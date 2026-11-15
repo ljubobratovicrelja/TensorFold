@@ -84,6 +84,8 @@ pub fn Snaps(comptime Cuda: type) type {
 
         pub fn restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
             const self = of(ptr);
+            // a bf16-shaped state (this server's own, or one kept on disk earlier) must not land in fp8 rows
+            if (self.engine.kv8) return error.FlashNextKv8SnapshotsUnsupported;
             const s: *lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
             const l = try self.lane(s);
             if (self.ranks) |r| return r.restore(&l.seq, if (l.draft) |*d| d else null, @ptrCast(@alignCast(saved)));
