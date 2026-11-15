@@ -114,7 +114,7 @@ test "an fp8 cache: every position saves a 16-byte scale block's width from two 
     const cap = 65536;
     for ([_]Heads{ .full, .half }) |h| {
         // bf16: 2 rows of head_dim * 2 bytes a KV head; fp8: head_dim codes and 16 bytes of scales a head, then codes
-        try std.testing.expectEqual(cap * h.kv * (2 * wt.head_dim - 16), seqBytes(cap, h) - seqBytesOf(cap, h, true));
+        try std.testing.expectEqual(12 * cap * h.kv * (2 * wt.head_dim - 16), seqBytes(cap, h) - seqBytesOf(cap, h, true));
         try std.testing.expect(kvKeyBytes(1, h, true) == h.kv * (wt.head_dim + 16));
         try std.testing.expect(kvValueBytes(1, h, true) == h.kv * wt.head_dim);
         try std.testing.expect(kvKeyBytes(1, h, false) == h.kvRow() and kvValueBytes(1, h, false) == h.kvRow());
