@@ -31,6 +31,12 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     if (o.slide and captured != null) return error.TrainingOnCapturedGlue;
     const page_tokens = try @import("cuda_kv_lanes.zig").paging();
     if (page_tokens > 0 and (o.tp != 1 or o.slide or captured != null)) return error.FlashNextPagesUnsupported;
+    // --kv-cache fp8: the cache's rows are fp8, which the paged, vision, learned and captured paths do not lay out yet
+    if (o.kv8 and page_tokens > 0) return error.FlashNextKv8PagesUnsupported;
+    if (o.kv8 and captured != null) return error.FlashNextKv8CapturedGlue;
+    if (o.kv8 and o.vision != null) return error.FlashNextKv8VisionUnsupported;
+    if (o.kv8 and o.slide) return error.FlashNextKv8LearningUnsupported;
+    if (o.kv8 and o.tp > 1) return error.FlashNextKv8RanksUnsupported;
     // pending DeltaNet rows run on one GPU only: TF_FLASHNEXT_KEEP_LATE=1 with tensor parallel is refused
     const Draft = @import("cuda_mtp_draft.zig").Draft;
     const late_fits = o.tp == 1;
@@ -46,6 +52,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     errdefer own.stream.deinit();
     own.glue = try Glue.load(driver);
     errdefer own.glue.deinit();
+    // the attention launches pick the fp8 or bf16 cache entries from this, once, here
+    own.glue.kv8 = o.kv8;
     // a captured set replaces our glue, for comparison, when it holds every entry point this engine launches
     if (captured) |kernels| own.set = try F.comparison(gpa, io, driver, ctx, kernels, o.drafts);
     errdefer if (own.set) |*x| x.deinit();
@@ -65,6 +73,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     };
     own.engine = try prompt.Engine.initRank(gpa, io, driver, &own.stream, dir, o.tp, o.rank);
     own.engine.chunk = chunk;
+    // --kv-cache fp8: every stream's caches and the head's are fp8 rows from here (cuda_seq_bytes.zig prices them)
+    own.engine.kv8 = o.kv8;
     if (own.ranks) |r| {
         r.engine = own.engine;
         own.engine.collective = &r.collective;
@@ -101,16 +111,16 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     own.lanes = .empty;
     own.next = 0;
     if (o.slide) own.lay = try @import("cuda_slide.zig").layoutOf(gpa, io, dir);
-    const own_seq_bytes = try prompt.seqBytesPaged(window, try @import("cuda_pages.zig").pageTest(), own.engine.heads);
+    const own_seq_bytes = try prompt.seqBytesPagedOf(window, try @import("cuda_pages.zig").pageTest(), own.engine.heads, o.kv8);
     var stream_bytes = own_seq_bytes;
     if (own.head) |h| {
-        stream_bytes += mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads);
-    } else if (o.drafts and o.tp == 2) stream_bytes += mtp.Draft.bytes(window, 1, own.engine.chunk, own.engine.heads);
+        stream_bytes += mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads, o.kv8);
+    } else if (o.drafts and o.tp == 2) stream_bytes += mtp.Draft.bytes(window, 1, own.engine.chunk, own.engine.heads, o.kv8);
     if (o.vision) |v| stream_bytes += @as(usize, v.image_tokens) * @import("cuda_prompt_wt.zig").dims * 2 + 16 * o.context;
     if (page_tokens > 0) {
         // the lane's head runs at the engine's chunk: its cache on the stream's pages, its buffers in the run
         own.kv.head = if (own.head) |h| .{ .draft_n = h.ids.len, .rows = own.engine.chunk } else null;
-        const head_bytes = if (own.head) |h| mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads) else 0;
+        const head_bytes = if (own.head) |h| mtp.Draft.bytes(window, h.ids.len, own.engine.chunk, own.engine.heads, o.kv8) else 0;
         own.kv.layout = @import("cuda_kv_lanes.zig").layout(o.context, page_tokens, own.kv.head, stream_bytes - own_seq_bytes - head_bytes);
     }
     if (own.ranks) |r| try load_cache.finishAfter(.{ r, std.math.maxInt(u64) }, ranks.Session.room) else load_cache.finish();

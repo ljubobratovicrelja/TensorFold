@@ -76,7 +76,7 @@ pub fn ensure(map: anytype, gpa: std.mem.Allocator, keys: []const u64, ctx: anyt
 
 /// Rank 1's window state for a sequence: one draft row, the head's absorb rows (Session.window's form).
 pub fn makeWindow(s: *Session, q: *const prompt.Seq) !mtp.Draft {
-    return mtp.Draft.init(s.gpa, s.engine.driver, s.engine.stream.*, q.cap, 1, s.engine.chunk, s.engine.heads);
+    return mtp.Draft.init(s.gpa, s.engine.driver, s.engine.stream.*, q.cap, 1, s.engine.chunk, s.engine.heads, s.engine.kv8);
 }
 
 fn limitOf(s: *const Session) usize {

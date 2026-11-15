@@ -148,13 +148,13 @@ test "Flash Next completion: draft constructor fill failures and queued window w
     for ([_]usize{ 1, 2, 3, 4 }) |fail_fill| {
         var d = Fake.init(0, fail_fill);
         const stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(328) };
-        try t.expectError(error.NotReady, Draft.init(t.allocator, &d, stream, 4, 8, 1, .full));
+        try t.expectError(error.NotReady, Draft.init(t.allocator, &d, stream, 4, 8, 1, .full, false));
         try t.expectEqual(Fake.allocations, Fake.frees);
         try t.expectEqual(@as(usize, 0), Fake.early);
     }
     var d = Fake.init(0, 0);
     const stream: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(329) };
-    var draft = try Draft.init(t.allocator, &d, stream, 4, 8, 1, .full);
+    var draft = try Draft.init(t.allocator, &d, stream, 4, 8, 1, .full, false);
     @memset(Fake.pending[1 .. Fake.allocations + 1], true);
     draft.deinit();
     try t.expectEqual(Fake.allocations, Fake.frees);

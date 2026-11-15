@@ -176,7 +176,7 @@ fn follower(comptime Cuda: type, frames: []const wire.Header, setup: *const fn (
     q.fed = 2;
     q.history = .{ 8, 9 };
     try rank.seqs.put(a, 1, q);
-    try rank.windows.put(a, 1, try mtp.Draft.init(a, &driver, stream, 64, 1, engine.chunk, .full));
+    try rank.windows.put(a, 1, try mtp.Draft.init(a, &driver, stream, 64, 1, engine.chunk, .full, false));
     const w = rank.windows.getPtr(1).?;
     defer w.deinit();
     defer w.log = null;

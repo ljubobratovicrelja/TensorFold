@@ -37,7 +37,7 @@ pub fn newSeqIn(e: *Engine, cap: usize, block: cuda.DeviceBuffer) !Seq {
     if (block.len < seqPartsBytes(e.heads)) return error.UnexpectedTensor;
     e.round_graph.clear();
     if (cap == 0 or cap > prompt.max_tokens) return error.UnexpectedTensor;
-    _ = try prompt.seqBytesPaged(cap, 0, e.heads);
+    _ = try prompt.seqBytesPagedOf(cap, 0, e.heads, e.kv8);
     var seq: Seq = .{
         .gen = @import("cuda_window_graph.zig").nextGen(),
         .stream = e.stream.*,
@@ -61,8 +61,8 @@ pub fn newSeqIn(e: *Engine, cap: usize, block: cuda.DeviceBuffer) !Seq {
     seq.conv = try viewsAt(e.gpa, e.driver, &at, linear_n, sizes.convBytes(e.heads));
     seq.state = try viewsAt(e.gpa, e.driver, &at, linear_n, sizes.stateBytes(e.heads));
     seq.tail = viewAt(e.driver, &at, ple_tail_n * wide * 2);
-    seq.kc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
-    seq.vc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
+    seq.kc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvKeyBytes(cap, e.heads, e.kv8));
+    seq.vc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvValueBytes(cap, e.heads, e.kv8));
     seq.ikc = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.indexBytes(cap));
     seq.pooled = try prompt.zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.pooledBytes(cap));
     return seq;
