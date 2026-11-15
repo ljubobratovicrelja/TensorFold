@@ -95,6 +95,8 @@ pub fn Kept(comptime F: type) type {
         /// A state from a stream that did not draft lacks the head's rows this server's parts name: it stays off disk.
         fn whole(ptr: *anyopaque, saved: api.prompt_cache.Saved) bool {
             const st: *const snap.Snap = @ptrCast(@alignCast(saved));
+            // an fp8 cache's state is not this image's (its rows are bf16 lengths): it stays off disk, never mis-sized
+            if (of(ptr).engine.kv8) return false;
             return st.head == (of(ptr).head != null) and st.rank_id == 0 and st.heads.eql(.full);
         }
 
