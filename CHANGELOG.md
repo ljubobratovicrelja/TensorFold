@@ -4,6 +4,24 @@ Each release's page on GitHub has its notes and measurements. See [the 1.0.0 rel
 
 ## Unreleased
 
+- Ling-3.0-tiny on Metal: the KDA mixer uses Kimi's existing `k3_kda` kernel (full-width gate, D=128, 4 taps) wired to Ling-tiny's 16 heads. Host `mixF64` is checked against a float64 dump of `oracle/kda_inner.py` (a stdlib copy of `ling_forward.py` Model.kda from conv through y, r = identity; that file is not imported and is not edited) on 16 heads x 2 and 4 rows (worst 8.3e-10 and 1.1e-9). The copy equals Model.kda at worst abs 2.8e-14 on those shapes (fake Ckpt, r = identity, `oracle/kda_vs_model.py`). `k3_kda` versus the dump is 0.0102 at 2 rows and 0.0119 at 4 rows, gated at 2 x (2^-7 of the largest |y|); true bf16 steps at those magnitudes are about 1.3 and 1.5 (values in [1, 2) share one step of 2^-7). `k3_kda` versus the f32 mixer is 0.001953 at 2 and 4 rows (gated under 0.01). `mix`/`mixF64` return `error.KdaWidthTooWide` when W > 2048 (ReleaseFast-safe; the stack conv window is 3 x 2048). Fixture inputs regenerate byte-identical; committed y matches a regenerate to within one float64 ulp, so they are numerically reproducible, not hash-reproducible. Every check uses r = identity and a fake Ckpt. No new kernel (for #1247).
+- Ling-3.0-tiny: a host KDA reference, and a Metal check that Kimi's `k3_kda` matches it at Ling-tiny's shape; nothing is served yet (part of #1247).
+- Spark 2.5 and MiniMax-M3 on CUDA: the last layer of a prompt runs only on the rows something reads (the final rows, plus DSpark's drafter rows for MiniMax), as Qwen's already did; tokens unchanged (#3122).
+
+- Server: an image URL's host lookup stops at 3 seconds (or the request's deadline, if sooner) even when the system resolver keeps retrying, at most 64 lookups run at once, and a refused connection falls through to the host's next checked address (#3127).
+
+- Living Weights: a fact graph write the OS refuses names its cause, for example "ShardWrite (ISDIR)" (#3126).
+
+- Pull: a hub file path refused for a reserved name or a path escape now names the path and the reason, and the pull exits 1 (#3097).
+
+- Server: a fact graph save whose final rename fails no longer leaves its temporary file behind (#3096).
+
+- Cluster: a pull plan asks for each file's safetensors header, and a file read in full is fetched whole, so its manifest hash is checked (#3095).
+
+- Tests: the macOS dashboard test no longer looks for a paged prefix cache tile the page never had; the paged store publishes no status (#3094).
+
+- Docs: the Flash Next CUDA recipe's two-GB10 section lists both RDMA devices of each ConnectX-7 port in `NCCL_IB_HCA` (`rocep1s0f0` and `roceP2p1s0f0` for the first port), with `NCCL_IB_ADDR_RANGE` covering both. A GB10 reaches its port over two PCIe links, and one device alone carries about 112 of the port's 200 Gb/s. On two GB10s joined by one cable this made cold 2,048 to 32,768-token prompts at `--tp 2` 26.5% to 28.1% faster (1,147 to 1,469 tokens/s at 8,192, NCCL 2.32.3), with decode speed and tokens unchanged (#2969). Thanks to @swbiggart.
+
 - DeepSeek V4.1 on Metal: on M5 GPUs (generation 17, macOS 27) the prompt's routed experts run on the tensor units, with every output bit-equal to the decode kernels as before. A 32-wide group of products goes to the tensor unit only when no fp32 sum of it can round; the few other groups take the decode kernels' fmas. On an M5 Ultra, a 4096-row chunk of a layer spends 23.5 ms instead of 45.2 ms in gate/up and 13.2 ms instead of 21.8 ms in down, and the layer takes 155 ms instead of 185 ms. Other Macs keep the simdgroup kernels (#3330).
 
 - DeepSeek-V4.1 on Metal: the dense FP8 prompt projections take 14 to 19% less time on an M5 Ultra, and every output bit is unchanged. Each threadgroup now stages two K groups between barriers, keeps the first three levels of the group sum tree in registers, and skips the zero groups that pad K to a power of two. A 4096-row prompt chunk of release layer 2 drops from 185 to 175 ms (#3322).
