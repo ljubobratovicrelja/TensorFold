@@ -50,10 +50,11 @@ fn seqRunBytes() usize {
 pub const Head = struct { draft_n: usize, rows: usize };
 
 /// Fixed: a lane's table and `extra` (image rows); paged: the attention caches (the head's too); a run: the states.
-pub fn layout(capacity: usize, tokens: usize, head: ?Head, extra: usize) kv.Layout {
+/// `kv8`: the cache's precision, which the kept states' budget (`snap_bytes`) is priced at too.
+pub fn layout(capacity: usize, tokens: usize, head: ?Head, extra: usize, kv8: bool) kv.Layout {
     const layers = wt.attn_n + @intFromBool(head != null);
     const run = seqRunBytes() + if (head) |h| mtp.Draft.runBytes(h.draft_n, h.rows) else 0;
-    return .{ .fixed_bytes = mostPages(capacity, tokens) * 4 + extra, .token_bytes = pages.pageBytesOf(tokens, layers) / tokens, .page_tokens = @intCast(tokens), .snap_bytes = snap.bytes(0, head != null, .full), .run_bytes = run };
+    return .{ .fixed_bytes = mostPages(capacity, tokens) * 4 + extra, .token_bytes = pages.pageBytesOf(tokens, layers) / tokens, .page_tokens = @intCast(tokens), .snap_bytes = snap.bytes(0, head != null, .full, kv8), .run_bytes = run };
 }
 
 /// Where a stream's caches came from: no pool, the one stream on its own caches beside a pool, or a pool lane.
@@ -156,7 +157,7 @@ pub const Pool = struct {
         const none: cuda.DeviceBuffer = .{ .d = d, .ptr = 0, .len = 0, .borrowed = true };
         @memset(conv, none);
         @memset(state, none);
-        return .{ .conv = conv, .state = state, .kc = kc, .vc = vc, .ikc = ikc, .pooled = pooled, .paged = paged, .tail = none, .history = .{ p.e.eos, p.e.eos }, .fed = 0, .logits = try gpa.alloc(u8, prompt.vocabulary * 2), .cap = 0 };
+        return .{ .conv = conv, .state = state, .kc = kc, .vc = vc, .ikc = ikc, .pooled = pooled, .paged = paged, .tail = none, .history = .{ p.e.eos, p.e.eos }, .fed = 0, .logits = try gpa.alloc(u8, prompt.vocabulary * 2), .cap = 0, .kv8 = p.e.kv8 };
     }
 
     pub fn deinit(p: *Pool) void {
@@ -305,9 +306,9 @@ test "TF_FLASHNEXT_KV_PAGES: unset, empty or whitespace-only text reads as no pa
 }
 
 test "a stream's pages: its rows and a drafted window, no more than a full window's" {
-    const l = layout(40960, 256, null, 0);
+    const l = layout(40960, 256, null, 0, false);
     try std.testing.expectEqual(pages.pageBytes(256), l.pageBytes());
-    const h = layout(40960, 256, .{ .draft_n = 32768, .rows = 1536 }, 0);
+    const h = layout(40960, 256, .{ .draft_n = 32768, .rows = 1536 }, 0, false);
     try std.testing.expectEqual(pages.pageBytesOf(256, wt.attn_n + 1), h.pageBytes());
     try std.testing.expect(h.run_bytes >= seqRunBytes() + mtp.Draft.runBytes(32768, 1536));
     try std.testing.expectEqual(@as(usize, 161), mostPages(40960, 256));

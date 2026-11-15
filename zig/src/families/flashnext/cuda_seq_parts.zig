@@ -42,6 +42,7 @@ pub fn newSeqIn(e: *Engine, cap: usize, block: cuda.DeviceBuffer) !Seq {
         .gen = @import("cuda_window_graph.zig").nextGen(),
         .stream = e.stream.*,
         .heads = e.heads,
+        .kv8 = e.kv8,
         .conv = &.{},
         .state = &.{},
         .kc = &.{},

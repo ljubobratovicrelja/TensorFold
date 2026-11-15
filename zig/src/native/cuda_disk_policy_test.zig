@@ -142,6 +142,7 @@ test "disk identity: Flash Next CUDA resolved prompt rows, kernel forms and expe
     var e: @typeInfo(@FieldType(flash.Cuda, "engine")).pointer.child = undefined;
     e.chunk = 8192;
     e.busy_chunk = 1536;
+    e.kv8 = false; // --kv-cache fp8: bf16 rows here
     const k = &e.batch_k;
     k.forms = .{};
     k.expert_tile = null;
@@ -209,6 +210,9 @@ test "disk identity: Flash Next CUDA resolved prompt rows, kernel forms and expe
     c.set = null;
     c.depth = 3; // a draft chain's length and lane buffers' reuse touch no prompt pass
     c.parts.on = false;
+    e.kv8 = true; // --kv-cache fp8: a state's rows are another length, so another directory of states
+    try changed.append(t.allocator, try flashKey(&x, &c));
+    e.kv8 = false;
     try fixture.misses(before, try flashKey(&x, &c), changed.items);
 }
 

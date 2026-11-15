@@ -300,6 +300,7 @@ pub const Engine = struct {
             .gen = @import("cuda_window_graph.zig").nextGen(),
             .stream = e.stream.*,
             .heads = e.heads,
+            .kv8 = e.kv8,
             .paged = paged,
             .conv = &.{},
             .state = &.{},
@@ -482,6 +483,8 @@ pub const Seq = struct {
     gen: u64 = 0, // its graphs' keys (cuda_window_graph.nextGen): unique among the engine's sequences
     /// The heads its DeltaNet states and KV caches hold (its engine's), which a snapshot's save and restore read.
     heads: Heads = .full,
+    /// The cache's precision its KV rows are laid out at (its engine's): a snapshot of the other precision cannot land.
+    kv8: bool = false,
     conv: []cuda.DeviceBuffer,
     state: []cuda.DeviceBuffer,
     kc: []cuda.DeviceBuffer,
@@ -500,7 +503,7 @@ pub const Seq = struct {
 
     /// The caches a batched pass reads and leaves; `scores` the engine's block scores (Engine.reserveScores).
     pub fn view(s: *Seq, scores: u64) batch.SeqState {
-        return .{ .gen = s.gen, .media = if (s.media) |*m| m.view() else null, .conv = s.conv, .state = s.state, .kc = s.kc, .vc = s.vc, .ikc = s.ikc, .pooled = s.pooled, .tail = s.tail, .history = &s.history, .cap = s.cap, .scores = scores, .pg = s.pg() };
+        return .{ .gen = s.gen, .media = if (s.media) |*m| m.view() else null, .conv = s.conv, .state = s.state, .kc = s.kc, .vc = s.vc, .ikc = s.ikc, .pooled = s.pooled, .tail = s.tail, .history = &s.history, .cap = s.cap, .scores = scores, .pg = s.pg(), .kv8 = s.kv8 };
     }
 
     /// The attention kernels' page argument (zero: contiguous caches).

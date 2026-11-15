@@ -530,6 +530,8 @@ pub const SeqState = struct {
     scores: u64,
     /// The attention caches' pages (pt 0: kc, vc, ikc and pooled are contiguous rows).
     pg: @import("cuda_glue.zig").Pg = .{},
+    /// The cache's precision its rows are laid at (cuda_heads.zig): a mark's kept state is laid the same.
+    kv8: bool = false,
 };
 
 pub const scoreStride = sizes.scoreStride;

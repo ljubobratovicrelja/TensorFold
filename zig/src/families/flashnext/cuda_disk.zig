@@ -5,27 +5,33 @@ const api = @import("engine_api");
 const lanes = @import("lanes");
 const snap = @import("cuda_snap.zig");
 const rows = api.prompt_cache.rows;
-const sh = snap.shape;
 const Allocator = std.mem.Allocator;
 
 const words = 32; // the n-gram history, the position, whether the MTP head's rows follow
 const Words = extern struct { history: [2]i64, at: u64, head: u64 };
 
-/// The image's parts at `at`: words, DeltaNet tails and states, each attention piece by layer, the tail, the head's.
-pub fn partsOf(at: u32, head: bool, out: *std.ArrayList(rows.image.Part), a: Allocator) !void {
+/// The image's parts at `at` and the cache's precision `kv8`: words, DeltaNet tails and states, each attention piece
+/// by layer, the tail, the head's.
+pub fn partsOf(at: u32, head: bool, kv8: bool, out: *std.ArrayList(rows.image.Part), a: Allocator) !void {
+    const sh = snap.shapeOf(kv8);
     try out.append(a, .{ .bytes = words });
-    try out.append(a, .{ .bytes = sh.linear * sh.conv });
-    try out.append(a, .{ .bytes = sh.linear * sh.state });
-    try attention(at, sh.attn, out, a);
-    try out.append(a, .{ .bytes = sh.tail });
-    if (head) try attention(at, 1, out, a);
+    try out.append(a, .{ .bytes = @as(u64, sh.linear) * @as(u64, sh.conv) });
+    try out.append(a, .{ .bytes = @as(u64, sh.linear) * @as(u64, sh.state) });
+    try attention(at, sh.attn, sh, out, a);
+    try out.append(a, .{ .bytes = @as(u64, sh.tail) });
+    if (head) try attention(at, 1, sh, out, a);
 }
 
-/// As cuda_snap.zig's move lays them: every layer's keys, then values, indexer keys, and pooled rows of `ratio`.
-fn attention(at: u32, layers: usize, out: *std.ArrayList(rows.image.Part), a: Allocator) !void {
-    for (0..2 * layers) |_| try out.append(a, .{ .bytes = @as(u64, at) * sh.kv_row, .row = sh.kv_row });
-    for (0..layers) |_| try out.append(a, .{ .bytes = @as(u64, at) * sh.index_row, .row = sh.index_row });
-    for (0..layers) |_| try out.append(a, .{ .bytes = @as(u64, at / sh.ratio) * sh.index_row, .row = sh.index_row, .per = sh.ratio });
+/// As cuda_snap.zig's move lays them: every layer's keys, then every layer's values, indexer keys, and pooled rows of
+/// `ratio`. At fp8 a key row keeps its two scales and a value row none, so the two groups have different row sizes.
+fn attention(at: u32, layers: usize, sh: snap.Shape, out: *std.ArrayList(rows.image.Part), a: Allocator) !void {
+    const key_row: u64 = @intCast(sh.key_row);
+    const value_row: u64 = @intCast(sh.value_row);
+    const index_row: u64 = @intCast(sh.index_row);
+    for (0..layers) |_| try out.append(a, .{ .bytes = @as(u64, at) * key_row, .row = @intCast(key_row) });
+    for (0..layers) |_| try out.append(a, .{ .bytes = @as(u64, at) * value_row, .row = @intCast(value_row) });
+    for (0..layers) |_| try out.append(a, .{ .bytes = @as(u64, at) * index_row, .row = @intCast(index_row) });
+    for (0..layers) |_| try out.append(a, .{ .bytes = (@as(u64, at) / @as(u64, sh.ratio)) * index_row, .row = @intCast(index_row), .per = @intCast(sh.ratio) });
 }
 
 /// The disk tier of a Flash Next namespace `F` (its Cuda backend is the prompt cache's target).
@@ -40,11 +46,13 @@ pub fn Kept(comptime F: type) type {
         }
 
         fn parts(ptr: *anyopaque, at: u32, out: *std.ArrayList(rows.image.Part), a: Allocator) anyerror!void {
-            try partsOf(at, of(ptr).head != null, out, a);
+            try partsOf(at, of(ptr).head != null, of(ptr).engine.kv8, out, a);
         }
 
         fn copy(c: *F.Cuda, st: *snap.Snap, ranges: []const rows.image.Range, host: []u8, out: bool) !void {
             const d = c.engine.driver;
+            // a stored state is this image's only at its precision: another's rows would land at the wrong stride
+            if (st.kv8 != c.engine.kv8) return error.KeptPrecisionDiffer;
             // a later range's failure leaves earlier copies queued on `host`, which its caller then frees or reuses
             errdefer cuda.completion.drain(d, c.stream, "a failed kept-state copy did not drain");
             var w: Words = .{ .history = st.history, .at = st.at, .head = @intFromBool(st.head) };
@@ -88,14 +96,16 @@ pub fn Kept(comptime F: type) type {
             const head = c.head != null;
             const st = try c.gpa.create(snap.Snap);
             errdefer c.gpa.destroy(st);
-            st.* = .{ .buf = try cuda.DeviceBuffer.alloc(c.engine.driver, snap.bytes(at, head, .full)), .at = at, .history = .{ 0, 0 }, .head = head };
+            st.* = .{ .buf = try cuda.DeviceBuffer.alloc(c.engine.driver, snap.bytes(at, head, .full, c.engine.kv8)), .at = at, .history = .{ 0, 0 }, .head = head, .kv8 = c.engine.kv8 };
             return @ptrCast(st);
         }
 
         /// A state from a stream that did not draft lacks the head's rows this server's parts name: it stays off disk.
+        /// So does a state of the other cache precision: this server's image is laid out at its own (`engine.kv8`).
         fn whole(ptr: *anyopaque, saved: api.prompt_cache.Saved) bool {
             const st: *const snap.Snap = @ptrCast(@alignCast(saved));
-            return st.head == (of(ptr).head != null) and st.rank_id == 0 and st.heads.eql(.full);
+            const c = of(ptr);
+            return st.head == (c.head != null) and st.rank_id == 0 and st.heads.eql(.full) and st.kv8 == c.engine.kv8;
         }
 
         /// A fixed prompt's state at a mark inside its last chunk, hashed, and the prompt rate it took.
@@ -135,9 +145,10 @@ pub fn Kept(comptime F: type) type {
             return .{ .hash = std.hash.Wyhash.hash(0x666e, bytes), .rate = @as(f64, @floatFromInt(toks.len)) / (@as(f64, @floatFromInt(@max(ns, 1))) / 1e9) };
         }
 
-        /// What else the states depend on: whether the MTP head's rows are part of them.
-        pub fn facts(target: *anyopaque) [1]u64 {
-            return .{@intFromBool(of(target).head != null)};
+        /// What else the states depend on: whether the MTP head's rows are part of them, and the caches' precision,
+        /// whose rows are a different length (fp8 keys keep their scales): each gets its own directory under the root.
+        pub fn facts(target: *anyopaque) [2]u64 {
+            return .{ @intFromBool(of(target).head != null), @intFromBool(of(target).engine.kv8) };
         }
 
         /// The native key extends with policyOf under this domain (native/cuda_disk.zig keptKey).
@@ -181,23 +192,23 @@ pub fn policyOf(c: anytype) [13]u64 {
 
 test "the image covers a state's device bytes once, its rows split into 256-token blocks, with and without the head" {
     const a = std.testing.allocator;
-    for ([_]bool{ false, true }) |head| for ([_]u32{ 1, 3, 256, 1000, 4137 }) |at| {
+    for ([_]bool{ false, true }) |kv8| for ([_]bool{ false, true }) |head| for ([_]u32{ 1, 3, 256, 1000, 4137 }) |at| {
         var parts: std.ArrayList(rows.image.Part) = .empty;
         defer parts.deinit(a);
-        try partsOf(at, head, &parts, a);
+        try partsOf(at, head, kv8, &parts, a);
         try std.testing.expect(rows.image.valid(parts.items, at, rows.block_tokens));
-        try std.testing.expectEqual(words + snap.bytes(at, head, .full), rows.image.imageBytes(parts.items));
+        try std.testing.expectEqual(words + snap.bytes(at, head, .full, kv8), rows.image.imageBytes(parts.items));
     };
 }
 
-test "the image's parts are cuda_snap.move's pieces in its order: sizes, offsets and rows, with and without the head" {
+test "the image's parts are cuda_snap.move's pieces in its order: sizes, offsets and rows, at either precision" {
     const a = std.testing.allocator;
-    for ([_]bool{ false, true }) |head| for ([_]u32{ 0, 1, 3, 4, 255, 256, 1000, 4136, 4137 }) |at| {
+    for ([_]bool{ false, true }) |kv8| for ([_]bool{ false, true }) |head| for ([_]u32{ 0, 1, 3, 4, 255, 256, 1000, 4136, 4137 }) |at| {
         var parts: std.ArrayList(rows.image.Part) = .empty;
         defer parts.deinit(a);
-        try partsOf(at, head, &parts, a);
+        try partsOf(at, head, kv8, &parts, a);
         try std.testing.expectEqual(@as(u64, words), parts.items[0].bytes);
-        const o = snap.order(at, head, .full);
+        const o = snap.order(at, head, .full, kv8);
         var i: usize = 1;
         var off: u64 = words; // the image's offset; move's buffer offset is this less the words
         var moved: u64 = 0;
@@ -222,8 +233,21 @@ test "the image's parts are cuda_snap.move's pieces in its order: sizes, offsets
             }
         }
         try std.testing.expectEqual(parts.items.len, i);
-        try std.testing.expectEqual(@as(u64, snap.bytes(at, head, .full)), moved);
+        try std.testing.expectEqual(@as(u64, snap.bytes(at, head, .full, kv8)), moved);
         try std.testing.expectEqual(rows.image.imageBytes(parts.items), off);
+    };
+}
+
+test "the image's offsets total a state's bytes at either precision: the invariant its blocks are cut at" {
+    const a = std.testing.allocator;
+    for ([_]bool{ false, true }) |kv8| for ([_]bool{ false, true }) |head| for ([_]u32{ 1, 4, 256, 1000, 4137 }) |at| {
+        var parts: std.ArrayList(rows.image.Part) = .empty;
+        defer parts.deinit(a);
+        try partsOf(at, head, kv8, &parts, a);
+        try std.testing.expectEqual(words + snap.bytes(at, head, .full, kv8), rows.image.imageBytes(parts.items));
+        if (kv8) { // the same length at fp8 is smaller: its keys keep 12 bytes of scales a position a layer's KV head
+            try std.testing.expect(words + snap.bytes(at, head, .full, false) > rows.image.imageBytes(parts.items));
+        }
     };
 }
 
@@ -251,7 +275,7 @@ const OneCopy = struct {
 
 /// A Flash Next namespace whose Cuda has just the fields its image reads, and no MTP head.
 const Bare = struct {
-    pub const Cuda = struct { gpa: Allocator, engine: struct { driver: *const cuda.Driver }, head: ?*anyopaque = null, stream: cuda.Stream };
+    pub const Cuda = struct { gpa: Allocator, engine: struct { driver: *const cuda.Driver, kv8: bool = false }, head: ?*anyopaque = null, stream: cuda.Stream };
 };
 
 test "Flash Next completion: a kept state's copy out or in that fails part way drains the copies it queued" {

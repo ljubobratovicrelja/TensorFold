@@ -22,13 +22,11 @@ pub fn Snaps(comptime Cuda: type) type {
         /// The chunk's stop: the first cache mark in [at, stop0) it cannot keep on the way; kept ones into `marks`.
         pub fn cut(self: *Cuda, s: *lanes.Stream, l: anytype, ids: []const u32, at: usize, stop0: usize, marks: *[parts.max_marks]parts.Mark) struct { stop: usize, kept: usize } {
             var n: usize = 0;
-            // an fp8 cache has no kept-state image yet (cuda_snap.zig's rows are bf16): the pass stops at the mark
-            if (self.engine.kv8) return .{ .stop = stop0, .kept = 0 };
             const forms = self.engine.batch_k.forms; // TF_FLASHNEXT_KEEP_INPASS and _GDN_FUSED as the load read them
             const inpass = forms.in_pass and self.ranks == null and l.seq.media == null and forms.gdn_fused;
             for (s.reuse.marks) |m| if (m > at and m < stop0) {
                 if (inpass and n < parts.max_marks) {
-                    if (snap.prepare(self.gpa, self.engine.driver, m, historyAt(l.seq.history, ids, at, m), l.draft != null, l.seq.heads)) |p| {
+                    if (snap.prepare(self.gpa, self.engine.driver, m, historyAt(l.seq.history, ids, at, m), l.draft != null, l.seq.heads, l.seq.kv8)) |p| {
                         l.prepared[n] = p;
                         marks[n] = .{ .at = m, .base = p.buf.ptr };
                         n += 1;
@@ -60,14 +58,12 @@ pub fn Snaps(comptime Cuda: type) type {
         }
 
         pub fn bytes(ptr: *anyopaque, at: u32) u64 {
-            return snap.bytes(at, of(ptr).head != null, of(ptr).engine.heads);
+            return snap.bytes(at, of(ptr).head != null, of(ptr).engine.heads, of(ptr).engine.kv8);
         }
 
         /// The owner stream's state, its prompt pass standing at `at` (a drafting stream's with the head's rows).
         pub fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!*anyopaque {
             const self = of(ptr);
-            // refused rather than written bf16-shaped: cuda_snap.zig prices and copies bf16 rows
-            if (self.engine.kv8) return error.FlashNextKv8SnapshotsUnsupported;
             const s: *lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
             const l = try self.lane(s);
             // a state its chunk kept on the way (TF_FLASHNEXT_KEEP_INPASS): the cache takes it as it is
@@ -84,8 +80,6 @@ pub fn Snaps(comptime Cuda: type) type {
 
         pub fn restore(ptr: *anyopaque, owner: ?*anyopaque, saved: *anyopaque) anyerror!void {
             const self = of(ptr);
-            // a bf16-shaped state (this server's own, or one kept on disk earlier) must not land in fp8 rows
-            if (self.engine.kv8) return error.FlashNextKv8SnapshotsUnsupported;
             const s: *lanes.Stream = @ptrCast(@alignCast(owner orelse return error.NoStream));
             const l = try self.lane(s);
             if (self.ranks) |r| return r.restore(&l.seq, if (l.draft) |*d| d else null, @ptrCast(@alignCast(saved)));

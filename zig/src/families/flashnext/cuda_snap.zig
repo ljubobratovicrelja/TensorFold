@@ -18,17 +18,23 @@ const head_heads: Heads = .full;
 pub const ladder = .{ .tokens = 8192, .most = 4 };
 
 /// A state's shape for its disk image (cuda_disk.zig, one rank, the whole layer): layer counts and bytes a row.
-pub const shape = .{ .linear = wt.linear_n, .attn = wt.attn_n, .conv = sizes.convBytes(.full), .state = sizes.stateBytes(.full), .kv_row = Heads.full.kvRow(), .index_row = index_row, .ratio = wt.index_ratio, .tail = tail_bytes };
+/// Keys and values have different rows at fp8 (`kv8`), so each has its own (`key_row`, `value_row`).
+pub const Shape = struct { linear: usize, attn: usize, conv: usize, state: usize, key_row: usize, value_row: usize, index_row: usize, ratio: usize, tail: usize };
+
+/// The image's shape at the cache's precision: fp8 keys keep their two scales a row, values need none (cuda_heads.zig).
+pub fn shapeOf(kv8: bool) Shape {
+    return .{ .linear = wt.linear_n, .attn = wt.attn_n, .conv = sizes.convBytes(.full), .state = sizes.stateBytes(.full), .key_row = Heads.full.keyRowOf(kv8), .value_row = Heads.full.valueRowOf(kv8), .index_row = index_row, .ratio = wt.index_ratio, .tail = tail_bytes };
+}
 
 /// One attention cache's first `at` key, value and indexer-key rows at heads `h`, and the pooled blocks they complete.
-fn attnBytes(at: usize, h: Heads) usize {
-    return at * (2 * h.kvRow() + index_row) + at / wt.index_ratio * index_row;
+fn attnBytes(at: usize, h: Heads, kv8: bool) usize {
+    return at * (h.keyRowOf(kv8) + h.valueRowOf(kv8) + index_row) + at / wt.index_ratio * index_row;
 }
 
 /// Device bytes a state at the model's heads `h` after `at` tokens takes: fixed DeltaNet pieces, attention by token.
-pub fn bytes(at: usize, head: bool, h: Heads) usize {
-    const own = wt.linear_n * (sizes.convBytes(h) + sizes.stateBytes(h)) + wt.attn_n * attnBytes(at, h) + tail_bytes;
-    return own + if (head) attnBytes(at, head_heads) else 0;
+pub fn bytes(at: usize, head: bool, h: Heads, kv8: bool) usize {
+    const own = wt.linear_n * (sizes.convBytes(h) + sizes.stateBytes(h)) + wt.attn_n * attnBytes(at, h, kv8) + tail_bytes;
+    return own + if (head) attnBytes(at, head_heads, kv8) else 0;
 }
 
 /// One kept state; `head`: it holds the MTP head's cache over the same rows, which a drafting stream needs.
@@ -40,6 +46,8 @@ pub const Snap = struct {
     head: bool,
     /// The model's heads its pieces hold (the saved sequence's): a sequence of other heads cannot take it.
     heads: Heads = .full,
+    /// The cache's precision its rows were laid out at (cuda_heads.zig): a sequence of the other precision cannot take it.
+    kv8: bool = false,
 };
 
 /// Where a kept state's pieces sit in its buffer (move's order) for a pass's marks (Hooks.marks): whole heads only.
@@ -58,8 +66,8 @@ pub const layout = struct {
         return wt.linear_n * conv_bytes + li * state_bytes;
     }
     /// The n-gram tail of a state after `n` tokens (after every attention cache's rows).
-    pub fn tail(n: usize) u64 {
-        return wt.linear_n * (conv_bytes + state_bytes) + wt.attn_n * attnBytes(n, .full);
+    pub fn tail(n: usize, kv8: bool) u64 {
+        return wt.linear_n * (conv_bytes + state_bytes) + wt.attn_n * attnBytes(n, .full, kv8);
     }
 };
 
@@ -69,21 +77,24 @@ const Way = enum { save, restore, rows };
 pub const Piece = struct { layers: usize, n: usize, row: usize = 0, per: usize = 1 };
 
 /// `move`'s pieces in order at `at` and the model's heads `h` (the disk image's at full): DeltaNet, attention, tail.
-pub fn order(at: usize, head: bool, h: Heads) struct { p: [11]Piece, len: usize } {
+pub fn order(at: usize, head: bool, h: Heads, kv8: bool) struct { p: [11]Piece, len: usize } {
     var o: [11]Piece = undefined;
     o[0] = .{ .layers = wt.linear_n, .n = sizes.convBytes(h) };
     o[1] = .{ .layers = wt.linear_n, .n = sizes.stateBytes(h) };
-    o[2..6].* = attnOrder(wt.attn_n, at, h);
+    o[2..6].* = attnOrder(wt.attn_n, at, h, kv8);
     o[6] = .{ .layers = 1, .n = tail_bytes };
-    if (head) o[7..11].* = attnOrder(1, at, head_heads);
+    if (head) o[7..11].* = attnOrder(1, at, head_heads, kv8);
     return .{ .p = o, .len = if (head) 11 else 7 };
 }
 
 /// An attention cache's pieces for `at` rows: complete pooled blocks only (the rest pool again as later rows land).
-fn attnOrder(layers: usize, at: usize, h: Heads) [4]Piece {
+/// Keys come first, then values: at fp8 a key row carries its two scales, a value row none, so the rows differ.
+fn attnOrder(layers: usize, at: usize, h: Heads, kv8: bool) [4]Piece {
+    const key_row = h.keyRowOf(kv8);
+    const value_row = h.valueRowOf(kv8);
     return .{
-        .{ .layers = layers, .n = at * h.kvRow(), .row = h.kvRow() },
-        .{ .layers = layers, .n = at * h.kvRow(), .row = h.kvRow() },
+        .{ .layers = layers, .n = at * key_row, .row = key_row },
+        .{ .layers = layers, .n = at * value_row, .row = value_row },
         .{ .layers = layers, .n = at * index_row, .row = index_row },
         .{ .layers = layers, .n = at / wt.index_ratio * index_row, .row = index_row, .per = wt.index_ratio },
     };
@@ -93,7 +104,9 @@ fn attnOrder(layers: usize, at: usize, h: Heads) [4]Piece {
 fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize, way: Way) !void {
     const dr = stream.d;
     var off: u64 = 0;
-    const o = order(at, d != null, seq.heads);
+    // an fp8 cache's rows are not a page's: the paged path below strides bf16 rows only
+    if (seq.kv8 and seq.paged != null) return error.SnapShape;
+    const o = order(at, d != null, seq.heads, seq.kv8);
     var bufs: [11][]cuda.DeviceBuffer = undefined;
     bufs[0..7].* = .{ seq.conv, seq.state, seq.kc, seq.vc, seq.ikc, seq.pooled, (&seq.tail)[0..1] };
     if (d) |h| bufs[7..11].* = .{ (&h.kc)[0..1], (&h.vc)[0..1], (&h.ikc)[0..1], (&h.pooled)[0..1] };
@@ -131,7 +144,7 @@ fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize,
             off += p.n;
         }
     }
-    std.debug.assert(off == bytes(at, d != null, seq.heads));
+    std.debug.assert(off == bytes(at, d != null, seq.heads, seq.kv8));
 }
 
 /// A copy of `seq` (and of the head's cache, with `d`) as it stands after `seq.fed` tokens.
@@ -140,7 +153,7 @@ pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, stream: cuda.Str
     if (d) |h| if (h.len != at or h.drafted != 0) return error.NotAtMark;
     const snap = try gpa.create(Snap);
     errdefer gpa.destroy(snap);
-    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytes(at, d != null, seq.heads)), .at = at, .history = seq.history, .head = d != null, .heads = seq.heads };
+    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytes(at, d != null, seq.heads, seq.kv8)), .at = at, .history = seq.history, .head = d != null, .heads = seq.heads, .kv8 = seq.kv8 };
     errdefer snap.buf.free();
     errdefer cuda.completion.drain(driver, stream, "a failed snapshot save did not drain");
     try move(stream, seq, d, snap.buf.ptr, at, .save);
@@ -149,10 +162,10 @@ pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, stream: cuda.Str
 }
 
 /// A kept state for position `at` that a pass running past it fills (Hooks.marks); `finish` adds the attention rows.
-pub fn prepare(gpa: std.mem.Allocator, driver: *const cuda.Driver, at: usize, history: [2]i64, head: bool, heads: Heads) !*Snap {
+pub fn prepare(gpa: std.mem.Allocator, driver: *const cuda.Driver, at: usize, history: [2]i64, head: bool, heads: Heads, kv8: bool) !*Snap {
     const snap = try gpa.create(Snap);
     errdefer gpa.destroy(snap);
-    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytes(at, head, heads)), .at = at, .history = history, .head = head, .heads = heads };
+    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytes(at, head, heads, kv8)), .at = at, .history = history, .head = head, .heads = heads, .kv8 = kv8 };
     return snap;
 }
 
@@ -167,6 +180,8 @@ pub fn finish(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *Snap) !v
 pub fn restore(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *const Snap) !void {
     if (snap.at > seq.cap) return error.SequenceTooShort;
     if (!snap.heads.eql(seq.heads)) return error.SnapShape;
+    // a bf16-shaped state must not land in fp8 rows, or the reverse: every row after the first would stride wrong
+    if (snap.kv8 != seq.kv8) return error.SnapShape;
     if (d) |h| if (!snap.head or snap.at > h.cap) return error.NoHeadState;
     // a state with the head's rows serves a stream without drafts too: those rows stay in the buffer
     try move(stream, seq, d, snap.buf.ptr, snap.at, .restore);
@@ -186,28 +201,54 @@ pub fn drop(gpa: std.mem.Allocator, stream: cuda.Stream, snap: *Snap) void {
 }
 
 test "a state's bytes: about 110 MiB of DeltaNet states and the n-gram tail, then 27 KiB a token" {
-    try std.testing.expectEqual(@as(usize, 12 * (2 * 2 * 256 * 2 + 128 * 2)), bytes(1, false, .full) - bytes(0, false, .full));
+    try std.testing.expectEqual(@as(usize, 12 * (2 * 2 * 256 * 2 + 128 * 2)), bytes(1, false, .full, false) - bytes(0, false, .full, false));
     // a complete block of 4 adds its pooled row
-    try std.testing.expectEqual(@as(usize, 12 * (4 * (2 * 2 * 256 * 2 + 128 * 2) + 128 * 2)), bytes(4, false, .full) - bytes(0, false, .full));
+    try std.testing.expectEqual(@as(usize, 12 * (4 * (2 * 2 * 256 * 2 + 128 * 2) + 128 * 2)), bytes(4, false, .full, false) - bytes(0, false, .full, false));
     // the head's cache is one more attention layer's rows
-    try std.testing.expectEqual(@as(usize, 13 * (2 * 2 * 256 * 2 + 128 * 2)), bytes(1, true, .full) - bytes(0, true, .full));
-    try std.testing.expect(bytes(0, false, .full) > 100 << 20 and bytes(0, false, .full) < 120 << 20);
+    try std.testing.expectEqual(@as(usize, 13 * (2 * 2 * 256 * 2 + 128 * 2)), bytes(1, true, .full, false) - bytes(0, true, .full, false));
+    try std.testing.expect(bytes(0, false, .full, false) > 100 << 20 and bytes(0, false, .full, false) < 120 << 20);
 }
 
 test "a state at a rank's half of the heads: half the conv windows, states and KV rows, the indexer and the head's whole" {
     const h = Heads.half;
-    try std.testing.expectEqual(@as(usize, 36 * (3 * 5120 * 2 + 24 * 128 * 128 * 4) + 9 * 4 * 2560 * 2), bytes(0, false, h));
-    try std.testing.expectEqual(@as(usize, 12 * (2 * 256 * 2 + 128 * 2)), bytes(1, false, h) - bytes(0, false, h));
+    try std.testing.expectEqual(@as(usize, 36 * (3 * 5120 * 2 + 24 * 128 * 128 * 4) + 9 * 4 * 2560 * 2), bytes(0, false, h, false));
+    try std.testing.expectEqual(@as(usize, 12 * (2 * 256 * 2 + 128 * 2)), bytes(1, false, h, false) - bytes(0, false, h, false));
     // the head's cache keeps its two KV heads beside the model's one
-    try std.testing.expectEqual(@as(usize, 12 * (2 * 256 * 2 + 128 * 2) + (2 * 2 * 256 * 2 + 128 * 2)), bytes(1, true, h) - bytes(0, true, h));
-    const o = order(8, true, h);
+    try std.testing.expectEqual(@as(usize, 12 * (2 * 256 * 2 + 128 * 2) + (2 * 2 * 256 * 2 + 128 * 2)), bytes(1, true, h, false) - bytes(0, true, h, false));
+    const o = order(8, true, h, false);
     try std.testing.expectEqual(@as(usize, 3 * 5120 * 2), o.p[0].n);
     try std.testing.expectEqual(@as(usize, 24 * 128 * 128 * 4), o.p[1].n);
     for (o.p[2..4]) |p| try std.testing.expectEqual(@as(usize, 512), p.row);
     for (o.p[7..9]) |p| try std.testing.expectEqual(@as(usize, 1024), p.row);
     var sum: usize = 0;
     for (o.p[0..o.len]) |p| sum += p.layers * p.n;
-    try std.testing.expectEqual(bytes(8, true, h), sum);
+    try std.testing.expectEqual(bytes(8, true, h, false), sum);
+}
+
+test "an fp8 state: bytes() is the exact sum of its pieces, keys a row longer than values" {
+    for ([_]bool{ false, true }) |head| for ([_]usize{ 0, 1, 3, 4, 255, 256, 4137 }) |at| {
+        const o = order(at, head, .full, true);
+        var sum: usize = 0;
+        for (o.p[0..o.len]) |p| sum += p.layers * p.n;
+        try std.testing.expectEqual(bytes(at, head, .full, true), sum);
+        // a key row keeps both scales beside its codes; a value row is codes only
+        try std.testing.expectEqual(Heads.full.kv8KeyRow(), o.p[2].row);
+        try std.testing.expectEqual(Heads.full.kv8ValueRow(), o.p[3].row);
+        try std.testing.expect(o.p[2].row > o.p[3].row);
+        // the head's cache is at the whole layer's heads either way
+        if (head) try std.testing.expectEqual(Heads.full.kv8KeyRow(), o.p[7].row);
+    };
+}
+
+test "an fp8 state of the same length is smaller by each attention layer's two KV heads' scale blocks" {
+    // bf16 stores a key and a value row of head_dim * 2 bytes a KV head; fp8 a key row of head_dim + 16 and a value
+    // row of head_dim: 2 * head_dim - 16 bytes fewer a KV head, so `kv` times that a layer, a position
+    for ([_]usize{ 1, 4, 1000, 4137 }) |at| for ([_]bool{ false, true }) |head| {
+        const layers = wt.attn_n + @intFromBool(head);
+        const saved = bytes(at, head, .full, false) - bytes(at, head, .full, true);
+        try std.testing.expectEqual(layers * at * Heads.full.kv * (2 * wt.head_dim - 16), saved);
+        try std.testing.expect(saved > 0);
+    };
 }
 
 test "a state of the whole layer restores into no sequence of half the heads, and the reverse" {
@@ -216,6 +257,18 @@ test "a state of the whole layer restores into no sequence of half the heads, an
     for ([_][2]Heads{ .{ .full, .half }, .{ .half, .full } }) |pair| {
         const kept: Snap = .{ .buf = .{ .d = &driver, .ptr = 0x100, .len = 1, .borrowed = true }, .at = 1, .history = .{ 0, 0 }, .head = false, .heads = pair[0] };
         var seq: prompt.Seq = .{ .heads = pair[1], .conv = &.{}, .state = &.{}, .kc = &.{}, .vc = &.{}, .ikc = &.{}, .pooled = &.{}, .tail = .{ .d = &driver, .ptr = 0, .len = 0 }, .history = .{ 0, 0 }, .fed = 0, .logits = &.{}, .cap = 8 };
+        // refused before any copy: no driver call is made
+        try std.testing.expectError(error.SnapShape, restore(stream, &seq, null, &kept));
+        try std.testing.expectEqual(@as(usize, 0), seq.fed);
+    }
+}
+
+test "a bf16 state restores into no fp8 sequence, and the reverse, before any copy" {
+    var driver: cuda.Driver = undefined;
+    const stream: cuda.Stream = .{ .d = &driver, .handle = null };
+    for ([_]bool{ false, true }) |seq_kv8| {
+        const kept: Snap = .{ .buf = .{ .d = &driver, .ptr = 0x100, .len = 1, .borrowed = true }, .at = 1, .history = .{ 0, 0 }, .head = false, .heads = .full, .kv8 = !seq_kv8 };
+        var seq: prompt.Seq = .{ .kv8 = seq_kv8, .heads = .full, .conv = &.{}, .state = &.{}, .kc = &.{}, .vc = &.{}, .ikc = &.{}, .pooled = &.{}, .tail = .{ .d = &driver, .ptr = 0, .len = 0 }, .history = .{ 0, 0 }, .fed = 0, .logits = &.{}, .cap = 8 };
         // refused before any copy: no driver call is made
         try std.testing.expectError(error.SnapShape, restore(stream, &seq, null, &kept));
         try std.testing.expectEqual(@as(usize, 0), seq.fed);
