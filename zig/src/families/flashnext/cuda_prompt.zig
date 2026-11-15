@@ -94,6 +94,9 @@ pub const max_tokens: usize = weights.window;
 const sizes = @import("cuda_seq_bytes.zig");
 pub const seqBytes = sizes.seqBytes;
 pub const seqBytesPaged = sizes.seqBytesPaged;
+/// The same at a cache precision: `kv8` keeps the attention caches as fp8 rows.
+pub const seqBytesOf = sizes.seqBytesOf;
+pub const seqBytesPagedOf = sizes.seqBytesPagedOf;
 pub const pooledBytes = sizes.pooledBytes;
 const Heads = @import("cuda_heads.zig").Heads;
 const round_graph = @import("cuda_round_graph.zig");
@@ -125,6 +128,8 @@ pub const Engine = struct {
     busy_chunk: usize = batch.default_chunk,
     /// The heads every model layer holds on this rank, which each stream's caches take (the MTP head's are full).
     heads: Heads = .full,
+    /// --kv-cache fp8: each stream's attention caches are fp8 rows (cuda_heads.zig), half a bf16 cache's bytes.
+    kv8: bool = false,
     round_graph: round_graph.Cache = .{},
     graphs: @import("cuda_window_graph.zig").Graphs = .{}, // drafted windows, draft-head pieces, rollbacks on one GPU
     image_factory: ?*@import("cuda_images.zig").Vision = null,
@@ -290,7 +295,7 @@ pub const Engine = struct {
         errdefer if (paged) |*p| p.deinit(e.gpa);
         e.round_graph.clear();
         if (cap == 0 or cap > max_tokens) return error.UnexpectedTensor;
-        _ = try seqBytesPaged(cap, if (paged) |p| p.tokens else 0, e.heads);
+        _ = try seqBytesPagedOf(cap, if (paged) |p| p.tokens else 0, e.heads, e.kv8);
         var seq: Seq = .{
             .gen = @import("cuda_window_graph.zig").nextGen(),
             .stream = e.stream.*,
@@ -314,8 +319,8 @@ pub const Engine = struct {
         seq.logits = try e.gpa.alloc(u8, vocab * 2);
         seq.conv = try zeros(e.gpa, e.driver, e.stream.*, linear_n, sizes.convBytes(e.heads));
         seq.state = try zeros(e.gpa, e.driver, e.stream.*, linear_n, sizes.stateBytes(e.heads));
-        seq.kc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .key) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
-        seq.vc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .value) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvBytes(cap, e.heads));
+        seq.kc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .key) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvKeyBytes(cap, e.heads, e.kv8));
+        seq.vc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .value) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.kvValueBytes(cap, e.heads, e.kv8));
         seq.ikc = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .index) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, sizes.indexBytes(cap));
         seq.pooled = if (seq.paged) |*p| try p.views(e.gpa, e.driver, .pooled) else try zeros(e.gpa, e.driver, e.stream.*, attn_n, pooledBytes(cap));
         seq.tail = try cuda.DeviceBuffer.alloc(e.driver, ple_tail_n * wide * 2);

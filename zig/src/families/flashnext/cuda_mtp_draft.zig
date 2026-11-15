@@ -120,10 +120,10 @@ pub const Draft = struct {
     /// The head's own cache: its layer is whole on every rank.
     const head_heads: Heads = .full;
 
-    /// Device bytes `init(cap, draft_n, rows, h)` allocates: the head's cache at full KV rows, the rest at `h`.
-    pub fn bytes(cap: usize, draft_n: usize, rows: usize, h: Heads) usize {
+    /// Device bytes `init(cap, draft_n, rows, h, kv8)` allocates: the head's cache at full KV rows, the rest at `h`.
+    pub fn bytes(cap: usize, draft_n: usize, rows: usize, h: Heads, kv8: bool) usize {
         const l = Layout.of(h);
-        const head = 2 * sizes.kvBytes(cap, head_heads) + sizes.indexBytes(cap) + sizes.pooledBytes(cap);
+        const head = sizes.kvKeyBytes(cap, head_heads, kv8) + sizes.kvValueBytes(cap, head_heads, kv8) + sizes.indexBytes(cap) + sizes.pooledBytes(cap);
         const log = if (late()) logBytes() else 0;
         return head + @max(rows, max_rows) * wide * 2 + wide * 2 + max_rows * vocab * 2 + draft_n * 2 + best_bytes + l.saved + linear_n * l.state + log;
     }
@@ -158,11 +158,11 @@ pub const Draft = struct {
     }
 
     /// A head cache of `cap` entries; `rows` the widest prompt chunk whose streams it keeps; `h` the model's heads.
-    pub fn init(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, cap: usize, draft_n: usize, rows: usize, h: Heads) !Draft {
+    pub fn init(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, cap: usize, draft_n: usize, rows: usize, h: Heads, kv8: bool) !Draft {
         var d: Draft = .{ .gen = @import("cuda_window_graph.zig").nextGen(), .stream = stream, .gpa = gpa, .cap = cap, .rows_cap = @max(rows, max_rows), .kc = undefined, .vc = undefined, .ikc = undefined, .pooled = undefined, .streams = undefined, .out = undefined, .logits = undefined, .dlogits = undefined, .best = undefined, .saved = undefined, .host = undefined, .layout = .of(h) };
-        d.kc = try cuda.DeviceBuffer.alloc(driver, sizes.kvBytes(cap, head_heads));
+        d.kc = try cuda.DeviceBuffer.alloc(driver, sizes.kvKeyBytes(cap, head_heads, kv8));
         errdefer d.kc.free();
-        d.vc = try cuda.DeviceBuffer.alloc(driver, sizes.kvBytes(cap, head_heads));
+        d.vc = try cuda.DeviceBuffer.alloc(driver, sizes.kvValueBytes(cap, head_heads, kv8));
         errdefer d.vc.free();
         d.ikc = try cuda.DeviceBuffer.alloc(driver, sizes.indexBytes(cap));
         errdefer d.ikc.free();
@@ -205,13 +205,13 @@ pub const Draft = struct {
     }
 
     /// init's draft whose fixed-size buffers (partsBytes) are zeroed views of `block`; its caches allocated as init's.
-    pub fn initParts(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, cap: usize, draft_n: usize, rows: usize, h: Heads, block: cuda.DeviceBuffer) !Draft {
+    pub fn initParts(gpa: std.mem.Allocator, driver: *cuda.Driver, stream: cuda.Stream, cap: usize, draft_n: usize, rows: usize, h: Heads, block: cuda.DeviceBuffer, kv8: bool) !Draft {
         const bytes_in = partsBytes(draft_n, rows, h);
         if (block.len < bytes_in) return error.FlashNextRunTooShort;
         var d: Draft = .{ .gen = @import("cuda_window_graph.zig").nextGen(), .stream = stream, .gpa = gpa, .cap = cap, .rows_cap = @max(rows, max_rows), .kc = undefined, .vc = undefined, .ikc = undefined, .pooled = undefined, .streams = undefined, .out = undefined, .logits = undefined, .dlogits = undefined, .best = undefined, .saved = undefined, .spare = undefined, .host = undefined, .layout = .of(h) };
-        d.kc = try cuda.DeviceBuffer.alloc(driver, sizes.kvBytes(cap, head_heads));
+        d.kc = try cuda.DeviceBuffer.alloc(driver, sizes.kvKeyBytes(cap, head_heads, kv8));
         errdefer d.kc.free();
-        d.vc = try cuda.DeviceBuffer.alloc(driver, sizes.kvBytes(cap, head_heads));
+        d.vc = try cuda.DeviceBuffer.alloc(driver, sizes.kvValueBytes(cap, head_heads, kv8));
         errdefer d.vc.free();
         d.ikc = try cuda.DeviceBuffer.alloc(driver, sizes.indexBytes(cap));
         errdefer d.ikc.free();
@@ -261,7 +261,7 @@ pub const Draft = struct {
 
     /// Device bytes `initIn` takes from a run: every buffer but the head's cache, each on a 256-byte boundary.
     pub fn runBytes(draft_n: usize, rows: usize) usize {
-        return bytes(0, draft_n, rows, pool_heads) + (7 + linear_n) * 256;
+        return bytes(0, draft_n, rows, pool_heads, false) + (7 + linear_n) * 256;
     }
 
     /// A pool lane's model heads: the pages hold the whole layer (one rank; cuda_lanes_load.zig refuses pages at --tp).
@@ -356,12 +356,12 @@ test "a draft at 65,536 tokens and 1,536-row chunks: the head's cache whole, sav
     const tail: usize = 9 * 4 * 2560 * 2 + 32 * 4 * 2560 * 2;
     const full: usize = 36 * 3 * 10240 * 2 + 36 * 32 * 16480 * 2 + tail + 36 * 48 * 128 * 128 * 4;
     const half: usize = 36 * 3 * 5120 * 2 + 36 * 32 * 8240 * 2 + tail + 36 * 24 * 128 * 128 * 4;
-    try std.testing.expectEqual(head + buffers + full, Draft.bytes(cap, draft_n, rows, .full));
-    try std.testing.expectEqual(head + buffers + half, Draft.bytes(cap, draft_n, rows, .half));
-    try std.testing.expectEqual(@as(usize, 356_905_472), Draft.bytes(cap, draft_n, rows, .full));
-    try std.testing.expectEqual(@as(usize, 280_191_488), Draft.bytes(cap, draft_n, rows, .half));
+    try std.testing.expectEqual(head + buffers + full, Draft.bytes(cap, draft_n, rows, .full, false));
+    try std.testing.expectEqual(head + buffers + half, Draft.bytes(cap, draft_n, rows, .half, false));
+    try std.testing.expectEqual(@as(usize, 356_905_472), Draft.bytes(cap, draft_n, rows, .full, false));
+    try std.testing.expectEqual(@as(usize, 280_191_488), Draft.bytes(cap, draft_n, rows, .half, false));
     // with the stream's own caches at half the heads
-    try std.testing.expectEqual(@as(usize, 1_395_069_440), sizes.seqBytes(cap, .half) + Draft.bytes(cap, draft_n, rows, .half));
+    try std.testing.expectEqual(@as(usize, 1_395_069_440), sizes.seqBytes(cap, .half) + Draft.bytes(cap, draft_n, rows, .half, false));
 }
 
 test "blank TF_FLASHNEXT_KEEP_LATE: unset, empty or whitespace-only text asks for nothing, 1 and 0 keep their meaning" {
