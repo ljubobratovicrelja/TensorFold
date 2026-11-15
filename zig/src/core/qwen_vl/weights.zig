@@ -41,7 +41,10 @@ pub const Weights = struct {
     }
 };
 
-const Want = struct { name: []const u8, shape: []const usize, ref: *Ref };
+const Want = struct { name: []const u8, shape: []const usize, ref: *Ref, form: Form = .bf16 };
+
+/// How a linear's weight is stored in the checkpoint: bf16 as the tower holds it, or ModelOpt's quantized planes.
+pub const Form = enum { bf16, mxfp8, nvfp4 };
 
 /// Every tower tensor in buffer order with its shape (the patch weight as stored by MLX) and the place it fills.
 fn wanted(arena: std.mem.Allocator, c: Config, w: *Weights) !std.ArrayList(Want) {
@@ -52,11 +55,11 @@ fn wanted(arena: std.mem.Allocator, c: Config, w: *Weights) !std.ArrayList(Want)
     try out.append(arena, .{ .name = "patch_embed.proj.bias", .shape = try arena.dupe(usize, &.{h}), .ref = &w.patch_b });
     try out.append(arena, .{ .name = "pos_embed.weight", .shape = try arena.dupe(usize, &.{ c.positions, h }), .ref = &w.pos });
     for (w.blocks, 0..) |*b, i| {
-        const fields = .{ .{ "norm1.weight", &b.norm1_w, &[_]usize{h} }, .{ "norm1.bias", &b.norm1_b, &[_]usize{h} }, .{ "attn.qkv.weight", &b.qkv_w, &[_]usize{ 3 * h, h } }, .{ "attn.qkv.bias", &b.qkv_b, &[_]usize{3 * h} }, .{ "attn.proj.weight", &b.proj_w, &[_]usize{ h, h } }, .{ "attn.proj.bias", &b.proj_b, &[_]usize{h} }, .{ "norm2.weight", &b.norm2_w, &[_]usize{h} }, .{ "norm2.bias", &b.norm2_b, &[_]usize{h} }, .{ "mlp.linear_fc1.weight", &b.fc1_w, &[_]usize{ c.intermediate, h } }, .{ "mlp.linear_fc1.bias", &b.fc1_b, &[_]usize{c.intermediate} }, .{ "mlp.linear_fc2.weight", &b.fc2_w, &[_]usize{ h, c.intermediate } }, .{ "mlp.linear_fc2.bias", &b.fc2_b, &[_]usize{h} } };
-        inline for (fields) |f| try out.append(arena, .{ .name = try std.fmt.allocPrint(arena, "blocks.{d}.{s}", .{ i, f[0] }), .shape = try arena.dupe(usize, f[2]), .ref = f[1] });
+        const fields = .{ .{ "norm1.weight", &b.norm1_w, &[_]usize{h}, Form.bf16 }, .{ "norm1.bias", &b.norm1_b, &[_]usize{h}, Form.bf16 }, .{ "attn.qkv.weight", &b.qkv_w, &[_]usize{ 3 * h, h }, Form.mxfp8 }, .{ "attn.qkv.bias", &b.qkv_b, &[_]usize{3 * h}, Form.bf16 }, .{ "attn.proj.weight", &b.proj_w, &[_]usize{ h, h }, Form.mxfp8 }, .{ "attn.proj.bias", &b.proj_b, &[_]usize{h}, Form.bf16 }, .{ "norm2.weight", &b.norm2_w, &[_]usize{h}, Form.bf16 }, .{ "norm2.bias", &b.norm2_b, &[_]usize{h}, Form.bf16 }, .{ "mlp.linear_fc1.weight", &b.fc1_w, &[_]usize{ c.intermediate, h }, Form.nvfp4 }, .{ "mlp.linear_fc1.bias", &b.fc1_b, &[_]usize{c.intermediate}, Form.bf16 }, .{ "mlp.linear_fc2.weight", &b.fc2_w, &[_]usize{ h, c.intermediate }, Form.nvfp4 }, .{ "mlp.linear_fc2.bias", &b.fc2_b, &[_]usize{h}, Form.bf16 } };
+        inline for (fields) |f| try out.append(arena, .{ .name = try std.fmt.allocPrint(arena, "blocks.{d}.{s}", .{ i, f[0] }), .shape = try arena.dupe(usize, f[2]), .ref = f[1], .form = f[3] });
     }
-    const tail = .{ .{ "merger.norm.weight", &w.norm_w, &[_]usize{h} }, .{ "merger.norm.bias", &w.norm_b, &[_]usize{h} }, .{ "merger.linear_fc1.weight", &w.fc1_w, &[_]usize{ m, m } }, .{ "merger.linear_fc1.bias", &w.fc1_b, &[_]usize{m} }, .{ "merger.linear_fc2.weight", &w.fc2_w, &[_]usize{ c.out_hidden, m } }, .{ "merger.linear_fc2.bias", &w.fc2_b, &[_]usize{c.out_hidden} } };
-    inline for (tail) |f| try out.append(arena, .{ .name = f[0], .shape = try arena.dupe(usize, f[2]), .ref = f[1] });
+    const tail = .{ .{ "merger.norm.weight", &w.norm_w, &[_]usize{h}, Form.bf16 }, .{ "merger.norm.bias", &w.norm_b, &[_]usize{h}, Form.bf16 }, .{ "merger.linear_fc1.weight", &w.fc1_w, &[_]usize{ m, m }, Form.nvfp4 }, .{ "merger.linear_fc1.bias", &w.fc1_b, &[_]usize{m}, Form.bf16 }, .{ "merger.linear_fc2.weight", &w.fc2_w, &[_]usize{ c.out_hidden, m }, Form.nvfp4 }, .{ "merger.linear_fc2.bias", &w.fc2_b, &[_]usize{c.out_hidden}, Form.bf16 } };
+    inline for (tail) |f| try out.append(arena, .{ .name = f[0], .shape = try arena.dupe(usize, f[2]), .ref = f[1], .form = f[3] });
     return out;
 }
 
@@ -69,17 +72,39 @@ fn count(shape: []const usize) usize {
 /// The buffer's bytes: every tensor in bf16, each 256-aligned.
 pub const Memory = struct { source: usize, device: usize };
 
+/// How the checkpoint stores the tower's linears: bf16 as the tower holds them, or ModelOpt's quantized planes.
+pub const Stored = enum { bf16, modelopt };
+
 pub fn plan(gpa: std.mem.Allocator, c: Config) !Memory {
+    return planStored(gpa, c, .bf16);
+}
+
+/// `plan` for a checkpoint whose linears are ModelOpt-quantized: the source (load-time) bytes are the stored planes and
+/// scales, while the device bytes stay the bf16 the tower reads.
+pub fn planStored(gpa: std.mem.Allocator, c: Config, stored: Stored) !Memory {
     var arena = std.heap.ArenaAllocator.init(gpa);
     defer arena.deinit();
     var w: Weights = .{ .buf = undefined, .blocks = try arena.allocator().alloc(Block, c.depth) };
     var out: Memory = .{ .source = 0, .device = 0 };
     for ((try wanted(arena.allocator(), c, &w)).items) |want| {
-        const size = try std.math.mul(usize, 2, count(want.shape));
-        out.source = try std.math.add(usize, out.source, size);
-        out.device = try std.math.add(usize, std.mem.alignForward(usize, out.device, 256), size);
+        const device = try std.math.mul(usize, 2, count(want.shape));
+        const source = if (stored == .modelopt) try storedBytes(want.shape, want.form) else device;
+        out.source = try std.math.add(usize, out.source, source);
+        out.device = try std.math.add(usize, std.mem.alignForward(usize, out.device, 256), device);
     }
     return out;
+}
+
+/// The bytes a linear's weight takes in the checkpoint: bf16, or ModelOpt's MXFP8 (e4m3 codes, an e8m0 scale per 32
+/// inputs) and NVFP4 (two codes a byte, an e4m3 scale per 16 inputs, one fp32 global).
+fn storedBytes(shape: []const usize, form: Form) !usize {
+    const n = shape[0];
+    const k = shape[1];
+    return switch (form) {
+        .bf16 => try std.math.mul(usize, 2, try std.math.mul(usize, n, k)),
+        .mxfp8 => try std.math.add(usize, try std.math.mul(usize, n, k), try std.math.mul(usize, n, k / 32)),
+        .nvfp4 => try std.math.add(usize, 4, try std.math.add(usize, try std.math.mul(usize, n, k / 2), try std.math.mul(usize, n, k / 16))),
+    };
 }
 
 pub fn bytes(gpa: std.mem.Allocator, c: Config) !usize {
@@ -167,4 +192,15 @@ test "the buffer holds the 27B tower's 333 tensors in bf16" {
     try std.testing.expectEqual(@as(usize, 333), wants.items.len);
     const n = try bytes(std.testing.allocator, c);
     try std.testing.expect(n > 900_000_000 and n < 930_000_000); // about 460 million weights
+}
+
+test "a ModelOpt tower's source bytes shrink while its device bytes stay bf16" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const sample = @import("config.zig");
+    const c = (try Config.parse(arena.allocator(), sample.sample_config, null, null)).?;
+    const dense = try plan(std.testing.allocator, c);
+    const quantized = try planStored(std.testing.allocator, c, .modelopt);
+    try std.testing.expectEqual(dense.device, quantized.device);
+    try std.testing.expect(quantized.source < dense.source);
 }
