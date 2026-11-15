@@ -44,6 +44,27 @@ pub const Heads = struct {
         return h.kv * wt.head_dim * 2;
     }
 
+    /// Bytes of one position's key rows in the fp8 cache: each KV head's row is head_dim e4m3 codes, then its key and
+    /// value scales (fp32) and 8 zero bytes, so the row stays 16-byte aligned (flashnext_attn.cu's KS).
+    pub fn kv8KeyRow(h: Heads) usize {
+        return h.kv * (wt.head_dim + 16);
+    }
+
+    /// Bytes of one position's value rows in the fp8 cache: head_dim e4m3 codes a KV head, no scales of their own.
+    pub fn kv8ValueRow(h: Heads) usize {
+        return h.kv * wt.head_dim;
+    }
+
+    /// One position's keys at the cache's precision: an fp8 key row carries its two scales beside the codes.
+    pub fn keyRowOf(h: Heads, kv8: bool) usize {
+        return if (kv8) kv8KeyRow(h) else kvRow(h);
+    }
+
+    /// One position's values at the cache's precision: an fp8 value row is codes only (its scale rides its key row).
+    pub fn valueRowOf(h: Heads, kv8: bool) usize {
+        return if (kv8) kv8ValueRow(h) else kvRow(h);
+    }
+
     /// What each of `world` ranks computes of a layer the head split cuts: the whole layer at one rank, half at two.
     pub fn split(world: usize) error{UnevenHeadSplit}!Heads {
         return switch (world) {

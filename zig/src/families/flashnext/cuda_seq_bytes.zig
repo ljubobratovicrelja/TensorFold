@@ -25,6 +25,16 @@ pub fn kvBytes(cap: usize, h: Heads) usize {
     return cap * h.kvRow();
 }
 
+/// One attention layer's keys for `cap` positions, at the cache's precision (fp8: e4m3 codes and their scales).
+pub fn kvKeyBytes(cap: usize, h: Heads, kv8: bool) usize {
+    return cap * h.keyRowOf(kv8);
+}
+
+/// One attention layer's values for `cap` positions, at the cache's precision (fp8: e4m3 codes only).
+pub fn kvValueBytes(cap: usize, h: Heads, kv8: bool) usize {
+    return cap * h.valueRowOf(kv8);
+}
+
 /// One attention layer's indexer keys for `cap` positions: whole on every rank.
 pub fn indexBytes(cap: usize) usize {
     return cap * index_dim * 2;
@@ -40,20 +50,37 @@ fn attnBytes(cap: usize, h: Heads) usize {
     return attn_n * (2 * kvBytes(cap, h) + indexBytes(cap) + pooledBytes(cap));
 }
 
+/// As attnBytes at the cache's precision: an fp8 cache's keys keep their scales, its values need none.
+fn attnBytesOf(cap: usize, h: Heads, kv8: bool) usize {
+    return attn_n * (kvKeyBytes(cap, h, kv8) + kvValueBytes(cap, h, kv8) + indexBytes(cap) + pooledBytes(cap));
+}
+
 /// Device bytes `Engine.newSeq(cap)` allocates: conv tails, recurrent states, KV with indexer keys, the n-gram tail.
 pub fn seqBytes(cap: usize, h: Heads) usize {
     const linear = linear_n * (convBytes(h) + stateBytes(h));
     return linear + attnBytes(cap, h) + wt.ple_tail_n * wt.wide * 2;
 }
 
+/// seqBytes at the cache's precision: `kv8` keeps the attention caches as fp8 rows (cuda_heads.zig).
+pub fn seqBytesOf(cap: usize, h: Heads, kv8: bool) usize {
+    if (!kv8) return seqBytes(cap, h);
+    const linear = linear_n * (convBytes(h) + stateBytes(h));
+    return linear + attnBytesOf(cap, h, kv8) + wt.ple_tail_n * wt.wide * 2;
+}
+
 /// Contiguous storage or the page diagnostic's rounded arena and table, with every live allocation priced.
 pub fn seqBytesPaged(cap: usize, tokens: usize, h: Heads) !usize {
+    return seqBytesPagedOf(cap, tokens, h, false);
+}
+
+/// seqBytesPaged at the cache's precision (fp8 caches have no pages yet: the diagnostic prices bf16 ones).
+pub fn seqBytesPagedOf(cap: usize, tokens: usize, h: Heads, kv8: bool) !usize {
     if (cap == 0 or cap > max_tokens) return error.BadFlashNextPageTest;
-    if (tokens == 0) return seqBytes(cap, h);
+    if (tokens == 0) return seqBytesOf(cap, h, kv8);
     // the pages hold the whole layer's KV rows (cuda_pages.zig): a rank's half heads take none
     if (!h.eql(.full)) return error.FlashNextPagesUnsupported;
     const p = try pages.checkedLayout(cap, tokens);
-    return std.math.add(usize, seqBytes(cap, h) - attnBytes(cap, h), p.total) catch error.BadFlashNextPageTest;
+    return std.math.add(usize, seqBytesOf(cap, h, kv8) - attnBytesOf(cap, h, kv8), p.total) catch error.BadFlashNextPageTest;
 }
 
 test "a sequence's device bytes grow by the twelve attention layers' keys, values, indexer keys and pooled blocks" {
@@ -81,6 +108,20 @@ test "a stream at 65,536 tokens: 1.84 GiB with the whole layer, 1.04 GiB with a 
     try std.testing.expectEqual(@as(usize, 30720), convBytes(.half));
     try std.testing.expectEqual(@as(usize, 1_572_864), stateBytes(.half));
     try std.testing.expectEqual(@as(usize, cap * 512), kvBytes(cap, .half));
+}
+
+test "an fp8 cache: every position saves a 16-byte scale block's width from two bf16 rows" {
+    const cap = 65536;
+    for ([_]Heads{ .full, .half }) |h| {
+        // bf16: 2 rows of head_dim * 2 bytes a KV head; fp8: head_dim codes and 16 bytes of scales a head, then codes
+        try std.testing.expectEqual(cap * h.kv * (2 * wt.head_dim - 16), seqBytes(cap, h) - seqBytesOf(cap, h, true));
+        try std.testing.expect(kvKeyBytes(1, h, true) == h.kv * (wt.head_dim + 16));
+        try std.testing.expect(kvValueBytes(1, h, true) == h.kv * wt.head_dim);
+        try std.testing.expect(kvKeyBytes(1, h, false) == h.kvRow() and kvValueBytes(1, h, false) == h.kvRow());
+    }
+    // the whole layer at fp8: 12 KiB a token beside bf16's 24, so four 262,144-token streams fit the card's budget
+    const per_token = 12 * (Heads.full.kv8KeyRow() + Heads.full.kv8ValueRow());
+    try std.testing.expectEqual(@as(usize, 12_672), per_token);
 }
 
 test "the page diagnostic prices the whole layer's pages and refuses a rank's half of the heads" {
