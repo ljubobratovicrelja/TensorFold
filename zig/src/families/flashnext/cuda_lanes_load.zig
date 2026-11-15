@@ -31,10 +31,10 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     if (o.slide and captured != null) return error.TrainingOnCapturedGlue;
     const page_tokens = try @import("cuda_kv_lanes.zig").paging();
     if (page_tokens > 0 and (o.tp != 1 or o.slide or captured != null)) return error.FlashNextPagesUnsupported;
-    // --kv-cache fp8: the cache's rows are fp8, which the paged, vision, learned and captured paths do not lay out yet
+    // --kv-cache fp8: the cache's rows are fp8, which the paged, learned and captured paths do not lay out yet (images
+    // do: fn_attn_prep_media_kv8 quantizes their keys and values into the same rows)
     if (o.kv8 and page_tokens > 0) return error.FlashNextKv8PagesUnsupported;
     if (o.kv8 and captured != null) return error.FlashNextKv8CapturedGlue;
-    if (o.kv8 and o.vision != null) return error.FlashNextKv8VisionUnsupported;
     if (o.kv8 and o.slide) return error.FlashNextKv8LearningUnsupported;
     if (o.kv8 and o.tp > 1) return error.FlashNextKv8RanksUnsupported;
     // pending DeltaNet rows run on one GPU only: TF_FLASHNEXT_KEEP_LATE=1 with tensor parallel is refused
@@ -87,6 +87,8 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
         if (own.set != null) return error.VisionCapturedSetUnsupported;
         own.vision = try images.Vision.load(gpa, io, driver, own.stream, dir, limits, o.rank, own.glue.f.prep_media, own.glue.f.pool_media, own.glue.f.prep_media_paged, own.glue.f.pool_media_paged);
         own.engine.image_factory = own.vision;
+        // --kv-cache fp8: the media prep quantizes its keys and values into the fp8 rows (cuda_kv.zig)
+        if (o.kv8) own.vision.?.prep8 = own.glue.f.prep_media_kv8;
     }
     errdefer if (own.vision) |v| v.deinit();
     // the pass's scratch for a full chunk, once for the engine (every prompt, window, round and head pass)

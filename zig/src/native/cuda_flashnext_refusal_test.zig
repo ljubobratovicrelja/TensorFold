@@ -32,4 +32,7 @@ pub fn vision() !void {
     };
     try std.testing.expect(refusals.family(VisionFamily, o) == null);
     try std.testing.expect(refusals.family(F, .{ .dir = "d", .model_type = F.model_type }) == null);
+    // --kv-cache fp8 reads images through fn_attn_prep_media_kv8, so the pair must be admitted; paging is still refused
+    // inside the opener (TF_FLASHNEXT_KV_PAGES is an environment flag admission cannot see).
+    try std.testing.expect(refusals.family(F, .{ .dir = "d", .model_type = F.model_type, .kv8 = true, .vision = .{} }) == null);
 }

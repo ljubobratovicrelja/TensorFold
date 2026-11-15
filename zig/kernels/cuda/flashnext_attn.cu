@@ -195,6 +195,20 @@ extern "C" __global__ void __launch_bounds__(256) fn_attn_prep_media(const __nv_
                              delta, Pg{});
 }
 
+// fn_attn_prep_media into fp8 caches: the media positions' rope3/n/delta as fn_attn_prep_media's, KC [cap, NKV, KS] and
+// VC [cap, NKV, HD] bytes as fn_attn_prep_kv8's.
+extern "C" __global__ void __launch_bounds__(256) fn_attn_prep_media_kv8(const __nv_bfloat16* __restrict__ P, const int* __restrict__ POS0,
+                                                               const float* __restrict__ QW, const float* __restrict__ KW,
+                                                               const float* __restrict__ IW, const float* __restrict__ INV,
+                                                               __nv_bfloat16* __restrict__ Q, unsigned char* __restrict__ KC,
+                                                               unsigned char* __restrict__ VC, __nv_bfloat16* __restrict__ IQ,
+                                                               __nv_bfloat16* __restrict__ IKC, float eps, int PW, int NQ, int NKV,
+                                                               int NI, int IHD, int HALF, const int* rope3, int n, int delta) {
+    fn_attn_prep_body<false, true>(P, POS0, QW, KW, IW, INV, Q, reinterpret_cast<__nv_bfloat16*>(KC),
+                                   reinterpret_cast<__nv_bfloat16*>(VC), IQ, IKC, eps, PW, NQ, NKV, NI, IHD, HALF, rope3, n,
+                                   delta, Pg{});
+}
+
 // fn_attn_prep through a stream's page table: KC, VC and IKC are its arena's slot in page 0.
 extern "C" __global__ void __launch_bounds__(256)
     fn_attn_prep_paged(const __nv_bfloat16* __restrict__ P, const int* __restrict__ POS0, const float* __restrict__ QW,

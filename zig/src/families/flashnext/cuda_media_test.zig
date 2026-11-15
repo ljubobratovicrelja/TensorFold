@@ -17,12 +17,14 @@ const Capture = struct {
             2 => 21,
             4 => 22,
             5 => 14,
+            6 => 21,
             else => 13,
         };
         for (0..count) |i| {
             const wide = switch (id) {
                 1 => i < 3,
                 2, 4 => i < 11 or i == 18 or i == 21,
+                6 => i < 11 or i == 18,
                 else => i < 5 or i == 10 or i == 13,
             };
             values[calls][i] = if (wide) @as(*const u64, @ptrCast(@alignCast(args.?[i].?))).* else @as(*const u32, @ptrCast(@alignCast(args.?[i].?))).*;
@@ -83,4 +85,20 @@ test "a paged stream's media rows take the paged launches: the same arguments, i
     try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4, 5, eps, 8, wt.index_dim, wt.half, wt.index_ratio, 3000, 20, delta, 7000 }, Capture.values[1][0..14]);
     try std.testing.expectEqual([7]u32{ 3, wt.q_heads + wt.kv_heads + wt.index_heads + 1, 1, 256, 1, 1, 0 }, Capture.configs[0]);
     try std.testing.expectEqual([7]u32{ 8 / wt.index_ratio + 2, 1, 1, 128, 1, 1, 0 }, Capture.configs[1]);
+}
+
+test "an fp8 stream's media rows take the kv8 prep: the same arguments, no page table" {
+    var d: cuda.Driver = undefined;
+    d.api.cuLaunchKernel = Capture.launch;
+    const s: cuda.Stream = .{ .d = &d, .handle = @ptrFromInt(99) };
+    Capture.calls = 0;
+    var m = view(&d, 1000);
+    m.prep8 = .{ .d = &d, .handle = @ptrFromInt(6) };
+    try m.attn(s, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 1e-6, 3, .full, .{});
+    const eps: u32 = @bitCast(@as(f32, 1e-6));
+    const delta: u32 = @bitCast(@as(i32, -2));
+    try std.testing.expectEqual(@as(usize, 1), Capture.calls);
+    try std.testing.expectEqual(@as(usize, 6), Capture.fns[0]);
+    try std.testing.expectEqualSlices(u64, &.{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, eps, wt.proj_n, wt.q_heads, wt.kv_heads, wt.index_heads, wt.index_dim, wt.half, 3000, 20, delta }, Capture.values[0][0..21]);
+    try std.testing.expectEqual([7]u32{ 3, wt.q_heads + wt.kv_heads + wt.index_heads + 1, 1, 256, 1, 1, 0 }, Capture.configs[0]);
 }

@@ -81,8 +81,9 @@ const Fns = struct {
     merge_lanes: cuda.Function,
     chunks_one_paged: cuda.Function,
     fused_paged: cuda.Function,
-    /// The same three entries over fp8 caches (--kv-cache fp8): prep, chunks, fused.
+    /// The same entries over fp8 caches (--kv-cache fp8): prep, the media prep, chunks, fused.
     prep_kv8: cuda.Function,
+    prep_media_kv8: cuda.Function,
     chunks_kv8: cuda.Function,
     fused_kv8: cuda.Function,
 };
@@ -182,6 +183,7 @@ pub const Glue = struct {
             .chunks_one_paged = try g.attn.function("fn_attn_chunks_one_paged"),
             .fused_paged = try g.attn.function("fn_attn_fused_paged"),
             .prep_kv8 = try g.attn.function("fn_attn_prep_kv8"),
+            .prep_media_kv8 = try g.attn.function("fn_attn_prep_media_kv8"),
             .chunks_kv8 = try g.attn.function("fn_attn_chunks_kv8"),
             .fused_kv8 = try g.attn.function("fn_attn_fused_kv8"),
         };
