@@ -134,29 +134,27 @@ python3 tools/bench_fill.py http://127.0.0.1:8080 MODEL --corpus FILE --long 655
 `both_done_s` and the reply's largest gaps for each order, plus `alone` for the sum to compare `both_done_s` with. `exact`
 is true only when every reply's `token_sha256` equals its run alone; the tool exits 1 when it isn't, or when `cold` isn't.
 
-## The standard serving matrix: agents x fill
+## The standard serving run
 
-`tools/bench_matrix.py` is the default "is serving healthy" speed check: 1, 2, 4 and 6 agents at a clear 20k and 100k
-context, one pass per cell. Every agent gets its own filled prompt, so each cell is a cold prefill of that fill followed
-by decode under N-way concurrency - no warm replay, no shared prefix, which is what keeps the whole matrix to minutes.
-Greedy, thinking off, 128 tokens a stream.
+`tools/bench_serving.py` is the run the numbers quoted for the DGX Spark come from (the 2026-11-14
+`tensorfold-1.1.4-parallel4` and 2026-11-15 `upstream-1.2.9` receipts). Engine-agnostic — OpenAI API only — so the same
+script measures vLLM and TensorFold:
 
 ```sh
-python3 tools/bench_matrix.py                                   # :8005, 1,2,4,6 x 20000,100000
-python3 tools/bench_matrix.py --agents 1,2,4 --fill 20000 --out /tmp/m.json
+BASE_URL=http://127.0.0.1:8005/v1 MODEL=qwen3.8-flash-next OUT=results/run.json LABEL=my-build python3 tools/bench_serving.py
+PHASES=long,short,prefill   # subset to run
 ```
 
-The table gives the measured prompt tokens (the filler is word-based, so expect a few percent over the target), median
-TTFT, median per-stream decode tok/s, aggregate tok/s and wall. It exits 1 if any stream errored, so it can gate a
-deploy. Six agents on a four-lane server is the interesting row: four run, two queue, and the wall plus per-stream decode
-show the queue - that is the lanes working, not a failure.
+Protocol: every measured row is preceded by an unmeasured pass of the same prompts, so the prefix is cached and the
+kernels are hot before anything is timed. Phases are short (1, 2 and 4 agents, 600 tokens), long (32768 at 1, 2 and 4
+agents; 258000 at 1 and 4) and prefill (4096, 32768, 131072, one request each). Decode is `(completion_tokens - 1) /
+(last piece - first piece)`, the sparkDash definition, so TTFT is excluded.
 
-**Reading the multi-agent rows.** Distinct prompts are prefilled one at a time, in arrival order. Four distinct 20k
-prompts on the DGX Spark measured TTFT 12.0 / 24.1 / 33.3 / 41.1 s with wall 42.5 s; four *identical* 20k prompts share
-one prefill (TTFT 9.8-10.3 s, wall 12.3 s). The engine keeps one prompt pass, so the Nth agent waits N prefill times for
-its first token, and only decode after that is concurrent - which is why per-stream decode falls as agents rise even
-though aggregate throughput does not. Read `ttft spread` and `cell/s` together, and never compare a 4-agent row with a
-single-agent one as if prefill were parallel. Whether the disk tier contributes to the serialisation was not isolated.
+It is not a cold-fill test. A row whose prefix does not fit the prompt cache loses the warm pass and turns cold: the
+258000 x 4 row does exactly that (TTFT 363 s, 1.7 tok/s a stream), because prefills then run one at a time behind each
+other and only decode overlaps. Quote the warm rows as serving rates and that cold row as first-turn cost, not the other
+way round. A cold fill costs about 10 s of prefill at 20k and 50 s at 100k, paid serially when several agents start at
+once; repeat turns hit the imprint and cost nothing.
 
 ## Model-free checks
 
