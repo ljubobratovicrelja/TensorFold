@@ -701,24 +701,26 @@ pub const Draft = struct {
         try rmsnorm(s, b.h, l.input_norm, b.x, B);
         try dense(s, b.x, l.attn_conv, b.dyn, dyn, H, B);
         try dynConv(s, b.x, b.dyn, l.attn_base, 0, b.xin, 0);
-        try dense(s, b.xin, l.q, b.qraw, qw, H, B);
-        try dense(s, b.xin, l.k, b.kraw, kvw, H, B);
-        try dense(s, b.xin, l.v, b.vb, kvw, H, B);
+        // the block's attention projections: one launch each for all B rows, so a weight row streams
+        // once a layer instead of once a row (`denseBatch`'s bytes are `dense`'s, bit for bit)
+        try denseBatch(s, b.xin, l.q, b.qraw, qw, H, B);
+        try denseBatch(s, b.xin, l.k, b.kraw, kvw, H, B);
+        try denseBatch(s, b.xin, l.v, b.vb, kvw, H, B);
         try normRope(s, b.qraw, l.q_norm, b.q, qw, c.heads, pos, B);
         try normRope(s, b.kraw, l.k_norm, b.kb, kvw, c.kv_heads, pos, B);
         // the prefix's keys and values, into this layer's ring at the positions they were captured at
         try s.prefix(st, b, l, i, r);
         try attn(s, st, i, b, lo, r.ctx_len, B);
-        try dense(s, b.att, l.o, b.o, H, qw, B);
+        try denseBatch(s, b.att, l.o, b.o, H, qw, B);
         try dynConv(s, b.o, b.dyn, l.attn_base, b.h, b.h2, 1);
         // mlp: norm, prepare, gate/up/silu, down, finish
         try rmsnorm(s, b.h2, l.post_norm, b.x, B);
         try dense(s, b.x, l.mlp_conv, b.dyn, dyn, H, B);
         try dynConv(s, b.x, b.dyn, l.mlp_base, 0, b.xin, 0);
-        try dense(s, b.xin, l.gate, b.gate, c.intermediate, H, B);
-        try dense(s, b.xin, l.up, b.up, c.intermediate, H, B);
+        try denseBatch(s, b.xin, l.gate, b.gate, c.intermediate, H, B);
+        try denseBatch(s, b.xin, l.up, b.up, c.intermediate, H, B);
         try siluMul(s, b.gate, b.up, b.act, B * c.intermediate);
-        try dense(s, b.act, l.down, b.o, H, c.intermediate, B);
+        try denseBatch(s, b.act, l.down, b.o, H, c.intermediate, B);
         try dynConv(s, b.o, b.dyn, l.mlp_base, b.h2, b.h, 1);
     }
 
@@ -937,8 +939,21 @@ fn attn(s: *Draft, st: *State, i: usize, b: *const Bufs, pos0: c_longlong, ctx_l
 
 /// `Y[r, j] = X[r, :] @ W[j, :]`, bf16 in and out with fp32 sums in a fixed order
 /// (`qwen35_bf16_rows.cu`'s `tf_q35_dense_bf16`: grid (n, rows), 256 threads).
+///
+/// One CTA an output element, so the weight row a column streams once a row. For the block's own
+/// projections that is the whole of a layer's DRAM traffic times the block: `denseBatch` is the same
+/// dot with the block's rows in one CTA, and the same bytes out.
 fn dense(s: *Draft, x: u64, w: u64, out: u64, n: usize, k: usize, rows: usize) !void {
     return s.rows.denseRows(s.stream, x, w, out, rows, n, k);
+}
+
+/// `Y[r, j] = X[r, :] @ W[j, :]` for the block's `rows` at once (`qwen35_bf16_rows.cu`'s
+/// `tf_q35_dense_bf16_batch`: grid (n, 1), 256 threads, no shared memory).
+///
+/// Bit-identical to `dense` for every (row, j), so the kernels after it — the per-head norm and
+/// rotation, the silu-mul, the dynamic convolution — read exactly the bytes they read before.
+fn denseBatch(s: *Draft, x: u64, w: u64, out: u64, n: usize, k: usize, rows: usize) !void {
+    return s.rows.denseBatch(s.stream, x, w, out, rows, n, k);
 }
 
 /// tf_fxd2_silu_mul(GATE, UP, OUT, n): one thread an element.
@@ -1171,6 +1186,40 @@ test "the served drafter is exactly the shape this module's kernels fix" {
     try std.testing.expectEqual(@as(usize, 16), c.topk);
     try std.testing.expectEqual(@as(usize, 256), c.rank);
     try std.testing.expect(c.topk <= 32 and c.rank <= 256);
+}
+
+test "the block's seven projections are one launch each, at the widths and input widths they were" {
+    // `layer` hands `denseBatch` the same buffers, widths and `B` rows the seven `dense` calls took, so
+    // nothing about `Bufs` or `place` moves with this: what is pinned here is the shape of the seven
+    // swaps — the weight's row count and the input width each projection is asked for.
+    const c = try draft2.parse(std.testing.allocator, served_json, testTarget());
+    const B = c.block;
+    const kern = cuda.qwen35_bf16_rows;
+    // q, k, v, o, gate, up, down: n (the weight's rows) and k (the input width), as `layer` passes them
+    const proj = [_][2]usize{
+        .{ c.qWidth(), c.hidden },
+        .{ c.kvWidth(), c.hidden },
+        .{ c.kvWidth(), c.hidden },
+        .{ c.hidden, c.qWidth() },
+        .{ c.intermediate, c.hidden },
+        .{ c.intermediate, c.hidden },
+        .{ c.hidden, c.intermediate },
+    };
+    try std.testing.expectEqual(@as(usize, 7), proj.len);
+    // the served block is one launch a projection: the kernel takes up to 16 rows
+    try std.testing.expect(B <= kern.batch_rows);
+    for (proj) |p| {
+        const n = p[0];
+        const k = p[1];
+        // `denseBatch`'s two refusals: a width its int argument cannot carry, and an input width that
+        // is not whole uint4 words (the loop reads k / 8 of them, as the per-element kernel does)
+        try std.testing.expect(n > 0 and n <= std.math.maxInt(i32));
+        try std.testing.expectEqual(@as(usize, 0), k % 8);
+    }
+    // the seven widths at the served shape: 4096 q/o, 1024 k/v, 7680 gate/up, 2560 down's rows
+    try std.testing.expectEqual(@as(usize, 4096), c.qWidth());
+    try std.testing.expectEqual(@as(usize, 1024), c.kvWidth());
+    try std.testing.expectEqual(@as(usize, 7680), c.intermediate);
 }
 
 test "a round's scratch is one block plus one context chunk, 256-byte aligned, and measured the same twice" {

@@ -9,13 +9,22 @@ const launch = @import("launch.zig");
 
 const threads = 256;
 
+/// Rows `denseBatch` takes at most: `tf_q35_dense_bf16_batch`'s `tf_q35_batch_rows`.
+pub const batch_rows = 16;
+
 pub const Kernels = struct {
     mod: Module,
     embed_fn: Function,
     dense_fn: Function,
+    dense_batch_fn: Function,
 
     pub fn resolve(mod: Module) !Kernels {
-        return .{ .mod = mod, .embed_fn = try mod.function("tf_q35_embed_bf16"), .dense_fn = try mod.function("tf_q35_dense_bf16") };
+        return .{
+            .mod = mod,
+            .embed_fn = try mod.function("tf_q35_embed_bf16"),
+            .dense_fn = try mod.function("tf_q35_dense_bf16"),
+            .dense_batch_fn = try mod.function("tf_q35_dense_bf16_batch"),
+        };
     }
 
     /// Load the embedded module (owned: call unload) and resolve its functions.
@@ -49,5 +58,21 @@ pub const Kernels = struct {
         for ([_]u64{ x, w, out }) |v| a.add(v);
         for ([_]usize{ n, k }) |v| a.add(@as(i32, @intCast(v)));
         try launch.launch(kn.dense_fn, .{ .grid = .{ .x = @intCast(n), .y = @intCast(rows), .z = 1 }, .block = .{ .x = threads } }, s, &a);
+    }
+
+    /// out[rows][n] = x[rows][k] @ w[n][k]^T for every row at once: grid (n, 1), one CTA an output
+    /// column, a weight row read once for the whole block instead of once a row (the served block's
+    /// projections are 8x less weight traffic; measured 3-8x at the served shapes, 7-8x on the wide ones).
+    ///
+    /// The bits are `denseRows`'s bit for bit — the same per-thread stride-256 order over k / 8 uint4
+    /// words, the same warp shuffle, the same thread-0 sum — so a caller can swap one launch for `rows`
+    /// and read the same bytes downstream. rows <= 16, k % 8 == 0, aligned; no shared memory.
+    pub fn denseBatch(kn: *const Kernels, s: Stream, x: u64, w: u64, out: u64, rows: usize, n: usize, k: usize) !void {
+        if (rows == 0 or n == 0) return;
+        if (rows > batch_rows or k == 0 or k % 8 != 0 or k > std.math.maxInt(i32) or n > std.math.maxInt(i32) or x % 16 != 0 or w % 16 != 0) return error.RowShape;
+        var a: launch.Args = .{};
+        for ([_]u64{ x, w, out }) |v| a.add(v);
+        for ([_]usize{ n, k, rows }) |v| a.add(@as(i32, @intCast(v)));
+        try launch.launch(kn.dense_batch_fn, .{ .grid = .{ .x = @intCast(n), .y = 1, .z = 1 }, .block = .{ .x = threads } }, s, &a);
     }
 };
