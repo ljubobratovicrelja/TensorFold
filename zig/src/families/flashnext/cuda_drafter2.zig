@@ -618,20 +618,21 @@ pub const Draft2 = struct {
 // device — a round's GPU half is `cuda_draft2_fwd.zig`'s, measured by `cuda_draft2_check.zig`.
 // -----------------------------------------------------------------------------------------------
 
-test "a round's prefix span is the drafter's window of positions, ending on the anchor" {
-    // a stream's first token: one row, the anchor itself
-    try std.testing.expect(Span.eql(.{ .lo = 0, .len = 1 }, span(0, 2048)));
-    try std.testing.expect(Span.eql(.{ .lo = 0, .len = 2 }, span(1, 2048)));
-    // a prefix shorter than the window reads all of it
-    try std.testing.expect(Span.eql(.{ .lo = 0, .len = 2048 }, span(2047, 2048)));
+test "a round's prefix span is the drafter's window of positions, ending one before the anchor" {
+    // a stream's first token: no context yet, the block's row 0 is the anchor itself
+    try std.testing.expect(Span.eql(.{ .lo = 0, .len = 0 }, span(0, 2048)));
+    try std.testing.expect(Span.eql(.{ .lo = 0, .len = 1 }, span(1, 2048)));
+    // a prefix shorter than the window reads everything up to the anchor
+    try std.testing.expect(Span.eql(.{ .lo = 0, .len = 2047 }, span(2047, 2048)));
+    // at the window, the span covers the whole window and ends one before the anchor
+    try std.testing.expect(Span.eql(.{ .lo = 0, .len = 2048 }, span(2048, 2048)));
     // past the window, the span slides one position a token
-    try std.testing.expect(Span.eql(.{ .lo = 1, .len = 2048 }, span(2048, 2048)));
-    try std.testing.expect(Span.eql(.{ .lo = 4097, .len = 2048 }, span(6144, 2048)));
-    // the span always ends on the anchor, and never outruns the window
+    try std.testing.expect(Span.eql(.{ .lo = 4096, .len = 2048 }, span(6144, 2048)));
+    // the span always ends one before the anchor, and never outruns the window
     for ([_]u64{ 0, 1, 7, 2047, 2048, 2049, 100_000 }) |anchor| {
         const sp = span(anchor, 2048);
-        try std.testing.expectEqual(anchor, sp.lo + sp.len - 1);
-        try std.testing.expect(sp.len >= 1 and sp.len <= 2048);
+        try std.testing.expectEqual(anchor, sp.lo + sp.len);
+        try std.testing.expect(sp.len <= 2048);
     }
 }
 
@@ -644,10 +645,10 @@ test "a span is one ring run when it does not wrap and two when it does, and the
     try std.testing.expectEqual(@as(usize, 0), early[1].n);
     // a span that starts past `rows - len` wraps: the tail, then the ring's head
     const sp = span(3000, 2048);
-    try std.testing.expectEqual(@as(u64, 953), sp.lo);
+    try std.testing.expectEqual(@as(u64, 952), sp.lo);
     const wrapped = runs(sp.lo, sp.len, rows);
-    try std.testing.expect(Run.eql(.{ .at = 953, .n = 1111 }, wrapped[0]));
-    try std.testing.expect(Run.eql(.{ .at = 0, .n = 937 }, wrapped[1]));
+    try std.testing.expect(Run.eql(.{ .at = 952, .n = 1112 }, wrapped[0]));
+    try std.testing.expect(Run.eql(.{ .at = 0, .n = 936 }, wrapped[1]));
     try std.testing.expectEqual(sp.len, wrapped[0].n + wrapped[1].n);
     // a span exactly filling the ring is one run and lands on the slot the next position uses
     const full = runs(0, rows, rows);
@@ -708,17 +709,22 @@ test "a stream's ring floor is its newest rows, and never behind the first row i
 
 test "a round is refused when its prefix is not in its own ring" {
     const rows = tapring.rowsFor(2048, 8);
-    const sp = span(3000, 2048); // lo 953, len 2048
+    const sp = span(3000, 2048); // lo 952, len 2048
     // the ring holds everything from the stream's first pass to its newest
     try std.testing.expect(roundRefusal(sp, 0, 3001, 3001, 3000, rows) == null);
-    // the anchor's row is past what any pass wrote: a shared verify, or none yet
-    try std.testing.expectEqual(@as(?anyerror, error.DraftTapNotWritten), roundRefusal(sp, 0, 3000, 3001, 3000, rows));
+    // the anchor's own row may be missing (the first token was sampled from the prefill's last
+    // row), as long as the context up to anchor - 1 is written and absorbed
+    try std.testing.expect(roundRefusal(sp, 0, 3000, 3000, 3000, rows) == null);
+    // the context's last row is not written: nothing to draft from
+    try std.testing.expectEqual(@as(?anyerror, error.DraftTapNotWritten), roundRefusal(sp, 0, 2999, 2999, 3000, rows));
     // the ring wrapped, so the oldest rows of the span are another position's
     try std.testing.expectEqual(@as(?anyerror, error.DraftTapNotCovered), roundRefusal(sp, 1000, 3001, 3001, 3000, rows));
     // the ring holds the rows but the drafter was never handed the anchor's token
-    try std.testing.expectEqual(@as(?anyerror, error.DraftAbsorbMissing), roundRefusal(sp, 0, 3001, 3000, 3000, rows));
+    try std.testing.expectEqual(@as(?anyerror, error.DraftAbsorbMissing), roundRefusal(sp, 0, 3001, 2999, 3000, rows));
     // a span longer than the ring cannot be served at any position
     try std.testing.expectEqual(@as(?anyerror, error.DraftWindowPastRing), roundRefusal(.{ .lo = 0, .len = rows + 1 }, 0, 1 << 20, 1 << 20, 1 << 20, rows));
+    // an empty span (a round at position 0) has no context to draft from
+    try std.testing.expectEqual(@as(?anyerror, error.DraftNoContext), roundRefusal(.{ .lo = 0, .len = 0 }, 0, 1 << 20, 1 << 20, 0, rows));
 }
 
 test "a shared round's lanes must read the same span, and a tree is not grown here" {
