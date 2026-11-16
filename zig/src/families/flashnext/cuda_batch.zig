@@ -190,6 +190,21 @@ pub fn Pass(comptime Tri: type) type {
             return self.readoutKeep(hc_w, r0, n, .{});
         }
 
+        /// Copy the completed output of tapped `layer` out of the pass's rows (DFlash2's taps).
+        ///
+        /// flashnext keeps four hyper-connection streams, so a layer's output is `wide` = 4 x hidden
+        /// bf16 a row; the whole row is stored and the drafter's own `fc` decides how to collapse it.
+        /// The write-back is flushed here rather than left for the head because `s.h` holds only the
+        /// most recent layer's output — read it after a later layer and the tap silently holds the
+        /// wrong layer, which shows up as a weak drafter rather than as an error.
+        pub fn tapDump(self: *Self, layer: usize) !void {
+            const slot = parts.tapSlot(self.hooks, layer) orelse return;
+            const dst = self.hooks.taps_out[slot];
+            if (dst == 0) return;
+            try self.writeback(0, self.rows);
+            try self.copy(dst, self.s.h, self.rows * wide * 2);
+        }
+
         /// readout, keeping what its backward reads (rows r0 = 0 on): the streams, normed rows, v, up rows, gates.
         pub fn readoutKeep(self: *Self, hc_w: HcW, r0: usize, n: usize, keep: HcKeep) !void {
             const s = self.s;
@@ -557,6 +572,9 @@ pub fn Pass(comptime Tri: type) type {
                 }
                 try self.moeBlockKeep(lw, keep);
                 try self.moeAdds(layer, keep);
+                // A tapped layer's output is copied out here, while `s.h` still holds it: the next
+                // layer overwrites it. See Hooks.tapDump for why the flush cannot wait for the head.
+                if (parts.tapSlot(self.hooks, layer) != null) try self.tapDump(layer);
                 self.pending = layer;
             }
             try self.head(logits_host);

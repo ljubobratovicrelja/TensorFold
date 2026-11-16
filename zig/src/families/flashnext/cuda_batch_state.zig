@@ -152,7 +152,20 @@ pub const Hooks = struct {
     host_logits: bool = true,
     /// Prompt cache marks inside this pass (TF_FLASHNEXT_KEEP_INPASS): each one's states go to its kept state's buffer.
     marks: [max_marks]Mark = .{ .{}, .{} },
+    /// A drafter's taps (DFlash2): the completed layer output after these layers, `wide` bytes a row,
+    /// written to `taps_out[i]` in tap order. 0 taps: none. Read by `tapDump` and, once the drafter
+    /// lands, by its cross-attention. A tapped layer's write-back is flushed early, so the rows it
+    /// copies are that layer's output and not a later layer's.
+    taps: [8]u32 = @splat(0),
+    n_taps: usize = 0,
+    taps_out: [8]u64 = @splat(0),
 };
+
+/// Whether `layer` is one of the pass's taps, and which tap slot it fills.
+pub fn tapSlot(h: Hooks, layer: usize) ?usize {
+    for (h.taps[0..h.n_taps], 0..) |t, i| if (t == layer) return i;
+    return null;
+}
 
 /// Rows a layer's pending-row log holds, and the pending count past which a chain stores its state in place.
 pub const late_rows: usize = 48;

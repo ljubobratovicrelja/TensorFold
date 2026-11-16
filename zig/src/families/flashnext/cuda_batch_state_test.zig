@@ -1,5 +1,6 @@
 //! Failure injection for the production staging fence.
 const std = @import("std");
+const parts = @import("cuda_batch_state.zig");
 const Staging = @import("cuda_batch_state.zig").Staging;
 const FakeQueue = struct {
     queued: usize = 0,
@@ -77,4 +78,25 @@ test "a failed staging drain keeps the upload guard set until a successful retry
     try std.testing.expect(!g.open);
     try std.testing.expectEqual(@as(usize, 0), fq.queued);
     try std.testing.expectEqual(@as(usize, 2), fq.drains);
+}
+
+test "no taps configured: every layer's slot is null, so the tap hook copies nothing" {
+    // The guarantee that adding the hook cannot perturb a build that drafts with the MTP head:
+    // n_taps is 0 unless a drafter asked, and the slot scan then never matches a layer.
+    const none: parts.Hooks = .{};
+    try std.testing.expectEqual(@as(usize, 0), none.n_taps);
+    for (0..48) |layer| try std.testing.expect(parts.tapSlot(none, layer) == null);
+
+    // With the served drafter's five taps, each tapped layer maps to its own slot and no other does.
+    var some: parts.Hooks = .{};
+    some.taps = .{ 5, 15, 25, 35, 45, 0, 0, 0 };
+    some.n_taps = 5;
+    try std.testing.expectEqual(@as(?usize, 0), parts.tapSlot(some, 5));
+    try std.testing.expectEqual(@as(?usize, 1), parts.tapSlot(some, 15));
+    try std.testing.expectEqual(@as(?usize, 4), parts.tapSlot(some, 45));
+    try std.testing.expect(parts.tapSlot(some, 6) == null);
+    try std.testing.expect(parts.tapSlot(some, 0) == null);
+    try std.testing.expect(parts.tapSlot(some, 47) == null);
+    // a slot past n_taps is never reached, so the zero padding cannot alias layer 0
+    try std.testing.expect(parts.tapSlot(some, 0) == null);
 }
