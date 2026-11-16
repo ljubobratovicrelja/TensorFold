@@ -491,8 +491,8 @@ test "a detiled block is the weight the engine packed" {
     const a = std.testing.allocator;
     // k = 128 is two 64-column blocks; n = 70 runs past the packing's 64-row tile, so the second
     // block is short and its padding rows must not be written.
-    const n = 70;
-    const k = 128;
+    const n: usize = 70;
+    const k: usize = 128;
     const npad = (n + 127) / 128 * 128;
     const w = try a.alloc(u16, n * k);
     defer a.free(w);

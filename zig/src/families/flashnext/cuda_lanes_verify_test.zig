@@ -28,7 +28,11 @@ const Owner = struct {
         }
     };
     const Ops = struct {
+        const S = struct {
+            pub fn synchronize(_: *@This()) !void {}
+        };
         log: *Log,
+        e: struct { stream: *S = undefined } = .{},
         pub fn verify(o: Ops, _: *prompt.Seq, _: *mtp.Draft, _: []const u32) !void {
             o.log.add(0);
         }
@@ -41,6 +45,9 @@ const Owner = struct {
         pub fn draws(_: Ops, _: *mtp.Draft, _: anytype, _: []const u32, _: []u32) !void {}
     };
     log: Log = .{},
+    drafter: ?struct {
+        pub fn note(_: *const @This(), _: *lanes.Stream, _: u64, _: u64) void {}
+    } = null,
     lanes_: [4]Lane = .{ .{}, .{}, .{}, .{} },
     streams: [4]lanes.Stream = undefined,
     ranks: ?*Ranks = null,
@@ -55,6 +62,10 @@ const Owner = struct {
     }
     pub fn ops(o: *Owner) Ops {
         return .{ .log = &o.log };
+    }
+    pub fn opsTapped(o: *Owner, s: *lanes.Stream) Ops {
+        _ = s; // the fixture's windows hold no tap ring: the lone path records the same
+        return o.ops();
     }
 };
 
