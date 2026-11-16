@@ -428,10 +428,14 @@ extern "C" __global__ void __launch_bounds__(256) tf_fxd2_head_topk(const __nv_b
 // for the layout, so its write is one contiguous list a CTA, and the merge pass reads its row strided
 // — a few thousand cached reads against the scan's 1.27 GB of weights.
 
-// The head's first pass: logits = X[blockIdx.y] @ HEAD^T in fp32 over vocabulary entries
-// [tile * blockIdx.x, min(V, +tile)), then the top `topk` of that slice, descending, into PARTIAL at
-// ((blockIdx.x * rows) + blockIdx.y) * topk as the candidates `tf_fxd2_headmerge` reads. Grid
-// (tiles, rows), 256 threads, dynamic shared of H * 2 + (blockDim.x / 32) * topk * 8 bytes.
+// The head's first pass: logits = X[blockIdx.x] @ HEAD^T in fp32 over vocabulary entries
+// [tile * blockIdx.x, min(V, +tile)). One CTA a tile, looping the block's rows inside it: a
+// tile's weights are 5 MiB, and a grid of (tiles, rows) CTAs streamed them once per row (seven
+// times over, 220 GB/s of pure re-read for a 1.27 GB head); looping the rows inside the CTA
+// streams each tile once and reuses it across the block, which is what the round actually pays
+// for. The per-row top `topk` of the slice lands in PARTIAL at
+// ((blockIdx.x * rows) + row) * topk as the candidates `tf_fxd2_headmerge` reads. Grid (tiles),
+// 256 threads, dynamic shared of H * 2 + (blockDim.x / 32) * topk * 8 bytes.
 // H % 8 == 0 and topk <= FXD2_TOP.
 extern "C" __global__ void __launch_bounds__(256) tf_fxd2_headtile(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ HEAD,
                                                                   Fxd2Cand* __restrict__ PARTIAL,
@@ -439,51 +443,56 @@ extern "C" __global__ void __launch_bounds__(256) tf_fxd2_headtile(const __nv_bf
     extern __shared__ __nv_bfloat16 fxd2_sh[];
     __nv_bfloat16* xs = fxd2_sh;
     Fxd2Cand* all = reinterpret_cast<Fxd2Cand*>(fxd2_sh + H);
-    const __nv_bfloat16* x = X + (size_t)blockIdx.y * H;
-    for (int i = threadIdx.x; i < H; i += blockDim.x) xs[i] = x[i];
-    __syncthreads();
-    Fxd2Cand mine[FXD2_TOP];
-    for (int i = 0; i < topk; i++) {
-        mine[i].v = -INFINITY;
-        mine[i].id = 0;
-    }
-    const uint4* xv = reinterpret_cast<const uint4*>(xs);
-    const int words = H / 8;
-    // A warp owns one entry at a time and its lanes split that entry's words, so the tile streams as
-    // coalesced 512-byte reads; a thread an entry would read the same bytes as 32-byte sectors, five
-    // KiB apart.
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
     const int warps = blockDim.x >> 5;
     const int first = blockIdx.x * tile;
     const int last = min(V, first + tile);
-    for (int v = first + warp; v < last; v += warps) {
-        const uint4* w = reinterpret_cast<const uint4*>(HEAD + (size_t)v * H);
-        float s = 0.0f;
-        for (int c = lane; c < words; c += 32) {
-            const uint4 a = xv[c], b = w[c];
-            const __nv_bfloat16* ab = reinterpret_cast<const __nv_bfloat16*>(&a);
-            const __nv_bfloat16* bb = reinterpret_cast<const __nv_bfloat16*>(&b);
-#pragma unroll
-            for (int e = 0; e < 8; e++) s = fmaf(bf(ab[e]), bf(bb[e]), s);
-        }
-#pragma unroll
-        for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
-        if (lane == 0) fxd2_insert(mine, topk, s, v);
-    }
-    // the tile's candidates are split by warp, so the merge reads every warp's list, not one thread's
-    if (lane == 0)
-        for (int i = 0; i < topk; i++) all[warp * topk + i] = mine[i];
-    __syncthreads();
-    if (threadIdx.x == 0) {
-        Fxd2Cand out[FXD2_TOP];
+    const int words = H / 8;
+    for (int r = 0; r < rows; r++) {
+        const __nv_bfloat16* x = X + (size_t)r * H;
+        for (int i = threadIdx.x; i < H; i += blockDim.x) xs[i] = x[i];
+        __syncthreads();
+        const uint4* xv = reinterpret_cast<const uint4*>(xs);
+        Fxd2Cand mine[FXD2_TOP];
         for (int i = 0; i < topk; i++) {
-            out[i].v = -INFINITY;
-            out[i].id = 0;
+            mine[i].v = -INFINITY;
+            mine[i].id = 0;
         }
-        for (int i = 0; i < warps * topk; i++) fxd2_insert(out, topk, all[i].v, all[i].id);
-        Fxd2Cand* dst = PARTIAL + ((size_t)blockIdx.x * rows + blockIdx.y) * topk;
-        for (int i = 0; i < topk; i++) dst[i] = out[i];
+        // A warp owns one entry at a time and its lanes split that entry's words, so the tile
+        // streams as coalesced 512-byte reads; a thread an entry would read the same bytes as
+        // 32-byte sectors, five KiB apart.
+        for (int v = first + warp; v < last; v += warps) {
+            const uint4* w = reinterpret_cast<const uint4*>(HEAD + (size_t)v * H);
+            float s = 0.0f;
+            for (int c = lane; c < words; c += 32) {
+                const uint4 a = xv[c], b = w[c];
+                const __nv_bfloat16* ab = reinterpret_cast<const __nv_bfloat16*>(&a);
+                const __nv_bfloat16* bb = reinterpret_cast<const __nv_bfloat16*>(&b);
+#pragma unroll
+                for (int e = 0; e < 8; e++) s = fmaf(bf(ab[e]), bf(bb[e]), s);
+            }
+#pragma unroll
+            for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+            if (lane == 0) fxd2_insert(mine, topk, s, v);
+        }
+        // the row's candidates are split by warp, so the merge reads every warp's list, not one
+        // thread's
+        if (lane == 0)
+            for (int i = 0; i < topk; i++) all[warp * topk + i] = mine[i];
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            Fxd2Cand out[FXD2_TOP];
+            for (int i = 0; i < topk; i++) {
+                out[i].v = -INFINITY;
+                out[i].id = 0;
+            }
+            for (int i = 0; i < warps * topk; i++) fxd2_insert(out, topk, all[i].v, all[i].id);
+            Fxd2Cand* dst = PARTIAL + ((size_t)blockIdx.x * rows + r) * topk;
+            for (int i = 0; i < topk; i++) dst[i] = out[i];
+        }
+        // the next row reloads xs and rewrites `all`
+        __syncthreads();
     }
 }
 

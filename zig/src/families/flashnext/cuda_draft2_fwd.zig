@@ -918,13 +918,14 @@ fn embed(s: *Draft, ids: u64, out: u64) !void {
 }
 
 /// The head, two passes: `tf_fxd2_headtile(X, HEAD, PARTIAL, H, V, topk, rows, tile)` on grid
-/// (tiles, rows), then `tf_fxd2_headmerge(PARTIAL, IDS, VAL, tiles, rows, topk)` on grid (rows);
+/// (tiles) — one CTA a tile, looping the block's rows so the tile's weights stream once — then
+/// `tf_fxd2_headmerge(PARTIAL, IDS, VAL, tiles, rows, topk)` on grid (rows);
 /// 256 threads each, `part` between them a `[tiles, rows, topk]` table of candidates.
 ///
 /// The split is occupancy, not arithmetic: the scan reads 1.27 GB of `lm_head` a round, and one CTA
 /// a row is seven CTAs of the card's twenty SMs, which measured 93 ms against a 5-15 ms band. The
-/// tiles are `head_tile` entries each, so `tiles * rows` CTAs stream the same bytes at a grid the
-/// card can fill; a CTA's list covers a 1,024-entry slice, which is enough headroom over `topk` that
+/// tiles are `head_tile` entries each, so `tiles` CTAs stream the head once at a grid the card can
+/// fill; a CTA's list covers a 1,024-entry slice, which is enough headroom over `topk` that
 /// the merge pass sees every entry that could be in the row's top-k.
 ///
 /// What the passes must reproduce is the single-pass form's answer (`tf_fxd2_head_topk`): the head's
@@ -945,7 +946,7 @@ fn headTopk(s: *Draft, x: u64, rows: usize, part: u64, ids: u64, val: u64) !void
     const tile_shared = c.hidden * 2 + lists * c.topk * 8;
     const merge_shared = @as(usize, threads) * c.topk * 8;
     if (tile_shared > 48 * 1024 or merge_shared > 48 * 1024) return error.HeadTopkSharedTooLarge;
-    try launch(s, s.fns.head_tile, .{ @intCast(tiles), @intCast(rows), 1 }, threads, @intCast(tile_shared), .{
+    try launch(s, s.fns.head_tile, .{ @intCast(tiles), 1, 1 }, threads, @intCast(tile_shared), .{
         x, s.target.head, part, ci(c.hidden), ci(c.vocab), ci(c.topk), ci(rows), ci(head_tile),
     });
     try launch(s, s.fns.head_merge, .{ @intCast(rows), 1, 1 }, threads, @intCast(merge_shared), .{
