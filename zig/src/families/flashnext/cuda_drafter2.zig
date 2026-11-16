@@ -30,6 +30,13 @@
 //! admission prices it before a request is admitted, exactly as it prices the target's caches.
 
 const std = @import("std");
+
+/// A monotonic reading for the throwaway `TF_TAP_TIME` bisect.
+fn nowNs() u64 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @intCast(@max(0, ts.sec) * std.time.ns_per_s + ts.nsec);
+}
 const cuda = @import("cuda");
 const lanes = @import("lanes");
 const batch = @import("cuda_batch_state.zig");
@@ -50,7 +57,7 @@ pub const default_window: usize = 2048;
 /// Lanes one `hold` takes at most: a round's streams (`cuda_lanes.zig`'s `round_streams`).
 pub const max_round: usize = 32;
 
-/// A round's prefix: positions [lo, lo + len), the anchor's row last.
+/// A round's prefix: positions [lo, lo + len), ending on the position *before* the anchor's own row.
 pub const Span = struct {
     lo: u64,
     len: usize,
@@ -63,9 +70,13 @@ pub const Span = struct {
 /// The prefix a round whose anchor sits at `anchor` reads: the drafter's window of positions, or
 /// everything up to the anchor when the anchor is younger than the window.
 pub fn span(anchor: u64, window: usize) Span {
-    const have: u64 = anchor + 1;
+    // The block's row 0 is the anchor, and it is embedded and rotated at the anchor's own position.
+    // A context that ended there too would put the same position in the keys twice and phase every
+    // context key one step late, which is what the vendor's `position_ids[:, start-ctx : start]`
+    // avoids: the context is the committed tokens up to the one before the anchor.
+    const have: u64 = anchor;
     const len: usize = @intCast(@min(@as(u64, @intCast(window)), have));
-    return .{ .lo = anchor + 1 - @as(u64, @intCast(len)), .len = len };
+    return .{ .lo = anchor - @as(u64, @intCast(len)), .len = len };
 }
 
 /// One contiguous run of a span inside a ring: `n` rows from slot `at`.
@@ -480,23 +491,37 @@ pub const Draft2 = struct {
         const st = self.states.get(it.stream) orelse return error.UnknownStream;
         const anchor = it.position - 1;
         const rows = self.ringRows();
-        // context is what the ring has: a first round runs before the anchor's own row exists
-        var ctx_span = sp;
-        if (st.written < ctx_span.lo + ctx_span.len and st.written > ctx_span.lo) ctx_span.len = @intCast(st.written - ctx_span.lo);
+        // the context never includes the anchor's row, so an unwritten anchor is not a reason to clip;
+        // a ring that holds less than the span is refused by the checks below, not silently shortened
+        const ctx_span = sp;
         if (roundRefusal(ctx_span, st.low(rows), st.written, st.covered, anchor, rows)) |e| {
             std.log.err("draft2 round refused ({s}): span [{d},{d}) low {d} written {d} covered {d} anchor {d} rows {d}", .{
                 @errorName(e), sp.lo, sp.lo + sp.len, st.low(rows), st.written, st.covered, anchor, rows,
             });
             return e;
         }
+        var t0: u64 = 0;
+        if (std.c.getenv("TF_TAP_TIME") != null) t0 = nowNs();
         const ctx = try self.gather(st, ctx_span);
+        var t1 = t0;
+        if (t0 != 0) t1 = nowNs();
         // A round rewrites its whole prefix into the drafter's k/v ring (`cuda_draft2_fwd.zig`'s
         // `prefix`), so the ring is contiguous by construction and the drafter's own "no gap" guard —
         // which is about a ring carried between rounds — must not see the rounds this stream skipped
         // (a copy round, a plain round, a rollback): `roundRefusal` above is the check that matters.
         st.st.end = 0;
         var out: [depth]u32 = @splat(0);
-        try self.fwd.draft(&st.st, .{ .ctx = ctx, .ctx_len = sp.len, .anchor = it.pending, .position = anchor }, out[0..depth]);
+        try self.fwd.draft(&st.st, .{ .ctx = ctx, .ctx_len = ctx_span.len, .anchor = it.pending, .position = anchor }, out[0..depth]);
+        if (t0 != 0) {
+            const t2 = nowNs();
+            std.log.info("draft2 round: {d:.1} ms = gather {d:.1} (ctx {d} rows) + draft {d:.1} (held {d})", .{
+                @as(f64, @floatFromInt(t2 - t0)) / 1e6,
+                @as(f64, @floatFromInt(t1 - t0)) / 1e6,
+                ctx_span.len,
+                @as(f64, @floatFromInt(t2 - t1)) / 1e6,
+                depth,
+            });
+        }
         st.held = out;
         st.held_n = depth;
     }
@@ -573,7 +598,10 @@ pub const Draft2 = struct {
         for (0..8) |i| {
             st.st.end = 0;
             const t0 = std.Io.Clock.awake.now(self.io);
-            try self.fwd.draft(&st.st, .{ .ctx = st.ctx.ptr, .ctx_len = w, .anchor = 0, .position = @intCast(w - 1) }, out[0..depth]);
+            // a full window of context needs a block at least that far into the sequence: the prefix is
+            // [position - ctx_len, position), so a block at position `w` is the youngest one that can
+            // carry the whole window
+            try self.fwd.draft(&st.st, .{ .ctx = st.ctx.ptr, .ctx_len = w, .anchor = 0, .position = @intCast(w) }, out[0..depth]);
             const ns: f64 = @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds());
             // the first rounds pay the driver's stalls, which no later round does
             if (i >= 2) quickest = @min(quickest, ns / 1e6);

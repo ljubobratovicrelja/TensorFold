@@ -552,9 +552,20 @@ pub fn Namespace(comptime Tri: type) type {
             return self.drawn[handle % ring];
         }
 
+        /// A monotonic reading, for the throwaway `TF_TAP_TIME` bisect: a round that costs 300 ms with a
+        /// 44 ms verify and a 0.3 ms drafter is hiding its time in one of four places, not nowhere.
+        fn nowNs() u64 {
+            var ts: std.c.timespec = undefined;
+            _ = std.c.clock_gettime(.MONOTONIC, &ts);
+            return @intCast(@max(0, ts.sec) * std.time.ns_per_s + ts.nsec);
+        }
+
         /// A drafting stream's window in one batched pass; streams without drafts share rounds, each row its own bits.
         fn verifyFn(ptr: *anyopaque, windows: []const be.Window, out: []be.Verified) anyerror!void {
             const self = of(ptr);
+            const timing = std.c.getenv("TF_TAP_TIME") != null;
+            const t0 = if (timing) nowNs() else 0;
+            var tA = t0;
             const seqs = try self.gpa.alloc(*prompt.Seq, windows.len);
             defer self.gpa.free(seqs);
             const ids = try self.gpa.alloc(u32, windows.len);
@@ -595,6 +606,7 @@ pub fn Namespace(comptime Tri: type) type {
             // another stream's taps.
             const cap = if (self.drafter != null) 1 else @min(@min(env_rows, mtp.round_rows), self.engine.chunk);
             try @import("cuda_lanes_verify.zig").windows(self, windows, out, drafted[0..held], row_ids, cap);
+            if (timing) tA = nowNs();
             var at: usize = 0;
             while (at < plain) : (at += round_streams) {
                 const n = @min(round_streams, plain - at);
@@ -604,6 +616,16 @@ pub fn Namespace(comptime Tri: type) type {
                 if (n == 1) if (self.drafter) |draft2| draft2.note(windows[at_window[at]].stream, seqs[at].fed - 1, seqs[at].fed);
             }
             for (seqs[0..plain], at_window[0..plain]) |q, wi| out[wi].sampled[0] = try self.tokenAt(q, windows[wi].stream, windows[wi].positions[0], windows[wi].masks);
+            if (timing) {
+                const t1 = nowNs();
+                std.log.info("round: {d:.1} ms = verify {d:.1} (held {d}, plain {d}) + rest {d:.1}", .{
+                    @as(f64, @floatFromInt(t1 - t0)) / 1e6,
+                    @as(f64, @floatFromInt(tA - t0)) / 1e6,
+                    held,
+                    plain,
+                    @as(f64, @floatFromInt(t1 - tA)) / 1e6,
+                });
+            }
         }
 
         /// Each window keeps its first rows (a chain's prefix): the DeltaNet states replayed over them alone.

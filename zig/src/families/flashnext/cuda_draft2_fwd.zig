@@ -7,9 +7,13 @@
 //!
 //! 1. **fuse** the five taps of each of the *prefix's* positions — every position the target had
 //!    already computed when it proposed the block — into one 2560-wide context row a position
-//!    (`tf_fxd2_fuse`: `rms_norm(hidden_norm, taps @ fc^T)`). The block's own rows never come from
-//!    taps: `reference.py` hands the prefix's taps in as the cross-attention context and starts
-//!    the block from the target's embedding table (`anchor`, then `block - 1` mask tokens).
+//!    (`tf_fxd2_fuse`: `rms_norm(hidden_norm, taps @ fc^T)`). The kernel streams the whole of `fc`
+//!    a row, so it is a round's work and not a layer's: the fused rows are kept at their positions
+//!    (`State.fused`) and every layer cross-attends to the same ones, which also lets a round read
+//!    the rows the round before it fused — consecutive rounds share all but the positions the
+//!    target accepted. The block's own rows never come from taps: `reference.py` hands the prefix's
+//!    taps in as the cross-attention context and starts the block from the target's embedding table
+//!    (`anchor`, then `block - 1` mask tokens).
 //!    Fusing the block's own taps instead is the "leaky" variant of `tools/dflash2/tap_accept.py`,
 //!    which shows the block the next seven positions' hidden states.
 //! 2. **five layers**: input norm, attention conv, q/k/v of the block's rows, the prefix's own k/v,
@@ -71,15 +75,16 @@ pub fn tapsFrom(src: tap_ring.Source) ?u64 {
     return src.ptr(tap_source);
 }
 
-/// Rows of the prefix the k/v staging is sized for: a chunk of the context is fused, projected,
-/// rotated and put into the ring `ctx_chunk` rows at a time, so a state costs one chunk's scratch
-/// rather than one window's. Every step of it is per row, so a chunk boundary changes no byte.
+/// Rows of the prefix the k/v staging is sized for: a chunk of the context is copied out of the
+/// fused ring, projected, rotated and put into the ring `ctx_chunk` rows at a time, so a state costs
+/// one chunk's scratch rather than one window's. Every step of it is per row, so a chunk boundary
+/// changes no byte.
 pub const ctx_chunk = 64;
 
 /// One round's inputs: a block of `block` rows to draft, and the prefix it cross-attends to.
 pub const Round = struct {
     /// `[ctx_len, n_taps * hidden]` bf16 on the device: the fused tap rows of the positions
-    /// `position - ctx_len + 1 .. position`, taps in the config's `target_layer_ids` order (a tap's
+    /// `position - ctx_len .. position - 1`, taps in the config's `target_layer_ids` order (a tap's
     /// row is the `hidden`-wide slice at `k * hidden`). That is the prefix — everything the target
     /// had already computed when it proposed the block — and it is what the layers' cross-attention
     /// reads; the block's own rows start from `Target.embed`. Collapsing flashnext's four streams
@@ -94,28 +99,50 @@ pub const Round = struct {
     position: u64,
 };
 
-/// A stream's drafter state: five layers' key and value rings, and the block's scratch.
+/// A stream's drafter state: five layers' key and value rings, the prefix's fused rows, and the
+/// block's scratch.
 ///
-/// The ring holds *one round's prefix*: every round writes its own context keys at the positions
+/// The k/v ring holds *one round's prefix*: every round writes its own context keys at the positions
 /// they were captured at, and reads them back through the same round's attention, so the ring
 /// carries nothing between rounds but the span `end` records — which is what makes a gap (a round
 /// whose prefix starts past the previous round's block) a refusal rather than a stale read.
+///
+/// The fused ring is the exception and carries by design: a fused row is a function of its own
+/// position's taps and the same for every layer, so it outlives the round that paid for it
+/// (`fusePrefix`). Its span is `[fused_lo, fused_end)`, and it is trusted no further than that: a
+/// caller that re-uses positions must say so (`Draft.invalidate`).
 ///
 /// One round at a time per state: the scratch is reused by the next round, and a round ends by
 /// synchronising to read its proposals back.
 pub const State = struct {
     /// `layers * 2 * ringRows * kvWidth` bf16: layer i's keys at `ringK(i)`, then its values.
     ring: cuda.DeviceBuffer,
+    /// `window * hidden` bf16: the prefix's fused context rows, a position's at slot
+    /// `position % window`. Sized by the window because that is the most positions a round reads.
+    fused: cuda.DeviceBuffer,
     /// The block's rows and the head's candidates (`Bufs`).
     scratch: cuda.DeviceBuffer,
     /// The position after the last row written; 0 until the first round.
     end: u64 = 0,
+    /// The first position `fused` does not hold, and the first one it does: the fused rows are
+    /// `[fused_lo, fused_end)`, each at its own slot. A round fuses `fused_end .. hi` and reads
+    /// what it needs of `lo .. fused_end`.
+    fused_end: u64 = 0,
+    fused_lo: u64 = 0,
 
     const Self = @This();
 
     pub fn deinit(s: *Self) void {
         s.ring.free();
+        s.fused.free();
         s.scratch.free();
+    }
+
+    /// Forget the fused rows: the span is empty, so the next round fuses every position it reads
+    /// and no slot of `fused` is trusted on the strength of an earlier round's write.
+    pub fn fusedReset(s: *Self) void {
+        s.fused_lo = 0;
+        s.fused_end = 0;
     }
 };
 
@@ -123,7 +150,8 @@ pub const State = struct {
 pub const Bufs = struct {
     /// The block's token ids, u32: the anchor then `block - 1` mask tokens.
     ids: u64,
-    /// The context chunk being fused, `[ctx_stage, hidden]` bf16 (`ctx_stage` is `ctx_chunk`).
+    /// The context chunk being read out of the fused ring, `[ctx_stage, hidden]` bf16 (`ctx_stage`
+    /// is `ctx_chunk`).
     ctx: u64,
     /// The running hidden state and the post-attention row.
     h: u64,
@@ -201,8 +229,8 @@ pub const Fault = extern struct {
 /// mean advance.
 pub const Debug = struct {
     /// `[ctx_rows, hidden]` bf16: the fused prefix rows of the round, `ctx_rows >= ctx_len`. Written
-    /// from layer 0's pass over the prefix; the fusion is re-run per layer and is row-wise, so the
-    /// later layers would write the same bytes.
+    /// from layer 0's pass over the prefix, out of the round's fused ring: the fusion is row-wise
+    /// and a row's bytes are its position's, so every layer reads these same bytes.
     ctx: u64 = 0,
     /// Rows `ctx` holds: a round whose context outruns it is refused rather than allowed to write
     /// past the caller's buffer.
@@ -275,6 +303,13 @@ pub const Target = struct {
     head: u64,
 };
 
+/// A monotonic reading in nanoseconds: zig 0.17 dropped `std.time.Timer`, and a stage bill measured
+/// in anything but wall-clock deltas around the launches is a guess.
+fn nowNs(io: std.Io) u64 {
+    const t = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+    return @intCast(@max(0, t));
+}
+
 /// The kernels a round launches, by symbol.
 ///
 /// `tf_fxd2_knorm` — the norm without a rotation, for a context whose keys were all rotated at
@@ -296,6 +331,14 @@ const Fns = struct {
 
 /// The drafter, loaded: its config, its weights, and its kernels.
 pub const Draft = struct {
+    /// Per-stage nanoseconds, kept only when `TF_DRAFT2_TIME` is set: a round that is five times the
+    /// target's cost is a fusion bill or a projection bill, and guessing which one wastes a build.
+    t_fuse: u64 = 0,
+    t_kv: u64 = 0,
+    t_layers: u64 = 0,
+    t_tail: u64 = 0,
+    t_rounds: u64 = 0,
+    timing: bool = false,
     gpa: std.mem.Allocator,
     io: std.Io,
     d: *const cuda.Driver,
@@ -358,6 +401,10 @@ pub const Draft = struct {
         };
         s.w = try loadWeights(gpa, io, s, dir);
         errdefer s.w.deinit(gpa);
+        if (std.c.getenv("TF_DRAFT2_TIME")) |p| {
+            const v = std.mem.span(p);
+            s.timing = v.len != 0 and !std.mem.eql(u8, v, "0");
+        }
         return s;
     }
 
@@ -368,10 +415,17 @@ pub const Draft = struct {
         s.gpa.destroy(s);
     }
 
-    /// A new stream's state: its ring and scratch, both zeroed so a stray read sees a key of 0.
+    /// A new stream's state: its rings and scratch, the k/v ring and the scratch zeroed so a stray
+    /// read sees a key of 0.
+    ///
+    /// The fused ring is *not* zeroed: nothing reads a slot outside `[fused_lo, fused_end)`, so a
+    /// slot no round has written is unreachable rather than a key of the last stream's, and a state's
+    /// first round fills the span it reads before it reads it.
     pub fn create(s: *Self) !State {
-        var st: State = .{ .ring = try cuda.DeviceBuffer.alloc(s.d, s.c.ringBytes()), .scratch = undefined };
+        var st: State = .{ .ring = try cuda.DeviceBuffer.alloc(s.d, s.c.ringBytes()), .fused = undefined, .scratch = undefined };
         errdefer st.ring.free();
+        st.fused = try cuda.DeviceBuffer.alloc(s.d, fusedBytes(s.c));
+        errdefer st.fused.free();
         st.scratch = try cuda.DeviceBuffer.alloc(s.d, try scratchBytes(s.c));
         errdefer st.scratch.free();
         try st.ring.fill8(0, s.stream.handle);
@@ -380,9 +434,31 @@ pub const Draft = struct {
         return st;
     }
 
-    /// The bytes a stream's state takes, before it is created: its ring and one block's scratch.
+    /// The bytes a stream's state takes, before it is created: its k/v ring, the fused prefix and
+    /// one block's scratch.
     pub fn stateBytes(c: Config) !usize {
-        return std.math.add(usize, c.ringBytes(), try scratchBytes(c));
+        return std.math.add(usize, try std.math.add(usize, c.ringBytes(), fusedBytes(c)), try scratchBytes(c));
+    }
+
+    /// The fused ring's bytes: a window of positions, `hidden` bf16 each — one row a position, and a
+    /// round never reads more positions than the window holds.
+    pub fn fusedBytes(c: Config) usize {
+        return c.window * c.hidden * 2;
+    }
+
+    /// Forget the fused prefix: the next round fuses every position it needs.
+    ///
+    /// The caller owns this because it owns the positions. A round already refuses the cache to a
+    /// prefix that starts before the fused span or ends inside it — a first round, one whose prefix
+    /// grew, a rewind — so what is left is the case the span cannot see: a stream whose *same*
+    /// positions now mean different tokens (a pooled state handed to another stream, a restored
+    /// prompt, an anchor resampled under a block the last round fused). The rule is: wherever a
+    /// caller drops a stream's positions — `cuda_drafter2.zig`'s `State.reset`, and its open path
+    /// before a first round — it drops the fusion here too. Clearing `st.end` a round is *not* that
+    /// signal, or the ring would never carry anything.
+    pub fn invalidate(s: *Self, st: *State) void {
+        _ = s;
+        st.fusedReset();
     }
 
     /// One layer's keys and values: the keys' `ringRows * kvWidth` rows, then the values'.
@@ -422,7 +498,7 @@ pub const Draft = struct {
         if (r.ctx_len > c.window) return error.ContextPastWindow;
         if (r.ctx_len > 0 and r.ctx == 0) return error.ContextRowsMissing;
         // the prefix ends at the anchor, so a block at position 0 has none
-        if (@as(u64, r.ctx_len) > r.position + 1) return error.ContextPastPosition;
+        if (@as(u64, r.ctx_len) > r.position) return error.ContextPastPosition;
         if (r.anchor >= c.vocab) return error.AnchorPastVocab;
         if (r.position > @as(u64, std.math.maxInt(i64)) -| B) return error.PositionOutOfRange;
         // Rounds may overlap (a verify accepts fewer rows than it was offered, and the accepted
@@ -442,11 +518,16 @@ pub const Draft = struct {
         const clear: Fault = .{};
         try st.scratch.upload(@intCast(b.err - st.scratch.ptr), std.mem.asBytes(&clear));
 
+        // the five layers' shared cross-attention context, fused once for the round and kept: every
+        // layer reads the same rows, and the rows the last round fused are still good
+        try s.fusePrefix(st, r);
         try embed(s, b.ids, b.h);
+        var rt = nowNs(s.io);
         // the block's input rows (the anchor's embedding and the masks), then one row block a layer:
         // a reader of the dump then sees the state each sublayer was handed, not just the last one
         const row_bytes = B * c.hidden * 2;
         if (s.dbg) |g| if (g.layers != 0) try copyOut(s, g.layers, row_bytes, b.h);
+        const rt0 = rt;
         for (s.w.layers, 0..) |l, i| {
             try s.layer(st, &b, l, i, r);
             if (s.dbg) |g| if (g.layers != 0) try copyOut(s, g.layers + (i + 1) * row_bytes, row_bytes, b.h);
@@ -455,16 +536,63 @@ pub const Draft = struct {
         // p+r and proposes the token at p+r, so row 0 only re-predicts the anchor. `reference.py`'s
         // `propose` heads `hidden[:, -block+1:]` for the same reason; starting at row 0 lags every
         // proposal by one slot, which reads as chance agreement rather than as an error.
+        var tL: u64 = 0;
+        var tH: u64 = 0;
+        var tS: u64 = 0;
+        if (s.timing) {
+            try s.stream.synchronize();
+            tL = nowNs(s.io);
+            s.t_layers += tL - rt;
+            rt = tL;
+        }
         try rmsnorm(s, b.h + c.hidden * 2, s.w.norm, b.hn, rows);
         try headTopk(s, b.hn, rows, b.cand, b.unary);
+        if (s.timing) {
+            try s.stream.synchronize();
+            tH = nowNs(s.io);
+        }
         try select(s, b.hn, rows, b.cand, b.unary, b.err, r.anchor, b.prop);
+        if (s.timing) {
+            try s.stream.synchronize();
+            tS = nowNs(s.io);
+        }
         // the proposals are read back on the host, so the round's kernels must have landed first:
         // a blocking DtoH copy does not order itself after work queued on a non-blocking stream
+        if (s.timing) {
+            const t1 = nowNs(s.io);
+            s.t_tail += t1 - rt;
+            s.t_rounds += 1;
+        }
         var held: [max_block - 1]u32 = @splat(0);
         var fault: Fault = .{};
         try s.stream.synchronize();
         try st.scratch.download(@intCast(b.prop - st.scratch.ptr), std.mem.sliceAsBytes(held[0..rows]));
         try st.scratch.download(@intCast(b.err - st.scratch.ptr), std.mem.asBytes(&fault));
+        if (s.timing) {
+            std.log.info("draft2 stages: layers {d:.1} ms, head {d:.1} ms, select {d:.1} ms ({d} ctx rows, {d} rows)", .{
+                @as(f64, @floatFromInt(tL - rt0)) / 1e6,
+                @as(f64, @floatFromInt(tH - tL)) / 1e6,
+                @as(f64, @floatFromInt(tS - tH)) / 1e6,
+                r.ctx_len,
+                rows,
+            });
+        }
+        if (s.timing and s.t_rounds >= 16) {
+            const ms = struct {
+                fn f(v: u64) f64 {
+                    return @as(f64, @floatFromInt(v)) / 1e6;
+                }
+            }.f;
+            const n = @as(f64, @floatFromInt(s.t_rounds));
+            std.log.info("draft2 time: {d:.1} ms/round = layers {d:.1} (fuse {d:.1}, kv {d:.1}) + tail {d:.1} | ctx {d} rows, block {d}", .{
+                ms(s.t_layers + s.t_tail) / n, ms(s.t_layers) / n, ms(s.t_fuse) / n, ms(s.t_kv) / n, ms(s.t_tail) / n, r.ctx_len, rows,
+            });
+            s.t_fuse = 0;
+            s.t_kv = 0;
+            s.t_layers = 0;
+            s.t_tail = 0;
+            s.t_rounds = 0;
+        }
         // A codebook index the selector refused outranks the proposals: a round is all of its
         // positions or none, and an index at or past the vocabulary is a layout fault, not a token
         // the drafter got wrong. Both codebooks are `[vocab, rank]`, so nothing legitimate produces
@@ -491,7 +619,10 @@ pub const Draft = struct {
         const kvw = c.kvWidth();
         const dyn = c.dynamic();
         const pos: c_longlong = @intCast(r.position);
-        const lo: c_longlong = @intCast(r.position + 1 - r.ctx_len);
+        // the context ends one position before the anchor's own row: row 0 of the block is the anchor,
+        // embedded and rotated at `position`, and duplicating that position in the keys phases every
+        // context key one step late.
+        const lo: c_longlong = @intCast(r.position - r.ctx_len);
         // attention: norm, prepare, project, rotate, attend, finish
         try rmsnorm(s, b.h, l.input_norm, b.x, B);
         try dense(s, b.x, l.attn_conv, b.dyn, dyn, H, B);
@@ -518,28 +649,31 @@ pub const Draft = struct {
     }
 
     /// The layer's cross-attention context: the prefix's fused tap rows, `ctx_chunk` rows at a time,
-    /// from the tap fusion through the k/v projections and the per-head norm and rotation at each
-    /// row's **own** position, into this layer's ring at those positions.
+    /// out of the round's fused ring, through the k/v projections and the per-head norm and rotation
+    /// at each row's **own** position, into this layer's ring at those positions.
     ///
-    /// Chunking is exact rather than approximate: fusion norms one row's 2560 outputs against that
-    /// row alone, the projections are row-wise, and the norm-plus-rotation is per head per row, so a
-    /// chunk boundary changes no byte of the result — it only bounds the scratch a state needs to
-    /// `ctx_chunk` rows instead of one window's. `reference.py` rotates the context keys at the
-    /// positions they were captured at (`ctx_positions`), not at zero: giving every prefix key the
-    /// same rotation destroys the q/k geometry the taps were trained against.
+    /// Chunking is exact rather than approximate: the projections are row-wise, and the
+    /// norm-plus-rotation is per head per row, so a chunk boundary changes no byte of the result — it
+    /// only bounds the scratch a state needs to `ctx_chunk` rows instead of one window's.
+    /// `reference.py` rotates the context keys at the positions they were captured at
+    /// (`ctx_positions`), not at zero: giving every prefix key the same rotation destroys the q/k
+    /// geometry the taps were trained against.
+    ///
+    /// The fusion itself is not here: it is `fusePrefix`'s, once a round, because its output does not
+    /// depend on the layer and fusing per layer would pay for it five times over.
     fn prefix(s: *Self, st: *State, b: *const Bufs, l: Layer, i: usize, r: Round) !void {
         const c = s.c;
         const H = c.hidden;
-        const k = c.n_taps * H;
         const kvw = c.kvWidth();
-        const lo: c_longlong = @intCast(r.position + 1 - r.ctx_len);
+        const lo: u64 = r.position + 1 - r.ctx_len;
         var done: usize = 0;
+        var t = nowNs(s.io);
         while (done < r.ctx_len) {
             const n = @min(ctx_chunk, r.ctx_len - done);
-            const at: c_longlong = lo + @as(c_longlong, @intCast(done));
-            try fuse(s, r.ctx + done * k * 2, b.ctx, n);
-            // the whole prefix's fusion, taken from layer 0's pass: `fuse` is row-wise, so the four
-            // later layers would write these same bytes and one copy of them is the fusion's output
+            const at: u64 = lo + @as(u64, @intCast(done));
+            try copyFused(s, st, at, n, b.ctx);
+            // the whole prefix's fusion, taken from layer 0's pass: the fused rows are the round's,
+            // not this layer's, and one copy of them is the fusion's output
             if (i == 0) {
                 if (s.dbg) |g| {
                     if (g.ctx != 0) {
@@ -550,10 +684,59 @@ pub const Draft = struct {
             }
             try dense(s, b.ctx, l.k, b.kcr, kvw, H, n);
             try dense(s, b.ctx, l.v, b.vc, kvw, H, n);
-            try normRope(s, b.kcr, l.k_norm, b.kc, kvw, c.kv_heads, at, n);
-            try ringPut(s, b.kc, b.vc, s.ringK(st, i), s.ringV(st, i), kvw, at, n);
+            try normRope(s, b.kcr, l.k_norm, b.kc, kvw, c.kv_heads, @intCast(at), n);
+            try ringPut(s, b.kc, b.vc, s.ringK(st, i), s.ringV(st, i), kvw, @intCast(at), n);
+            if (s.timing) {
+                const t1 = nowNs(s.io);
+                s.t_kv += t1 - t;
+                t = t1;
+            }
             done += n;
         }
+    }
+
+    /// The prefix's fused rows for this round: `tf_fxd2_fuse` over the positions the ring does not
+    /// already hold, `ctx_chunk` rows a launch, each into its own position's slot.
+    ///
+    /// The kernel reads all 65 MB of `fc` a row, so fusing inside the layer loop streamed `fc` five
+    /// times over one prefix for one answer; fusing once a round is five times less, and fusing only
+    /// the positions the last round did not is the rest — the target accepts a few positions a round,
+    /// so consecutive prefixes share all but those. Nothing here depends on a layer, and a position's
+    /// tap rows are the same bytes every time they are fused, so reading a row an earlier round wrote
+    /// is the same result as fusing it again.
+    ///
+    /// The ring is `window` slots and a prefix is at most a window long (`draft` refuses
+    /// `ContextPastWindow`), so a span cannot alias its own slots, and a row a round still needs is
+    /// overwritten only by a position a window ahead of it — which a prefix that short cannot fuse.
+    fn fusePrefix(s: *Self, st: *State, r: Round) !void {
+        const c = s.c;
+        const H = c.hidden;
+        const k = c.n_taps * H;
+        const lo: u64 = r.position + 1 - r.ctx_len;
+        const hi: u64 = r.position + 1;
+        var p: u64 = fuseFrom(lo, hi, st.fused_lo, st.fused_end);
+        var t = nowNs(s.io);
+        while (p < hi) {
+            const n: usize = @intCast(@min(@as(u64, ctx_chunk), hi - p));
+            const src = r.ctx + (p - lo) * k * 2;
+            // the destination wraps at most once a chunk, because the ring is a window wide and a
+            // chunk is `ctx_chunk`: two launches over one chunk are the same bytes as one, the
+            // kernel being strictly row-wise
+            const slot: usize = @intCast(p % c.window);
+            const head = @min(n, c.window - slot);
+            try fuse(s, src, st.fused.ptr + slot * H * 2, head);
+            if (n > head) try fuse(s, src + head * k * 2, st.fused.ptr, n - head);
+            if (s.timing) {
+                const t1 = nowNs(s.io);
+                s.t_fuse += t1 - t;
+                t = t1;
+            }
+            p += n;
+        }
+        // the span this round can vouch for: everything it read, fused now or by the round that did
+        // it at the same position
+        st.fused_lo = lo;
+        st.fused_end = hi;
     }
 };
 
@@ -572,20 +755,49 @@ fn ci(x: usize) c_int {
     return @intCast(x);
 }
 
-/// One device-to-device copy into a caller's debug span, on the round's own stream: queued, not
-/// waited on, so the check's single synchronisation at the end of the round covers it too.
+/// One device-to-device copy on the round's own stream: queued, not waited on, so the round's single
+/// synchronisation covers it too. `dst` is a borrowed span the module does not own — a caller's debug
+/// buffer, or a staging row block in the round's own scratch.
 fn copyOut(s: *Draft, dst: u64, len: usize, src: u64) !void {
     if (len == 0) return;
-    // a borrowed view of the caller's span: `copyFrom` writes rows, it does not own them
+    // a borrowed view of the destination: `copyFrom` writes rows, it does not own them
     const view: cuda.memory.DeviceBuffer = .{ .d = s.d, .ptr = dst, .len = len, .borrowed = true };
     try view.copyFrom(0, src, len, s.stream.handle);
 }
 
+/// The fused rows of positions `[at, at + n)` out of the round's fused ring, into `dst` in position
+/// order: at most two copies, because the ring wraps once a window and a chunk is `ctx_chunk` rows.
+///
+/// This is the whole of what a layer reads of the fusion, and the bytes are the fusion's own — a
+/// row's slot holds the row `fusePrefix` wrote for that position, never a partial or a neighbouring
+/// one, so a chunk read from here is what fusing the chunk would have produced.
+fn copyFused(s: *Draft, st: *State, at: u64, n: usize, dst: u64) !void {
+    const row = s.c.hidden * 2;
+    const first: usize = @intCast(at % s.c.window);
+    const head = @min(n, s.c.window - first);
+    try copyOut(s, dst, head * row, st.fused.ptr + first * row);
+    if (n > head) try copyOut(s, dst + head * row, (n - head) * row, st.fused.ptr);
+}
+
+/// The position a round's fusion starts at, `[p, hi)`, given the prefix it needs and the span the
+/// ring holds: the first position the ring does not hold, when the prefix still covers what the
+/// ring does hold, and the prefix's own first position when it does not.
+///
+/// The two cases the ring's span cannot cover, and why they are a miss rather than a reuse:
+/// a prefix that starts *before* `fused_lo` needs rows no round fused (a first round, a prefix that
+/// grew past its window), and a prefix that ends at or before `fused_end` is a round the target
+/// rewound — its rows may have been re-derived from different tokens, and the anchor is one of
+/// them. Both fuse the whole prefix, which is always correct, at the cost of the round's saving.
+fn fuseFrom(lo: u64, hi: u64, fused_lo: u64, fused_end: u64) u64 {
+    return if (lo >= fused_lo and hi > fused_end) @max(lo, fused_end) else lo;
+}
+
 /// tf_fxd2_fuse(X, W, NORM, OUT, K, H, eps): grid (rows), 256 threads, `(K + 2H) * 2` shared.
 ///
-/// `taps` is the first of `rows` contiguous `n_taps * hidden` rows: a prefix chunk, or the whole
-/// prefix at once when a caller has the room. `rows` is a chunk of the context, so it may not
-/// outrun the scratch's `ctx_chunk`.
+/// `taps` is the first of `rows` contiguous `n_taps * hidden` rows: the prefix's rows from an
+/// arbitrary position, since `fusePrefix` fuses only the ones the ring is missing. `rows` is a chunk
+/// of the context, so it may not outrun the scratch's `ctx_chunk`, and its `out` is a slot of the
+/// fused ring — which may be the ring's start, when a chunk wraps.
 fn fuse(s: *Draft, taps: u64, out: u64, rows: usize) !void {
     if (rows == 0) return;
     if (rows > ctx_chunk) return error.ChunkPastScratch;
@@ -862,7 +1074,28 @@ test "a round's scratch is one block plus one context chunk, 256-byte aligned, a
     try std.testing.expect(c.hidden * 2 + 256 * c.topk * 8 <= 48 * 1024);
     // the ring is what a stream costs besides: the window, a block, a tile of slack
     try std.testing.expectEqual(@as(usize, 5 * 2 * 2064 * 1024 * 2), c.ringBytes());
-    try std.testing.expectEqual(c.ringBytes() + total, try Draft.stateBytes(c));
+    // and the fused prefix is a window of `hidden`-wide rows, 10 MiB a stream: the most positions a
+    // round reads, one row each, whichever of them this round has to fuse
+    try std.testing.expectEqual(@as(usize, 2048 * 2560 * 2), Draft.fusedBytes(c));
+    try std.testing.expectEqual(c.ringBytes() + Draft.fusedBytes(c) + total, try Draft.stateBytes(c));
+}
+
+test "a round fuses only the positions the round before it did not" {
+    // A stream whose last round fused [0, 101): a round at position 107 over a 110-row prefix needs
+    // [0, 108) and fuses the seven positions the target advanced — the 101 rows it already holds are
+    // the same bytes, because a fused row is a function of its own position's taps alone.
+    try std.testing.expectEqual(@as(u64, 101), fuseFrom(0, 108, 0, 101));
+    // the same round twice: positions [0, 101) end where the fused span does, so nothing is trusted
+    // (the anchor may have been resampled) and the whole prefix is fused again
+    try std.testing.expectEqual(@as(u64, 0), fuseFrom(0, 101, 0, 101));
+    // a first round, and a state whose fused span was dropped (`Draft.invalidate`): nothing to read
+    try std.testing.expectEqual(@as(u64, 0), fuseFrom(0, 108, 0, 0));
+    // a prefix that grew past the fused span's start needs rows no round fused: a window sliding
+    // forward is the normal case, so a prefix reaching back behind it is a full fusion
+    try std.testing.expectEqual(@as(u64, 900), fuseFrom(900, 1100, 950, 1000));
+    // and the window sliding forward reuses everything it can: [1000, 1100) needs fusing, [901, 1000)
+    // is what the last round left
+    try std.testing.expectEqual(@as(u64, 1000), fuseFrom(901, 1100, 700, 1000));
 }
 
 test "the tap source is one constant, read once" {

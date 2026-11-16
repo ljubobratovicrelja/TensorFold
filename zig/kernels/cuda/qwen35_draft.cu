@@ -375,19 +375,29 @@ extern "C" __global__ void __launch_bounds__(256) tf_fxd2_head_topk(const __nv_b
     }
     const uint4* xv = reinterpret_cast<const uint4*>(xs);
     const int words = H / 8;
-    for (int v = threadIdx.x; v < V; v += blockDim.x) {
+    // A warp owns one vocabulary entry at a time and its lanes split that row's words, so the row is
+    // streamed as coalesced 512-byte reads. One thread per entry read the same bytes with a 5 KiB
+    // stride between neighbours, which cost the round 105 ms of the 265 it took.
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    for (int v = warp; v < V; v += warps) {
         const uint4* w = reinterpret_cast<const uint4*>(HEAD + (size_t)v * H);
         float s = 0.0f;
-        for (int c = 0; c < words; c++) {
+        for (int c = lane; c < words; c += 32) {
             const uint4 a = xv[c], b = w[c];
             const __nv_bfloat16* ab = reinterpret_cast<const __nv_bfloat16*>(&a);
             const __nv_bfloat16* bb = reinterpret_cast<const __nv_bfloat16*>(&b);
 #pragma unroll
             for (int e = 0; e < 8; e++) s = fmaf(bf(ab[e]), bf(bb[e]), s);
         }
-        fxd2_insert(mine, topk, s, v);
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+        if (lane == 0) fxd2_insert(mine, topk, s, v);
     }
-    for (int i = 0; i < topk; i++) all[threadIdx.x * topk + i] = mine[i];
+    // the row's candidates are split by warp, so the merge reads every warp's list, not one thread's
+    if (lane == 0)
+        for (int i = 0; i < topk; i++) all[warp * topk + i] = mine[i];
     __syncthreads();
     if (threadIdx.x == 0) {
         Fxd2Cand out[FXD2_TOP];
@@ -395,7 +405,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_fxd2_head_topk(const __nv_b
             out[i].v = -INFINITY;
             out[i].id = 0;
         }
-        for (int i = 0; i < (int)blockDim.x * topk; i++) fxd2_insert(out, topk, all[i].v, all[i].id);
+        for (int i = 0; i < (blockDim.x >> 5) * topk; i++) fxd2_insert(out, topk, all[i].v, all[i].id);
         for (int i = 0; i < topk; i++) {
             VAL[(size_t)blockIdx.x * topk + i] = out[i].v;
             IDS[(size_t)blockIdx.x * topk + i] = (unsigned)out[i].id;

@@ -27,7 +27,7 @@ test "dense serving: owned CUDA images retain their reviewed lane and decode byt
     // to walk a round's steps in one block over the head's own `[rows, topk]` tables (it took a
     // block base on top of a step base, and read 511 GB past a codebook), and to refuse any
     // codebook index at or past the vocabulary instead of reading it.
-    try std.testing.expectEqualStrings("76cb6ab5e28a22f7b7a96503c5ad22201d26b3089b4b898841da6970ce45a9ca", &hash(@embedFile("kernels/cuda/qwen35_draft.cu")));
+    try std.testing.expectEqualStrings("623f7e97201dae912901880759fb215a90b8fc16e0bbe5d69c539ffb6dac2fa2", &hash(@embedFile("kernels/cuda/qwen35_draft.cu")));
     try std.testing.expectEqualStrings("403cf841b89ad61da0818bdad8976ed4b286b3282c8c22df7171921b7e06eb6d", &hash(@embedFile("kernels/cuda/qwen35_keep.cu")));
     try std.testing.expectEqualStrings("d1a379a98cf7504a7ed3b3f2d24c8ab6a39fe5511bcded6449e598ce5c3c79e7", &hash(@embedFile("kernels/cuda/scan_rows.cu")));
 }
