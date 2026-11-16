@@ -140,7 +140,16 @@ def stage_bytes(t: torch.Tensor):
 # ---------------------------------------------------------------------------------------------
 
 
-def run_round(vendor, model, ctx_x, block_ids, pos_ids, embed_w, lm_head, anchor, stages):
+def run_round(vendor, model, ctx_x, block_ids, pos_ids, embed_w, lm_head, anchor, stages,
+              start_hidden=None, start_layer=0, stop_layer=None):
+    """One drafter round, stage by stage.
+
+    `start_hidden` (an optional `[1, q_len, hidden]` tensor) replaces `noise_emb` as the residual
+    the first block starts from, and `start_layer`/`stop_layer` bound the blocks walked. With the
+    defaults this is the whole round from the embedding, unchanged. The bounds exist so a
+    block-by-block isolation can run *one* block on **our** previous block's output and ask whether
+    this block alone turns a matching input into a mismatched one.
+    """
     hd = model.layers[0].self_attn.head_dim
     ctx_len = ctx_x.shape[1]
     q_len = block_ids.shape[1]
@@ -154,8 +163,15 @@ def run_round(vendor, model, ctx_x, block_ids, pos_ids, embed_w, lm_head, anchor
     ctx_hidden = model.hidden_norm(model.fc(ctx_x))
     stages["fc_ctx_rows"] = ctx_hidden[0]
 
-    hidden = noise_emb
+    hidden = noise_emb if start_hidden is None else start_hidden
+    stop = len(model.layers) if stop_layer is None else stop_layer
     for i, layer in enumerate(model.layers):
+        if i < start_layer:
+            # a bounded walk: the blocks before `start_layer` are not run at all, so their stages are
+            # absent rather than recomputed and overwritten
+            continue
+        if i >= stop:
+            break
         att = layer.self_attn
         residual = hidden
 
