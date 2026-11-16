@@ -13,6 +13,10 @@ pub const rank_engine = @import("cuda_rank_engine.zig");
 pub const collective = @import("cuda_collective.zig");
 pub const rank_wire = @import("cuda_rank_wire.zig");
 pub const modelopt_experts = @import("cuda_modelopt_experts.zig");
+/// The DFlash2 drafter a flashnext checkpoint can serve: its config's refusals, and the tap ring
+/// a stream keeps for it. Both are declared here so the family's test build compiles them.
+pub const draft2 = @import("cuda_draft2.zig");
+pub const tap_ring = @import("cuda_tap_ring.zig");
 /// The MoE pass's native routed experts (NVFP4, block FP8), whose FP8 call a device test takes.
 pub const moe_native = @import("cuda_moe_native.zig");
 /// A prompt pass's expert exchange at --tp 2, which the two-rank device test runs against the all-reduce.
