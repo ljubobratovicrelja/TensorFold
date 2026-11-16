@@ -165,7 +165,8 @@ pub const Hooks = struct {
     /// `taps_out` is the only consumer.
     tap_ring: u64 = 0,
     tap_rows: usize = 0,
-    /// Which single 2560-wide row of a tapped layer's four-stream output the ring keeps.
+    /// Which single 2560-wide row of a tapped layer's four-stream output the ring keeps: the read-out's
+    /// mixed row, its normed row, or (the default) the plain mean of the four raw streams.
     tap_source: tapring.TapSource = tapring.TapSource.default,
 };
 
@@ -277,6 +278,9 @@ pub const Scratch = struct {
     xs_act: u64 = 0,
     inj: u64 = 0,
     mixed: u64 = 0,
+    /// The four raw streams collapsed to one `dims`-wide row a row (`tap4`, `TapSource.mean4`): the
+    /// bytes `Pass.tapRingWrite` hands the ring when the basis is the mean, and nothing else reads it.
+    tap4: u64 = 0,
     xsm: u64 = 0,
     proj: u64 = 0,
     part: u64 = 0,
@@ -407,6 +411,8 @@ pub const Scratch = struct {
         n += cap * streams * 4 + cap * wide * 2 * 2 + cap * pss_n * 4 + cap * (low + 4) * 2 + hcPartRows(cap) * (low + 4) * 4;
         n += cap * wide * 2 + (if (z.lane_reduce) 8 * cap * dims * 4 else 0);
         n += cap * low * 2 + cap * (low / 32) * 4 + cap * streams * 2 + cap * dims * 2 + cap * (dims / 32) * 4;
+        // the mean4 basis's collapsed rows (Pass.tapRingWrite's `tap4`): `dims` bf16 a row
+        n += cap * dims * 2;
         n += cap * proj_row * 2 + partRows(cap) * dims * 4 + cap * gdn.value_dim * (2 + 4 + 4) + cap * (gdn.value_dim / 32) * 4;
         n += cap * (2 * gdn.nk * gdn.dk + 2 * gdn.nv) * 4;
         n += cap * q_heads * head_dim * 2 + cap * index_heads * index_dim * 2;
@@ -448,6 +454,7 @@ pub const Scratch = struct {
         s.xs_act = try s.add(gpa, d, cap * (low / 32) * 4);
         s.inj = try s.add(gpa, d, cap * streams * 2);
         s.mixed = try s.add(gpa, d, cap * dims * 2);
+        s.tap4 = try s.add(gpa, d, cap * dims * 2);
         s.xsm = try s.add(gpa, d, cap * (dims / 32) * 4);
         s.proj = try s.add(gpa, d, cap * proj_row * 2);
         s.rank_input = try s.add(gpa, d, cap * out_k * 2);

@@ -19,7 +19,7 @@ Branch **`dflash2`**, worktree `~/Projects/tf-wt/dflash2`, pushed to `origin` at
 | --- | --- | --- |
 | 0 tap-row measurement | **MECHANISM DONE; blocked on the torch reference** | engine exposes `TF_FLASHNEXT_TAP_DUMP`, real dumps on disk; `tools/dflash2/reference.py` scores 0/7 — see §0.6 |
 | 1 MTP baseline E2E | **DONE** | measured, see §0.2 |
-| 2 tap capture | **RING WRITE DONE (single stream, readout/normed)** | `Hooks.tap_ring/tap_rows/tap_source`, `Pass.tapRingWrite`; persistence through Snap/disk still missing |
+| 2 tap capture | **RING WRITE DONE (single stream, all three bases; `mean4` default)** | `Hooks.tap_ring/tap_rows/tap_source`, `Pass.tapRingWrite`; persistence through Snap/disk still missing |
 | 3 drafter forward on CUDA | not started | spec in `flashnext-dflash2-kernels.md` |
 | 4 candidate selector on CUDA | not started | same spec, §2.5 |
 | 5 `openDrafter` wiring | not started | `cuda_drafted.wrap` still refuses flashnext |
@@ -105,7 +105,8 @@ and be prepared for the honest answer that DFlash2 loses to MTP on this box.
 The ring exists in the engine and produces real rows. What landed:
 
 - `Hooks.tap_ring / tap_rows / tap_source` (`cuda_batch_state.zig`), `Pass.tapRingWrite`
-  (`cuda_batch.zig`), and `TF_FLASHNEXT_TAP_SOURCE=readout|normed` (`cuda_tap_ring.zig`).
+  (`cuda_batch.zig`), and `TF_FLASHNEXT_TAP_SOURCE=readout|normed|mean4` (`cuda_tap_ring.zig`,
+  `mean4` the default: §4.1b).
 - The tap is **deferred by one layer on purpose**: the mixed/normed row over layer L's output is
   produced by layer L+1's input mix, so `tapDump` only names the slot and `tapRingWrite` copies it
   at the top of the next layer. Writing at `tapDump` time can only give the four-stream `s.h`.
@@ -311,6 +312,28 @@ uniform `mean(dim=-2)` (which would give a fixed 0.25 scale per stream). So:
 tap"** — read-out row vs down-projected row vs the normed variant. It is a cheap, bounded question
 with three candidates, and it is answered by acceptance length, not by argument. Getting it wrong
 does not crash: it silently produces plausible-but-wrong drafts and a low acceptance length.
+
+### 4.1b The answer is (b), the plain mean — and it is now the default (2026-11-16)
+
+Everything above reasons from the *target's* weights; the row the drafter was trained on is a fact
+about the *drafter's capture recipe*, and that recipe is on the record. incoai's
+`patches/qwen38-dflash2-capture.patch` for SGLang captures a DFlash2 tap as
+
+```python
+hidden_states.unflatten(-1, (hc_count, hidden_size)).mean(dim=-2)
+```
+
+i.e. the plain mean of the four **raw** streams — no gate, no `hc_norm` — and the independent vLLM
+port of the same checkpoint does the same. So option (b) is the training-time tensor, and the
+`readout` row this tree served first (`fn_hc_dense_mix`'s gated mean over *normalized* streams) is a
+different tensor by construction. The measured symptom of serving the wrong one is acceptance around
+1.5 tokens a round against the card's 2.4-3.3 band.
+
+What landed: `TapSource.default = .mean4` (`cuda_tap_ring.zig`), the collapse kernel `tf_fxd2_mean4`
+(`kernels/cuda/qwen35_draft.cu`: fp32 accumulation, one bf16 rounding), `Pass.tapRingWrite`'s mean4
+arm writing into the pass's `tap4` scratch, and `TF_FLASHNEXT_TAP_SOURCE=readout|normed|mean4` kept as
+the A/B so the other two bases can be re-measured without a rebuild. Acceptance against the band is
+still the gate; nothing here is a measurement of it.
 
 ### 4.2 DeltaNet / sparse-attention state interaction
 The target's own KV is Gated DeltaNet + full attention + a Qwen Sparse Attention indexer. DFlash2

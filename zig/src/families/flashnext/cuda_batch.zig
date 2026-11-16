@@ -19,6 +19,7 @@ const moe_native = @import("cuda_moe_native.zig");
 const zs = @import("cuda_zero_slice.zig");
 const ops = @import("cuda_batch_ops.zig");
 const split_lane = @import("cuda_split_lane.zig");
+const tapring = @import("cuda_tap_ring.zig");
 
 const layers_n = wt.layers_n;
 const linear_n = wt.linear_n;
@@ -217,7 +218,12 @@ pub fn Pass(comptime Tri: type) type {
 
         /// The ring's copy of the tapped layer `tap_slot` names: the read-out rows over that layer's
         /// output, which this pass made for the layer now starting. Called immediately after the
-        /// input-mix read-out of a layer, so `s.mixed`/`s.norm` hold that layer's predecessor.
+        /// input-mix read-out of a layer, so `s.h` holds that layer's predecessor — the four-stream
+        /// output every basis here is a function of — and `s.mixed`/`s.norm` its read-out.
+        ///
+        /// `mean4` is the default because it is the row the drafter was trained on (cuda_tap_ring.zig
+        /// has the vendor's recipe): the plain mean of the four RAW streams, which no read-out row is.
+        /// It needs a collapse the other two bases do not, into the pass's `tap4` scratch.
         pub fn tapRingWrite(self: *Self, n: usize) !void {
             const slot = self.tap_slot orelse return;
             self.tap_slot = null;
@@ -228,13 +234,26 @@ pub fn Pass(comptime Tri: type) type {
             // through this path (the ring is per stream and the rows are not one lane's). One lane is
             // fine: its rows are its own, at its own position.
             if (self.lanes.len > 1) return error.TapRingSharedRound;
+            if (n == 0) return;
             const base = if (self.lanes.len == 1) self.lanes[0].pos else self.pos0;
             const src = switch (self.hooks.tap_source) {
                 .readout => self.s.mixed,
                 .normed => self.s.norm,
-                // The control needs a four-stream collapse kernel this path does not have yet; refuse
-                // by name rather than silently storing the wrong row.
-                .mean4 => return error.TapSourceMean4NotBuilt,
+                .mean4 => collapse: {
+                    // The mean is over `s.h`, the raw 4-stream rows. With no raw-stream tensor (or a
+                    // family built without streams) there is nothing to average: refuse by name rather
+                    // than store a row that is not a tap.
+                    if (self.s.h == 0 or streams == 0) return error.TapSourceMean4NoStreams;
+                    const dst = self.s.tap4;
+                    var a: cuda.Args = .{};
+                    a.add(self.s.h);
+                    a.add(dst);
+                    a.add(cint(dims));
+                    a.add(cint(streams));
+                    // One CTA a row; the kernel walks the row's 2560 channels `streams` times.
+                    try cuda.launch.launch(self.k.mean4, .{ .grid = .{ .x = @intCast(n) }, .block = .{ .x = 256 } }, self.stream, &a);
+                    break :collapse dst;
+                },
             };
             if (std.c.getenv("TF_FLASHNEXT_TAP_DEBUG") != null) {
                 std.debug.print("tap: layer slot {d} rows {d} pos0 {d} ring_rows {d} mixed {x} norm {x}\n", .{ slot, n, self.pos0, rows, self.s.mixed, self.s.norm });
@@ -246,8 +265,10 @@ pub fn Pass(comptime Tri: type) type {
                 const run = @min(n - at, rows - first);
                 // A tap's row at tap index `slot` sits `slot * hidden` into its ring slot, so the run
                 // is strided: one contiguous copy lands 5 slots' worth in the first slot and is wrong.
-                // copyCols takes byte addresses but its pitches and width in 16-bit values.
-                try self.copyCols(src + at * dims * 2, dims, ring + (first * self.hooks.n_taps + slot) * dims * 2, self.hooks.n_taps * dims, dims, run);
+                // `slotOffset` is that arithmetic in 16-bit values; `copyCols` takes byte addresses
+                // but its pitches and width in values, so each address is doubled here and nowhere
+                // else.
+                try self.copyCols(src + at * dims * 2, dims, ring + tapring.slotOffset(first, self.hooks.n_taps, slot, dims) * 2, self.hooks.n_taps * dims, dims, run);
                 at += run;
             }
         }
