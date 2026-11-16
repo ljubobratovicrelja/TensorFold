@@ -119,10 +119,11 @@ pub const Round = struct {
 /// A stream's drafter state: five layers' key and value rings, the prefix's fused rows, and the
 /// block's scratch.
 ///
-/// The k/v ring holds *one round's prefix*: every round writes its own context keys at the positions
-/// they were captured at, and reads them back through the same round's attention, so the ring
-/// carries nothing between rounds but the span `end` records — which is what makes a gap (a round
-/// whose prefix starts past the previous round's block) a refusal rather than a stale read.
+/// The k/v ring holds the prefix's projected keys and values, position-addressed and trusted only
+/// across the span `[kv_lo, kv_end)`: a row is a function of its own position's fused row alone,
+/// so a round projects only the positions the span does not cover and reuses the rest — which is
+/// what makes a gap (a round whose prefix starts past the previous round's block) a refusal rather
+/// than a stale read, and a rewind (`fusedReset`) a full re-projection.
 ///
 /// The fused ring is the exception and carries by design: a fused row is a function of its own
 /// position's taps and the same for every layer, so it outlives the round that paid for it
@@ -146,6 +147,11 @@ pub const State = struct {
     /// what it needs of `lo .. fused_end`.
     fused_end: u64 = 0,
     fused_lo: u64 = 0,
+    /// The positions whose projected keys and values the ring holds, for every layer:
+    /// `[kv_lo, kv_end)`, each at its own slot. A round projects `reuseFrom(lo, hi, kv_lo, kv_end)
+    /// .. hi` and then vouches for the whole prefix; `fusedReset` clears the span with the fusion's.
+    kv_end: u64 = 0,
+    kv_lo: u64 = 0,
 
     const Self = @This();
 
@@ -155,11 +161,14 @@ pub const State = struct {
         s.scratch.free();
     }
 
-    /// Forget the fused rows: the span is empty, so the next round fuses every position it reads
-    /// and no slot of `fused` is trusted on the strength of an earlier round's write.
+    /// Forget the fused rows and the projected keys and values: both spans are empty, so the next
+    /// round fuses and projects every position it reads, and no slot is trusted on the strength of
+    /// an earlier round's write.
     pub fn fusedReset(s: *Self) void {
         s.fused_lo = 0;
         s.fused_end = 0;
+        s.kv_lo = 0;
+        s.kv_end = 0;
     }
 };
 
@@ -632,6 +641,11 @@ pub const Draft = struct {
         if (std.mem.indexOfScalar(u32, held[0..rows], bad_proposal) != null) return error.SelectorIndexOutOfVocab;
         @memcpy(out, held[0..rows]);
         st.end = r.position + B;
+        // every layer's ring now holds the prefix's keys and values at their own positions; the
+        // next round reuses them across [kv_lo, kv_end) and projects only what the span does not
+        // cover. Set here, after the round's kernels landed, so a failed round vouches for nothing.
+        st.kv_lo = r.position - r.ctx_len;
+        st.kv_end = r.position;
     }
 
     /// One layer of the block: input norm and conv, q/k/v of the block's rows plus the prefix's own,
@@ -692,26 +706,36 @@ pub const Draft = struct {
         const H = c.hidden;
         const kvw = c.kvWidth();
         const lo: u64 = r.position - r.ctx_len;
+        const hi: u64 = r.position;
+        // the first position the ring does not hold for every layer: a row's keys and values are a
+        // function of its own position's fused row alone, so the span [kv_lo, kv_end) a previous
+        // round projected is reused under the fused ring's own rule (`reuseFrom`)
+        const from: u64 = reuseFrom(lo, hi, st.kv_lo, st.kv_end);
         var done: usize = 0;
         var t = nowNs(s.io);
         while (done < r.ctx_len) {
             const n = @min(ctx_chunk, r.ctx_len - done);
             const at: u64 = lo + @as(u64, @intCast(done));
-            try copyFused(s, st, at, n, b.ctx);
-            // the whole prefix's fusion, taken from layer 0's pass: the fused rows are the round's,
-            // not this layer's, and one copy of them is the fusion's output
+            // a chunk entirely before `from` is already in the ring at its positions: nothing to
+            // project, and only layer 0's debug dump still wants its fused bytes
+            const stale: bool = at + n <= from;
+            if (!stale) try copyFused(s, st, at, n, b.ctx);
             if (i == 0) {
                 if (s.dbg) |g| {
                     if (g.ctx != 0) {
                         if (g.ctx_rows < done + n) return error.DebugCtxTooSmall;
+                        // the dump holds the whole prefix the round read, covered rows included
+                        if (stale) try copyFused(s, st, at, n, b.ctx);
                         try copyOut(s, g.ctx + done * H * 2, n * H * 2, b.ctx);
                     }
                 }
             }
-            try dense(s, b.ctx, l.k, b.kcr, kvw, H, n);
-            try dense(s, b.ctx, l.v, b.vc, kvw, H, n);
-            try normRope(s, b.kcr, l.k_norm, b.kc, kvw, c.kv_heads, @intCast(at), n);
-            try ringPut(s, b.kc, b.vc, s.ringK(st, i), s.ringV(st, i), kvw, @intCast(at), n);
+            if (!stale) {
+                try dense(s, b.ctx, l.k, b.kcr, kvw, H, n);
+                try dense(s, b.ctx, l.v, b.vc, kvw, H, n);
+                try normRope(s, b.kcr, l.k_norm, b.kc, kvw, c.kv_heads, @intCast(at), n);
+                try ringPut(s, b.kc, b.vc, s.ringK(st, i), s.ringV(st, i), kvw, @intCast(at), n);
+            }
             if (s.timing) {
                 const t1 = nowNs(s.io);
                 s.t_kv += t1 - t;
@@ -816,6 +840,15 @@ fn copyFused(s: *Draft, st: *State, at: u64, n: usize, dst: u64) !void {
 /// them. Both fuse the whole prefix, which is always correct, at the cost of the round's saving.
 fn fuseFrom(lo: u64, hi: u64, fused_lo: u64, fused_end: u64) u64 {
     return if (lo >= fused_lo and hi > fused_end) @max(lo, fused_end) else lo;
+}
+
+/// Where a round's k/v projection starts: the fused ring's rule over the span of positions the
+/// ring already holds for every layer. A row's keys and values are a function of its own
+/// position's fused row alone, so covered rows are the same bytes a re-projection would produce,
+/// and the two cases `fuseFrom` refuses — a prefix that starts before the covered span, and one
+/// that ends inside it (a rewind) — refuse here too.
+fn reuseFrom(lo: u64, hi: u64, kv_lo: u64, kv_end: u64) u64 {
+    return fuseFrom(lo, hi, kv_lo, kv_end);
 }
 
 /// tf_fxd2_fuse(X, W, NORM, OUT, K, H, eps): grid (rows), 256 threads, `(K + 2H) * 2` shared.
@@ -1154,6 +1187,31 @@ test "a round fuses only the positions the round before it did not" {
     // and the window sliding forward reuses everything it can: [1000, 1100) needs fusing, [901, 1000)
     // is what the last round left
     try std.testing.expectEqual(@as(u64, 1000), fuseFrom(901, 1100, 700, 1000));
+}
+
+test "a round projects only the k/v positions the round before it did not" {
+    // The fused ring's rule, applied to the k/v span: a row's keys and values are a function of
+    // its own position's fused row alone, so covered positions are the same bytes a
+    // re-projection would produce and only the positions the target advanced are projected.
+    try std.testing.expectEqual(@as(u64, 101), reuseFrom(0, 108, 0, 101));
+    // the same round twice (an overlap or a rewind): project the whole prefix again
+    try std.testing.expectEqual(@as(u64, 0), reuseFrom(0, 101, 0, 101));
+    // a first round, and a state whose spans were dropped (`Draft.invalidate`)
+    try std.testing.expectEqual(@as(u64, 0), reuseFrom(0, 108, 0, 0));
+    // a prefix that grew back past the covered span's start: a full projection
+    try std.testing.expectEqual(@as(u64, 900), reuseFrom(900, 1100, 950, 1000));
+    // the window sliding forward reuses everything it can
+    try std.testing.expectEqual(@as(u64, 1000), reuseFrom(901, 1100, 700, 1000));
+}
+
+test "fusedReset drops the k/v span with the fusion" {
+    var st: State = .{ .ring = undefined, .fused = undefined, .scratch = undefined,
+        .kv_lo = 7, .kv_end = 99, .fused_lo = 3, .fused_end = 77 };
+    st.fusedReset();
+    try std.testing.expectEqual(@as(u64, 0), st.kv_lo);
+    try std.testing.expectEqual(@as(u64, 0), st.kv_end);
+    try std.testing.expectEqual(@as(u64, 0), st.fused_lo);
+    try std.testing.expectEqual(@as(u64, 0), st.fused_end);
 }
 
 test "the tap source is one constant, read once" {

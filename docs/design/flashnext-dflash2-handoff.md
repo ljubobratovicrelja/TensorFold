@@ -243,3 +243,38 @@ or it will lie to you.
 3. Force depth 7 and compare accepted-per-round against the depth the rule picks (§5.3).
 4. Only then the cost work: land the tiled head, and make the fused ring survive a
    prompt-cache restore so a benchmark can actually run.
+
+## 12. 2026-11-16 — vendor oracle, current measured state, incremental K/V
+
+Settled this session (evidence in `tools/dflash2`, /tmp/voa_*.json, replays in
+~/.hermes/cache/scratch/voracle/):
+
+- **THE vendor code is two things.** `z-lab/dflash` (local shallow clone, commit 07ebd93) is the
+  reference/bench repo; its README routes serving to the runtime forks. Production =
+  **SGLang PR #35371** ("DFlash2: local convolution + candidate selector"): `srt/models/dflash.py`,
+  `srt/speculative/dflash_worker_v2.py`, `spec_aux_hidden_state.py` + Triton selector (same team's
+  ports: vLLM #52816, llama.cpp #27342, oMLX). Production numbers (Qwen3.8-27B, block 8):
+  4.39-5.46 accepted tokens a step, 236.1 t/s vs 68.9 autoregressive (3.43x, GSM8K conc 1).
+- **Our reference.py matches the production forward op-for-op.** z-lab torch model vs reference.py:
+  stage rel_rms 2e-7..1.5e-6, proposals identical (the vendor's 8-row propose is the generate
+  loop's slice `[:, 1-verify_size:, :]` applied outside). SGLang's conventions agree with ours:
+  sliding-window bidirectional (is_causal:false + sliding_window 2048), selector lattice
+  unary + <A[p]*proj(h), B[c]>, rows 1..7 headed, target layer ids unshifted for qwen3 targets,
+  draft KV materialized from the target's verified hidden rows, dense target lm_head required.
+- **Context semantics are acceptance-neutral** (200-round vendor-code replays on the dump):
+  production-incremental 0.255, engine full-prefix 0.260, hybrid 0.260, no-context 0.065.
+- **Tap noise does not matter**: row-relative gaussian noise 0/1/5/10% on the context taps gives
+  0.260/0.260/0.260/0.275 accepted/round. fp8-KV taps (4.9% vs bf16) are not the acceptance issue.
+- True-text per-slot marginal hit rates decay 0.20 (slot 1) -> 0.05 (slot 7); scoring still
+  deflates vs live, but the shape is the drafter's capacity curve, not a defect.
+- **Baseline A/B (binary @614aa3c2a, one server, per-request draft flag, temp 0, 160 tokens):**
+  short prompt: drafting 12.87 t/s vs nodrafts 22.2-24.9; 1451-token prompt: drafting **8.89**
+  vs nodrafts 20.79. Stage split at 1600-token ctx (TF_DRAFT2_TIME): layers 93.0, head 39.5,
+  select 0.9, verify 44-47; round 133 draft + 47 verify. The `kv` sub-timer reads 1.0 — enqueue
+  time, the known unsynchronized-timer trap — the ctx-scaled k/v work hides inside `layers`.
+
+**Incremental K/V (this branch):** the k/v ring now carries projected rows between rounds, guarded
+by span `[kv_lo, kv_end)` with the fused ring's own reuse rule (`reuseFrom`); a round projects
+only the positions the span does not cover, `fusedReset` clears it. Tests: `cuda_draft2_fwd.zig`
+"a round projects only the k/v positions the round before it did not" + span-reset.
+
