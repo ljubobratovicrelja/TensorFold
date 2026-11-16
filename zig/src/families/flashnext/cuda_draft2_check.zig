@@ -18,7 +18,8 @@
 //!
 //! * `p` starts at the ring's oldest row, `max(0, ids.len - rows)` (older positions are already
 //!   overwritten, so a round there would read another position's taps);
-//! * the context is the *prefix*, positions `[max(0, p - window + 1), p]`, gathered out of the ring
+//! * the context is the *prefix*, positions `[max(0, p - window), p - 1]` (the anchor's own position
+//!   is not in the keys: `Round.ctx` is `[position - ctx_len, position)`), gathered out of the ring
 //!   (`slot = pos % rows`) into one contiguous `[ctx_len, n_taps * hidden]` span, because the
 //!   drafter's cross-attention reads exactly that;
 //! * the block is `ids[p]` then `block - 1` mask tokens, at positions `p .. p + block - 1`;
@@ -204,8 +205,8 @@ pub fn run(
     var prop: [block - 1]u32 = @splat(0);
     while (rounds < max_rounds and p + block < n) : (rounds += 1) {
         // the prefix: what the target had computed when the block was proposed, capped by the window
-        const len = @min(ctx_rows, p + 1);
-        const lo = p + 1 - len;
+        const len = @min(ctx_rows, p);
+        const lo = p - len;
         for (0..len) |i| {
             const slot = (lo + i) % cap.rows;
             @memcpy(gather[i * row_bytes ..][0..row_bytes], cap.ring[slot * row_bytes ..][0..row_bytes]);
