@@ -107,20 +107,105 @@ roughly 0.44–0.85 per draft. Our 2.16 tokens/round = 1.16 accepted + 1 bonus.
 Any future comparison must state its cell (suite, width, sampling, concurrency, max tokens); several
 published numbers were measured at a capped width of 4, which is not our width.
 
-## 7. What is left
+## 7. The layer mapping is correct (measured 2026-11-16, closes the 2× intercept hypothesis)
 
-1. **Workload matching (in flight).** Establish which published cell, if any, corresponds to a
+The last structural explanation for the acceptance deficit was an off-by-one in the layer→tap mapping:
+if `target_layer_ids` mean HF-style `hidden_states[i]` (where index 1 is layer 0's output) rather than
+"layer i's completed output", every tap is one layer off — and *every* existing comparison would still
+agree with itself, because the reference would be fed the same wrong rows.
+
+Measured with the engine's own oracle rather than by reading. `TF_FLASHNEXT_TAP_LAYERS` overrides the
+captured layer set with no rebuild; `TF_FLASHNEXT_DRAFT_CHECK=1` then walks the drafter over that ring
+and scores each block against the sequence's **true continuation**. Three servers, one at a time,
+identical checkpoint/prompt/env; the ring sha differs per run, so the capture really moved.
+
+| layer set | `mean_advance` | accepted/draft | zero-accept |
+| --- | ---: | ---: | ---: |
+| `[5,15,25,35,45]` (shipped) | **1.450** | 0.450 | 72.5 % |
+| `[4,14,24,34,44]` (down one) | 1.433 | 0.433 | 74.2 % |
+| `[6,16,26,36,46]` (up one) | 1.450 | 0.450 | 75.0 % |
+
+**Verdict: the mapping is not the bug.** Shifting down is worse; shifting up ties on `mean_advance`
+and is worse on both tiebreakers (higher zero-accept, more candidates that propose nothing). The
+shipped set wins or ties every column. A one-layer error would have shown a clear winner, not a
+three-hundredths spread.
+
+This was the only remaining hypothesis that could produce a 2× acceptance deficit *invisibly* — one
+where our drafter agrees with the reference because both are fed the same wrong rows. With it closed,
+"our drafter is the reference drafter" (1.317 vs 1.342, §5) stands as a measurement, not an artifact
+of a shared error.
+
+Harness note: `cuda_draft2_check.zig` walked the context as positions `[p+1-len, p]` with
+`position = p`, so `ctx_len > position` at small `p` and the walk died on `ContextPastPosition`
+before round 0. `Round.ctx` is `[position - ctx_len, position)` — the anchor's own position is not in
+the keys — so the correct span is `[p-len, p-1]`, `len = min(ctx_rows, p)`. Fixed in
+`zig/src/families/flashnext/cuda_draft2_check.zig` (branch `layerprobe`).
+
+## 8. The dtype-matched layer probe: diverges from round 0, and the divergence compounds
+
+Both sides ran the **same bytes** — a seeded `N(0,1)` tap ring and prompt, sha256'd before dispatch —
+with the reference in vendor torch **bf16 on GPU** (`allow_bf16_reduced_precision_reduction = False`)
+and ours through the production drafter path. 53 stages each, 52 compared. This is the first
+comparison where a non-zero delta means a defect rather than a dtype difference.
+
+| stage (window case, ctx 2047, 8-row block) | rel L2 | cosine | bit-identical |
+| --- | ---: | ---: | --- |
+| `fc_ctx_rows` (the fused context) | 3.3e-03 | 0.9999946 | no |
+| `conv_attn_in_0` | 5.1e-03 | 0.9999869 | no |
+| `block_hidden_0` | 8.5e-03 | 0.9999642 | no |
+| `block_hidden_1` | 1.8e-02 | 0.9998489 | no |
+| `block_hidden_2` | 4.0e-02 | 0.9992282 | no |
+| `block_hidden_3` | **1.5e-01** | 0.9901629 | no |
+| `block_hidden_4` | **2.6e-01** | 0.9693146 | no |
+| `final_norm_block` | 2.4e-01 | 0.9720389 | no |
+| `logits_full` | 2.1e-01 | 0.9783146 | no |
+| `logits_top16_ids` | — | 0.0985 | no (21 % of ids agree) |
+| `proposals` | — | 0.7774 | no |
+
+**Reading.** No stage is bit-identical, so the two implementations are not computing the same
+function. But the error is *monotone in depth*, not stepwise: it starts at 3e-3 on the shared input
+and grows by roughly a factor of two per layer, hitting 26 % relative by layer 4. A single wrong
+weight, a wrong bias or a misplaced reduction would show as a step — one stage jumping and the next
+carrying it. Compounding per-step gain of ~1.5–2× on every layer is the signature of a *systematic*
+difference reapplied each block: a dtype that is not really bf16 somewhere, a normalisation applied to
+the wrong axis, or an attention scale/softmax temperature off by a constant.
+
+That also makes it consistent with the acceptance deficit and with every earlier "the layers agree,
+cos ≥ 0.99975" claim: those were bf16-against-fp32 and could not separate rounding from a real
+per-layer gain of this size. They cannot be quoted again as agreement.
+
+**What this does not yet say.** It does not name the faulty stage, because the probe has no
+stage-by-stage isolation of the *input* to each block — the growth could be seeded entirely by
+`fc_ctx_rows` (3e-3 is already above bf16's noise floor for a 2560-wide vector) and then amplified.
+The next step is to feed the reference each of our block outputs in turn and see which block turns a
+matching input into a mismatched one. That is the experiment the compounding tells us to run; it is
+not evidence that layer 4 is wrong.
+
+**Harness note (fixed).** The first run of this comparison reported cosine ≈ 0 and rel-L2 exactly
+1.000 on *every* stage, which is a dump fault, not a finding: `writeNpy` padded the header so
+`10 + hlen` was a multiple of 64 and then stored `hlen - 10`, so numpy read every array ten bytes
+late. numpy only checks the file is long enough, so it loaded silently — bf16 widenings came back as
+denormal noise. Fixed in `86daffeaf` with a test that reads the declared offset back out of a written
+file (fails on the old line: `expected 0, found 54`). The engine's own stage summary was correct
+throughout (`fc_ctx_rows` mean 0.00017, std 1.04), which is what localised it to the writer.
+
+The `block8` case (pos_end 9) is not runnable: the check refuses it with `FixtureIdsShape`, because
+`cuda_draft2_check.zig:415` requires `pos_end >= block + 2` = 10. The reference side runs it happily;
+that fixture is one position too short and is a harness bug, not an engine one. Every number above
+comes from `window`.
+
+## 9. What is left
+
+1. **Workload matching.** Establish which published cell, if any, corresponds to a
    greedy 8-wide run on plain prose with a short prompt. If none does, our numbers must be judged
    against the closest cell and the difference stated, not against a headline.
-2. **Dtype-matched layer probe (in flight, branch `probe-layer`).** Feed identical random inputs to
-   the reference drafter and ours, both bf16 on GPU, and diff every stage. The existing evidence says
-   the layers agree to 0.44–2.23 % with cos ≥ 0.99975, but that comparison was bf16 against fp32 and
-   cannot distinguish rounding from a real divergence. This probe is the only way to say
-   "bit-identical" or name the stage where it is not.
+2. **Block-by-block isolation of the compounded divergence (§8).** Feed the reference our
+   `block_hidden_k` in place of its own and find the first block that turns a matching input into a
+   mismatched output. Until that runs, §8 localises the *shape* of the error, not the fault.
 3. **Round cost.** 84 ms against 39.6 ms with no drafts; verify rows cost roughly 6 ms each on top of
    a ~33 ms floor. This is the only remaining lever with arithmetic behind it.
 
-## 8. Open defects noted, not yet fixed
+## 10. Open defects noted, not yet fixed
 
 - `cuda_lanes_verify.zig:51` notes `q.fed` *after* the window advanced it, so `written` is inflated by
   one window and `absorbOne`'s gap detector is blind to gaps up to 8 positions.
