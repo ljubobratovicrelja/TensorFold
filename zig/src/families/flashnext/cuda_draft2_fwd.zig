@@ -1309,7 +1309,11 @@ test "fusedReset drops the k/v span with the fusion" {
 test "the tap source is one constant, read once" {
     try std.testing.expectEqual(tap_ring.TapSource.default, tap_source);
     const src: tap_ring.Source = .{ .readout = 0x1000, .normed = 0x2000, .streams = 0x3000, .stride = 12800 };
-    try std.testing.expectEqual(@as(?u64, 0x1000), tapsFrom(src)); // the default is the read-out row
+    // The default is `mean4`, so the row a stream must offer is its four raw streams (which this
+    // module's caller collapses); the read-out and normed rows stay reachable through the override.
+    try std.testing.expectEqual(@as(?u64, 0x3000), tapsFrom(src));
+    try std.testing.expectEqual(@as(?u64, 0x1000), src.ptr(.readout).?);
+    try std.testing.expectEqual(@as(?u64, 0x2000), src.ptr(.normed).?);
     try std.testing.expect(tapsFrom(.{}) == null);
 }
 

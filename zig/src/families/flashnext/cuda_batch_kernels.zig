@@ -59,6 +59,12 @@ pub const Kernels = struct {
     experts: cuda.Module,
     rows: cuda.Module,
     batch: cuda.Module,
+    /// The DFlash2 drafter's image (`qwen35_draft`), loaded for the one entry the tap ring launches:
+    /// the four-stream collapse `TapSource.mean4` stores. Its other kernels are the drafter's own and
+    /// are resolved by `cuda_draft2_fwd.zig`, which loads this image again on its side.
+    draft: cuda.Module,
+    /// `tf_fxd2_mean4(SRC, OUT, D, SS)` in that image: the mean of a row's `SS` raw streams.
+    mean4: cuda.Function,
     /// The core's expert plan and its rows kernels.
     router: cuda.grouped.Router,
     moe: cuda.experts.RowsExperts,
@@ -107,6 +113,8 @@ pub const Kernels = struct {
         errdefer k.rows.unload();
         k.batch = try cuda.Module.load(d, cuda.kernels.flashnext_batch);
         errdefer k.batch.unload();
+        k.draft = try cuda.Module.load(d, cuda.kernels.qwen35_draft);
+        errdefer k.draft.unload();
         k.lane = try k.qmm.function(cubin_qmm);
         try k.lane.allowDynamicShared(qmm_smem);
         k.tiles = try tk.TileKernels.load(d);
@@ -130,6 +138,7 @@ pub const Kernels = struct {
         k.sum = try k.batch.function("fn_sum_slices");
         k.moe_sum = try k.batch.function("fn_moe_sum");
         k.copy_cols = try k.batch.function("fn_copy_cols");
+        k.mean4 = try k.draft.function("tf_fxd2_mean4");
         k.ep_picks = try k.batch.function("fn_ep_picks");
         k.shift = try k.batch.function("fn_shift_window");
         k.select = try k.batch.function("fn_qsa_select");
@@ -169,6 +178,7 @@ pub const Kernels = struct {
         k.fp8.unload();
         k.nvfp4.unload();
         k.native_lane.unload();
+        k.draft.unload();
         k.batch.unload();
         k.rows.unload();
         k.experts.unload();

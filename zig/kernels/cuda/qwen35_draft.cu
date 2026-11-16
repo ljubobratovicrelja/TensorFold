@@ -683,3 +683,45 @@ extern "C" __global__ void tf_fxd2_silu_mul(const __nv_bfloat16* __restrict__ GA
     const float g = bf(GATE[i]);
     OUT[i] = __float2bfloat16_rn(g * sigmoid(g) * bf(UP[i]));
 }
+
+// A tap row from the target's four hyper-connection streams: OUT[r, d] = mean over s of SRC[r, s, d],
+// SRC stream-major with element (r, s, d) at (r * SS + s) * D + d. Grid (rows), 256 threads.
+//
+// This is the vendor's capture verbatim (`hidden_states.unflatten(-1, (hc_count, hidden_size))
+// .mean(dim=-2)`): no gate and no hc_norm, unlike `fn_hc_dense_mix`, which mixes normalized streams
+// through a learned projection. The accumulation is fp32 and the row is rounded to bf16 once: torch
+// reduces a bf16 tensor through `at::opmath_type` (float) and scales the total by 1/SS at the end, so
+// a bf16 rounding a term would land a different row than the drafter was trained on. `__fdiv_rn` by
+// SS is exact for the served SS = 4 (1/4 is a power of two) and correctly rounded otherwise.
+extern "C" __global__ void tf_fxd2_mean4(const __nv_bfloat16* __restrict__ SRC, __nv_bfloat16* __restrict__ OUT,
+                                         int D, int SS) {
+    if (SS < 1) return;
+    const __nv_bfloat16* src = SRC + (size_t)blockIdx.x * (size_t)SS * (size_t)D;
+    __nv_bfloat16* dst = OUT + (size_t)blockIdx.x * (size_t)D;
+    const float count = (float)SS;
+    // 8 bf16 a thread a pass through a 16-byte load; D a multiple of 8 keeps every stream's start
+    // 16-byte aligned, and anything else takes the scalar loop below.
+    const int vecs = (D & 7) ? 0 : D / 8;
+    for (int v = threadIdx.x; v < vecs; v += blockDim.x) {
+        const uint4 first = *reinterpret_cast<const uint4*>(src + (size_t)v * 8);
+        const __nv_bfloat16* h0 = reinterpret_cast<const __nv_bfloat16*>(&first);
+        float acc[8];
+#pragma unroll
+        for (int e = 0; e < 8; e++) acc[e] = bf(h0[e]);
+        for (int s = 1; s < SS; s++) {
+            const uint4 more = *reinterpret_cast<const uint4*>(src + (size_t)s * D + (size_t)v * 8);
+            const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&more);
+#pragma unroll
+            for (int e = 0; e < 8; e++) acc[e] = __fadd_rn(acc[e], bf(h[e]));
+        }
+        __nv_bfloat16* o = dst + (size_t)v * 8;
+#pragma unroll
+        for (int e = 0; e < 8; e += 2)
+            *reinterpret_cast<__nv_bfloat162*>(o + e) = __floats2bfloat162_rn(__fdiv_rn(acc[e], count), __fdiv_rn(acc[e + 1], count));
+    }
+    for (int d = vecs * 8 + threadIdx.x; d < D; d += blockDim.x) {
+        float acc = bf(src[d]);
+        for (int s = 1; s < SS; s++) acc = __fadd_rn(acc, bf(src[(size_t)s * D + d]));
+        dst[d] = __float2bfloat16_rn(__fdiv_rn(acc, count));
+    }
+}

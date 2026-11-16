@@ -27,7 +27,13 @@ test "dense serving: owned CUDA images retain their reviewed lane and decode byt
     // to walk a round's steps in one block over the head's own `[rows, topk]` tables (it took a
     // block base on top of a step base, and read 511 GB past a codebook), and to refuse any
     // codebook index at or past the vocabulary instead of reading it.
-    try std.testing.expectEqualStrings("65f9398db56dc307fa4084ad5a26da68ead392589bc427658bc2ea1d5e103b2d", &hash(@embedFile("kernels/cuda/qwen35_draft.cu")));
+    // Then tf_fxd2_mean4 was appended, once more after everything else: the tap ring's basis
+    // (cuda_tap_ring.zig's TapSource.mean4, written by Pass.tapRingWrite), the target's four raw
+    // hyper-connection streams averaged a channel. It is a new entry at the end of the image; no
+    // existing kernel's body, launch or argument list moved. Between the two, tf_fxd2_topf32's
+    // block reduction learned to keep every thread's list (it published one lane a warp, so no
+    // candidate id could avoid being a multiple of 32); this digest is of the merged image.
+    try std.testing.expectEqualStrings("abaaefa3a280bc157100c941eb3c01e12b2e3eaead1f0af067e8e521a8b40f12", &hash(@embedFile("kernels/cuda/qwen35_draft.cu")));
     try std.testing.expectEqualStrings("403cf841b89ad61da0818bdad8976ed4b286b3282c8c22df7171921b7e06eb6d", &hash(@embedFile("kernels/cuda/qwen35_keep.cu")));
     try std.testing.expectEqualStrings("d1a379a98cf7504a7ed3b3f2d24c8ab6a39fe5511bcded6449e598ce5c3c79e7", &hash(@embedFile("kernels/cuda/scan_rows.cu")));
 }
