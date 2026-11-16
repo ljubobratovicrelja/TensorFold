@@ -278,3 +278,24 @@ by span `[kv_lo, kv_end)` with the fused ring's own reuse rule (`reuseFrom`); a 
 only the positions the span does not cover, `fusedReset` clears it. Tests: `cuda_draft2_fwd.zig`
 "a round projects only the k/v positions the round before it did not" + span-reset.
 
+**Measured A/B, one server, per-request draft flag, temp 0 (2026-11-16):**
+
+- 614aa3c2a (baseline): short drafting 12.87 t/s (nodrafts 22.2-24.9); 1451-token 8.89 (20.79).
+- 92ed00596 (+incremental K/V): short 14.01, 1451-token **12.72 (+43%)**; stages @1600 ctx:
+  layers 93.0 -> 33 ms, kv 0.0, head 39.5, select 0.9, verify 44-47; sha still identical to
+  nodrafts (lossless).
+- e7acb89e2 (head tile pass: rows loop inside the tile CTA, weights stream once): perf-neutral.
+  nsys of the drafting path: `tf_fxd2_headtile` = 39.8 ms/launch (1.31 s across 33 launches,
+  ~32 GB/s effective — latency/issue-bound scalar path, not bandwidth); next drafter-side items:
+  tf_q35_dense_bf16 (the block's per-element dense) 0.38 ms/launch x 2035, fuse 7.5 ms chunks.
+  ncu is blocked on this box (ERR_NVGPUCTRPERM, needs root).
+
+**Next, in order:** (1) the head over the repo's tensor-core engine: `glm_mm.cu` BITS=16 mode is
+plain-bf16 weights and K=2560 fits its 64-groups; pre-tile lm_head once at open with
+`glm_mm_tile16`, then `glm_mm16_64(hn, ldx, tiled, null, logits_f32, null, 1, 7, 248320, 2560, 1)`
+per round + an fp32 slice-topk pass reusing `tf_fxd2_headmerge` — head 39.8 -> ~8-12 ms, long-ctx
+drafting ~17-19 t/s. (2) the block's projections batched, killing the per-element `tf_q35_dense_bf16`
+streams (the ~24 ms inside `layers`), for parity with the no-draft path. Then acceptance work on
+top.
+
+
