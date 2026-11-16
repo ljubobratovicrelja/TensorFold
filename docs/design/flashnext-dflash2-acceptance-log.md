@@ -174,12 +174,39 @@ That also makes it consistent with the acceptance deficit and with every earlier
 cos ≥ 0.99975" claim: those were bf16-against-fp32 and could not separate rounding from a real
 per-layer gain of this size. They cannot be quoted again as agreement.
 
-**What this does not yet say.** It does not name the faulty stage, because the probe has no
-stage-by-stage isolation of the *input* to each block — the growth could be seeded entirely by
-`fc_ctx_rows` (3e-3 is already above bf16's noise floor for a 2560-wide vector) and then amplified.
-The next step is to feed the reference each of our block outputs in turn and see which block turns a
-matching input into a mismatched one. That is the experiment the compounding tells us to run; it is
-not evidence that layer 4 is wrong.
+**What this did not yet say, and the isolation that answered it.** The compounding curve alone could
+not name a faulty stage: it could equally be one bad input amplified by five healthy blocks. So each
+block was then run *on its own* (`isolate_blocks.py`), twice — once from the reference's own previous
+output, once from **ours** — with both outputs scored against our `block_hidden_k`:
+
+| block | ours-in → ref block → vs our output | ref-in → ref block → vs our output |
+| --- | ---: | ---: |
+| 0 | **8.46e-03** | 8.46e-03 |
+| 1 | 1.40e-02 | 1.77e-02 |
+| 2 | 1.21e-02 | 3.98e-02 |
+| 3 | 2.57e-02 | 1.62e-01 |
+| 4 | 2.01e-02 | 2.46e-01 |
+
+**The per-block divergence is flat at ~2e-2, and the compounding was an artifact of the experiment.**
+Each block, fed a *matching* input, produces a mismatch of the same size regardless of depth. The
+2.6e-1 at layer 4 in the full round is what the reference's own drift becomes when it is fed back into
+itself five times — the isolation removes that by restarting each block from our state.
+
+So there is no "layer 4 is wrong": the error is present, at constant size, from the first block. And
+block 0 already fails on an input that is not in dispute (`noise_emb`, a table lookup on both sides),
+with the same figure in both arms — which puts the fault inside the block body: the layer's attention,
+conv or MLP arithmetic, not the context fusion and not the residual chain.
+
+Still unexplained, and the next question: **why is a healthy bf16 block off by 2e-2 at all?** At bf16
+with fp32 reduction the expectation for a correct implementation is ~1e-3 on a 2560-wide row — two
+orders of magnitude smaller. The candidate that would produce exactly this: if our kernels round
+*accumulations* to bf16 (accumulating in bf16 rather than fp32), every dot product carries a
+relative error near bf16's unit roundoff and a 2e-2 difference is what it looks like. That is
+checkable statically, in one grep across the drafter's kernels for accumulate types.
+
+**Earlier reading, now superseded:** the paragraph above called this "a systematic difference
+reapplied each block". The isolation shows it is not reapplied — it is constant per block. The
+conclusion (our drafter and the reference are not computing the same function) stands.
 
 **Harness note (fixed).** The first run of this comparison reported cosine ≈ 0 and rel-L2 exactly
 1.000 on *every* stage, which is a dump fault, not a finding: `writeNpy` padded the header so
@@ -188,6 +215,11 @@ late. numpy only checks the file is long enough, so it loaded silently — bf16 
 denormal noise. Fixed in `86daffeaf` with a test that reads the declared offset back out of a written
 file (fails on the old line: `expected 0, found 54`). The engine's own stage summary was correct
 throughout (`fc_ctx_rows` mean 0.00017, std 1.04), which is what localised it to the writer.
+
+Two further harness traps the isolation paid for: a dumped array is an **f32 widening** of a bf16
+value, so it must be *cast* to bf16 to be fed back (`.view(torch.bfloat16)` on f32 reinterprets the
+bytes and doubles the element count — it fails loudly only because a norm's weight is 2560 wide), and
+`run_round` stores its stages unbatched, so indexing `[0]` takes a row, not a batch.
 
 The `block8` case (pos_end 9) is not runnable: the check refuses it with `FixtureIdsShape`, because
 `cuda_draft2_check.zig:415` requires `pos_end >= block + 2` = 10. The reference side runs it happily;
