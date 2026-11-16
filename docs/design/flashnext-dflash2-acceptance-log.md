@@ -208,25 +208,29 @@ checkable statically, in one grep across the drafter's kernels for accumulate ty
 reapplied each block". The isolation shows it is not reapplied — it is constant per block. The
 conclusion (our drafter and the reference are not computing the same function) stands.
 
-**The fault, found: the block attention never applied the sliding window to its own rows.**
-`tf_fxd2_attn` scanned from `max(begin, p - window + 1)` with `begin = pos0`, so **every** block row
-saw the **whole** context. The reference builds its mask with
-`_attention_mask(is_causal=false, sliding_window=window)`, and under that flag the window hides the
-*oldest* columns from the later block rows: read directly off the reference's own mask, row 0 sees all
-2047 context columns, row `m` sees `2047 - m` and loses columns `0..m-1`. Row 7 was attending seven
-positions it is not allowed to see.
+**A real defect fixed, which was NOT the divergence (measured negative).** `tf_fxd2_attn` scanned
+from `max(begin, p - window + 1)` with `begin = pos0`, so **every** block row saw the **whole**
+context: the reference's `_attention_mask(is_causal=false, sliding_window=window)` hides the oldest
+columns from the later block rows (row `m` sees `ctx - m`, losing columns `0..m-1`). Row 7 was
+attending seven positions it is not allowed to see. That was a genuine bug — fixed in `qwen35_draft.cu`
+(`first = max(begin + m, p - window + 1)`, source pin regenerated `57b6ee2b…` from `abaaefa3…`), and
+the fixed binary's top-1 proposal now matches the reference's (`20`, was `220`).
 
-That is a constant-size error at every block (picking up a handful of extra context terms), which is
-exactly what the isolation measured — and it explains why the effect did not grow with depth per
-block, and why `qkv` was healthy (4e-3) while `attn` jumped to 2.8e-2 seven-fold.
+**But the bf16 divergence did not move.** The block-by-block isolation re-run on the fixed binary
+gives the same flat per-block figures as before the fix (`block_hidden` ours-in rel-L2: 8.5e-3,
+1.4e-2, 1.2e-2, 2.6e-2, 2.0e-2 vs 8.46e-3, 1.40e-2, 1.21e-2, 2.57e-2, 2.01e-2 pre-fix), and
+block 0 still fails on the undisputed `noise_emb` input. The window fix is correct and worth keeping,
+but it was not the source of the constant ~2e-2 per-block gap: the fault is still inside the block
+body (attention, conv or MLP arithmetic), not the context window. The earlier claim that this was
+"the fault, found" is superseded.
 
-Fixed in `qwen35_draft.cu` (`first = max(begin + m, p - window + 1)`), kernel header comment corrected,
-`dense_serving_test.zig`'s source pin regenerated with `sha256sum` and verified by hand
-(`57b6ee2b…`, from `abaaefa3…`). Two hypotheses were killed on the way and should not be reopened:
+Two hypotheses were killed on the way and should not be reopened:
 accumulation precision (all drafter accumulators are `float`, and recomputing the conv in numpy with
 per-step bf16 rounding versus fp32 accum produced differences that had **cosine -0.0007** with the
 observed gap), and the RMSNorm order (the reference returns to bf16 *before* the weight multiply,
-exactly as `rbf(rbf(v * inv) * w)` does).
+exactly as `rbf(rbf(v * inv) * w)` does). The window fix itself (making every row match the
+reference's mask) is now also a closed door on the per-layer compounding: it did not change any
+stage.
 
 **Harness note (fixed).** The first run of this comparison reported cosine ≈ 0 and rel-L2 exactly
 1.000 on *every* stage, which is a dump fault, not a finding: `writeNpy` padded the header so
@@ -251,9 +255,13 @@ comes from `window`.
 1. **Workload matching.** Establish which published cell, if any, corresponds to a
    greedy 8-wide run on plain prose with a short prompt. If none does, our numbers must be judged
    against the closest cell and the difference stated, not against a headline.
-2. **Block-by-block isolation of the compounded divergence (§8).** Feed the reference our
-   `block_hidden_k` in place of its own and find the first block that turns a matching input into a
-   mismatched output. Until that runs, §8 localises the *shape* of the error, not the fault.
+2. **The block-body fault behind the flat ~2e-2 per-block gap (§8).** The isolation runs and gets a
+   decisive negative: the fault is inside the block body (block 0 fails on the undisputed
+   `noise_emb` with the same figure as every other block), and the sliding-window mask is now a
+   closed door. The next step is a same-dtype stage diff inside one block: dump the attention
+   pre-softmax scores / post-softmax weights (or the conv output and MLP intermediate) on both sides
+   for block 0 only, and find which arithmetic differs — a scale/softmax-temperature/axis constant,
+   which the compounding shape originally pointed at.
 3. **Round cost.** 84 ms against 39.6 ms with no drafts; verify rows cost roughly 6 ms each on top of
    a ~33 ms floor. This is the only remaining lever with arithmetic behind it.
 
