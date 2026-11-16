@@ -1,6 +1,8 @@
 # DFlash2 divergence: debugging brief for the working agent
 
-Status: **open.** This document is the hand-off from the senior pass. It tells you what is
+Status: **partially closed.** The fusion-rounding defect in §4 is fixed and verified (§9). The
+block-body divergence is still open and the fix for it is not yet known. This document is the
+hand-off from the senior pass. It tells you what is
 already proven, what the one real defect found so far is, how to fix it, and how to debug the rest
 of this port the right way. Read it before touching anything. The older chronicle is
 `flashnext-dflash2-acceptance-log.md` — treat its conclusions as claims to re-verify, not as truth;
@@ -207,3 +209,36 @@ sounds.
 - Commit and push the branch before a long measurement; never amend a commit another agent made.
 - Every measured cell gets ≥3 reps; put `not measured` in cells you did not run. An invented number
   is worse than an empty row.
+
+## 9. Result of the §4 fix (measured 2026-11-17)
+
+The fusion-rounding fix (commit `3a173079b`) was built and the engine re-run on `fixture/window`
+alongside the unchanged reference. Pre-fix = `bf16d_fixed`, post-fix = `bf16e_fusedfix`, both
+compared against the same `bf16/ref_window`.
+
+| stage | pre rel L2 | post rel L2 | pre exact% | post exact% |
+|---|---|---|---|---|
+| `fc_ctx_rows` | 3.29e-3 | **4.53e-4** | 65.5 | **99.08** |
+| `conv_attn_in_0` | 5.12e-3 | **2.96e-3** | 24.2 | **62.3** |
+| `qkv_0` | 4.07e-3 | 3.18e-3 | 26.0 | 47.3 |
+| `attn_0` | 2.77e-2 | 2.52e-2 | 10.2 | 18.4 |
+| `block_hidden_0` | 8.46e-3 | 9.62e-3 | 5.5 | 6.1 |
+| `block_hidden_4` | 2.68e-1 | 2.57e-1 | 0.8 | 0.8 |
+| `proposals` | `[20,15,18,15,1,494,25]` | `[20,1,847,471,494,348,383]` | — | — |
+
+**Reading.** The fix did exactly what it promised and nothing more: `fc_ctx_rows` and
+`conv_attn_in_0` (the two stages that consume the fixed kernels' outputs directly) improved
+markedly, and `fc_ctx_rows` is now 99% bit-exact. But from `qkv_0` onward the numbers barely move,
+and `block_hidden_4` is still ~2.6e-1. So the fusion rounding was a real, fixable defect — and it
+was **not** the source of the block-body divergence. The per-block error still compounds ~2× a layer
+from `qkv_0` down, exactly as the pre-fix run did.
+
+**The next first divergence is `qkv_0`** (3.18e-3, 47% exact, fed by `conv_attn_in_0` which is now
+itself only 2.96e-3). The remaining ~3e-3 at `conv_attn_in_0` after the norm fix is either the
+`attention_conv` (dynamic grouped conv) or the block's own projections — those are the two things
+to read next, using the §6 method (first-divergent stage, read source there only). Do not chase the
+compounding curve below `qkv_0`; a wrong `qkv_0` makes every later stage look wrong.
+
+One correction to what §4 implied: the fix is necessary but not sufficient. The earlier "the fault
+is inside the block body" was wrong for the mechanical reason in §6, and the block-body divergence
+is real — it is just *upstream* of where the isolation claimed it was.
