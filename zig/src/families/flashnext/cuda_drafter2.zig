@@ -261,6 +261,11 @@ pub const Draft2 = struct {
     /// the marginal step (`step_ms`, `forward(rows) + step_ms x drafts`'s) is therefore 0.
     draft_ms: f64 = 1.0,
     step_ms: f64 = 0.0,
+    /// The basis this drafter's ring records, read from `TF_FLASHNEXT_TAP_SOURCE` once at `init`
+    /// (`tapring.sourceFromEnv`, which falls back to `fwd.tap_source`). `fwd.tap_source` is a comptime
+    /// constant, so it cannot carry the override; reading the environment here is what makes the
+    /// documented A/B real without a rebuild.
+    tap_source: tapring.TapSource = fwd.tap_source,
 
     const Self = @This();
 
@@ -284,6 +289,7 @@ pub const Draft2 = struct {
         const self = try gpa.create(Self);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .io = io, .d = d, .stream = stream, .fwd = undefined, .head = owned };
+        self.tap_source = tapring.sourceFromEnv();
         self.fwd = try fwd.Draft.open(gpa, io, d, stream, dir, cfg, target);
         errdefer self.fwd.deinit();
         self.fwd.target.head = self.head.ptr;
@@ -436,7 +442,7 @@ pub const Draft2 = struct {
         for (c.taps[0..c.n_taps], 0..) |t, i| out.taps[i] = t;
         out.tap_ring = st.ring.ptr;
         out.tap_rows = self.ringRows();
-        out.tap_source = fwd.tap_source;
+        out.tap_source = self.tap_source;
         return out;
     }
 

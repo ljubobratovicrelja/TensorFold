@@ -331,9 +331,22 @@ different tensor by construction. The measured symptom of serving the wrong one 
 
 What landed: `TapSource.default = .mean4` (`cuda_tap_ring.zig`), the collapse kernel `tf_fxd2_mean4`
 (`kernels/cuda/qwen35_draft.cu`: fp32 accumulation, one bf16 rounding), `Pass.tapRingWrite`'s mean4
-arm writing into the pass's `tap4` scratch, and `TF_FLASHNEXT_TAP_SOURCE=readout|normed|mean4` kept as
-the A/B so the other two bases can be re-measured without a rebuild. Acceptance against the band is
-still the gate; nothing here is a measurement of it.
+arm writing into the pass's `tap4` scratch, and `TF_FLASHNEXT_TAP_SOURCE=readout|normed|mean4` as the
+A/B so the other two bases can be re-measured without a rebuild.
+
+**MEASURED (2026-11-16): the basis is not the acceptance limiter.** One binary, one prompt, one
+request, the basis flipped by environment only — `mean4` 48/103 candidates, 77 rounds; `readout`
+49/103, 76 rounds. Per-draft 0.466 against 0.476, i.e. indistinguishable (one candidate in 103).
+Both bases sit far below the card's band, so the recipe fixes *which tensor is correct* and nothing
+about the number: whatever costs acceptance is upstream or downstream of the tap row, not in the
+choice of it. `mean4` stays the default because it is the tensor the drafter was trained on, not
+because it measured better.
+
+The same run exposed why the A/B was untrustworthy before: `cuda_draft2_fwd.zig`'s `tap_source` was a
+comptime constant, so `TF_FLASHNEXT_TAP_SOURCE` reached only the dump tool and never the serving path
+— two "different" bases produced byte-identical results. The drafter now reads it once at `init`
+(`cuda_drafter2.zig`) and hands it to `hooks`. Any future A/B should first confirm the two arms
+*disagree* before reading anything into a null.
 
 ### 4.2 DeltaNet / sparse-attention state interaction
 The target's own KV is Gated DeltaNet + full attention + a Qwen Sparse Attention indexer. DFlash2
