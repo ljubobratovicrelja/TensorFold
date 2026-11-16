@@ -33,7 +33,7 @@ test "dense serving: owned CUDA images retain their reviewed lane and decode byt
     // existing kernel's body, launch or argument list moved. Between the two, tf_fxd2_topf32's
     // block reduction learned to keep every thread's list (it published one lane a warp, so no
     // candidate id could avoid being a multiple of 32); this digest is of the merged image.
-    try std.testing.expectEqualStrings("57b6ee2bf2ac913d6c272d19f500266121abcd92dd8ee957d2164155712f88ee", &hash(@embedFile("kernels/cuda/qwen35_draft.cu")));
+    try std.testing.expectEqualStrings("ae670ce20f46bbe32b7f620be2c91456234d5a1bf33325d19f9e7240ed0be888", &hash(@embedFile("kernels/cuda/qwen35_draft.cu")));
     try std.testing.expectEqualStrings("403cf841b89ad61da0818bdad8976ed4b286b3282c8c22df7171921b7e06eb6d", &hash(@embedFile("kernels/cuda/qwen35_keep.cu")));
     try std.testing.expectEqualStrings("d1a379a98cf7504a7ed3b3f2d24c8ab6a39fe5511bcded6449e598ce5c3c79e7", &hash(@embedFile("kernels/cuda/scan_rows.cu")));
 }

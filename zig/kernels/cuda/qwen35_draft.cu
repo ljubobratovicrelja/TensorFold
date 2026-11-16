@@ -248,14 +248,14 @@ extern "C" __global__ void __launch_bounds__(256) tf_fxd2_fuse(const __nv_bfloat
 #pragma unroll
             for (int e = 0; e < 8; e++) s = fmaf(bf(ab[e]), bf(bb[e]), s);
         }
-        acc[j] = s;
+        acc[j] = __float2bfloat16_rn(s);
     }
     __syncthreads();
     float ss = 0.0f;
     for (int j = threadIdx.x; j < H; j += blockDim.x) ss = fmaf(acc[j], acc[j], ss);
     const float inv = rsqrtf(tf_common::block_sum_serial(ss, red) / (float)H + eps);
     for (int j = threadIdx.x; j < H; j += blockDim.x)
-        OUT[(size_t)blockIdx.x * H + j] = __float2bfloat16_rn(acc[j] * inv * bf(NORM[j]));
+        OUT[(size_t)blockIdx.x * H + j] = __float2bfloat16_rn(__float2bfloat16_rn(acc[j] * inv) * bf(NORM[j]));
 }
 
 // out[r, :] = rms_norm(w, x[r, :]) over the whole hidden width. Grid (rows), 256 threads: a layer's
@@ -271,7 +271,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_fxd2_rmsnorm(const __nv_bfl
         ss = fmaf(v, v, ss);
     }
     const float inv = rsqrtf(tf_common::block_sum_serial(ss, red) / (float)H + eps);
-    for (int j = threadIdx.x; j < H; j += blockDim.x) OUT[base + j] = __float2bfloat16_rn(bf(X[base + j]) * inv * bf(W[j]));
+    for (int j = threadIdx.x; j < H; j += blockDim.x) OUT[base + j] = __float2bfloat16_rn(__float2bfloat16_rn(bf(X[base + j]) * inv) * bf(W[j]));
 }
 
 // Per-head RMSNorm of packed (rows, heads, HD) rows with no rotation: the context keys' RoPE is at
