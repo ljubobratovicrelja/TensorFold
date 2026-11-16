@@ -1,0 +1,16 @@
+{
+  "rows": 2048,
+  "taps": [
+    5,
+    15,
+    25,
+    35,
+    45
+  ],
+  "hidden": 2560,
+  "window": 2048,
+  "block": 8,
+  "pos_end": 2048,
+  "row_bytes": 25600,
+  "source": "gen_inputs.py seed=20261116 case=window"
+}
