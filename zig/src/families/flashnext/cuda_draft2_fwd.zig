@@ -49,6 +49,7 @@ const config = @import("config.zig");
 const draft2 = @import("cuda_draft2.zig");
 const contract = @import("cuda_draft2_weights.zig");
 const tap_ring = @import("cuda_tap_ring.zig");
+const stage_dump = @import("cuda_draft2_stages.zig");
 
 /// The drafter's config, as `cuda_draft2.zig` parsed and validated it.
 pub const Config = draft2.Draft;
@@ -403,8 +404,18 @@ pub const Draft = struct {
     /// Where the next round's internals are copied, or null (`Debug`). Set by `trace`, off by default,
     /// and read only by the two copy sites a round has.
     dbg: ?Debug = null,
+    /// The stage-by-stage capture (`cuda_draft2_stages.zig`), or null. Set by `stages`, off by
+    /// default, and read at each stage boundary a round has: null is one branch a boundary and no
+    /// copy, so a serving round pays nothing for the format existing.
+    stg: ?*stage_dump.Collector = null,
 
     const Self = @This();
+
+    /// Send the stage capture to `k`, or (null) stop. A collector synchronises the stream at every
+    /// stage boundary, so this is a measurement harness's switch, never a serving one's.
+    pub fn traceStages(s: *Self, k: ?*stage_dump.Collector) void {
+        s.stg = k;
+    }
 
     /// Send the next rounds' internals to `g`, or (null) stop. The spans are the caller's: this module
     /// never allocates, sizes or frees one, and a span too small for a round is `DebugCtxTooSmall`.
@@ -589,9 +600,16 @@ pub const Draft = struct {
 
         // the five layers' shared cross-attention context, fused once for the round and kept: every
         // layer reads the same rows, and the rows the last round fused are still good
+        if (s.stg) |k| k.start();
         try s.fusePrefix(st, r);
         try embed(s, b.ids, b.h);
+        // the round's one shared stage: the prefix's five taps fused per position, plus the block's
+        // embedding lookup. Its rows are a window wide, so it records a clock and no tensor — the
+        // check summarises the fused ring itself.
+        try stageMark(s, "fc_ctx");
         var rt = nowNs(s.io);
+        // the block's input rows: the anchor's embedding and the seven masks, before any layer
+        try stageNamed(s, "embed", &.{.{ .ptr = b.h, .cols = c.hidden }}, B, c.hidden, .bf16);
         // the block's input rows (the anchor's embedding and the masks), then one row block a layer:
         // a reader of the dump then sees the state each sublayer was handed, not just the last one
         const row_bytes = B * c.hidden * 2;
@@ -600,6 +618,9 @@ pub const Draft = struct {
         for (s.w.layers, 0..) |l, i| {
             try s.layer(st, &b, l, i, r);
             if (s.dbg) |g| if (g.layers != 0) try copyOut(s, g.layers + (i + 1) * row_bytes, row_bytes, b.h);
+            // the row block the next layer was handed: the same bytes `conv_mlp_out_i` holds, read a
+            // second time where the following layer's input sits
+            try stageLayer(s, i, "block_hidden_{d}", &.{.{ .ptr = b.h, .cols = c.hidden }}, B, c.hidden, .bf16);
         }
         // The head and the selector read the block's rows 1..7, not 0..6: row r sits at position
         // p+r and proposes the token at p+r, so row 0 only re-predicts the anchor. `reference.py`'s
@@ -615,12 +636,20 @@ pub const Draft = struct {
             rt = tL;
         }
         try rmsnorm(s, b.h + c.hidden * 2, s.w.norm, b.hn, rows);
+        try stageNamed(s, "final_norm_block", &.{.{ .ptr = b.hn, .cols = c.hidden }}, rows, c.hidden, .bf16);
         try headTopk(s, b.hn, rows, b.part, b.cand, b.unary, b.lg);
+        // the head's two tables: the top-16 ids one row, and their fp32 logits. Ids first, because
+        // that entry carries the head's clock; the values are read back from the same landing.
+        try stageNamed(s, "logits_top16_ids", &.{.{ .ptr = b.cand, .cols = c.topk }}, rows, c.topk, .u32);
+        try stageNamed(s, "logits_top16_vals", &.{.{ .ptr = b.unary, .cols = c.topk }}, rows, c.topk, .f32);
+        // the head's whole-vocabulary logits, all 248,320 a row: the GEMM apart from the top-k
+        try stageNamed(s, "logits_full", &.{.{ .ptr = b.lg, .cols = c.vocab }}, rows, c.vocab, .f32);
         if (s.timing) {
             try s.stream.synchronize();
             tH = nowNs(s.io);
         }
         try select(s, b.hn, rows, b.cand, b.unary, b.err, r.anchor, b.prop);
+        try stageNamed(s, "proposals", &.{.{ .ptr = b.prop, .cols = 1 }}, rows, 1, .u32);
         if (s.timing) {
             try s.stream.synchronize();
             tS = nowNs(s.io);
@@ -701,27 +730,41 @@ pub const Draft = struct {
         try rmsnorm(s, b.h, l.input_norm, b.x, B);
         try dense(s, b.x, l.attn_conv, b.dyn, dyn, H, B);
         try dynConv(s, b.x, b.dyn, l.attn_base, 0, b.xin, 0);
+        try stageLayer(s, i, "conv_attn_in_{d}", &.{.{ .ptr = b.xin, .cols = H }}, B, H, .bf16);
         // the block's attention projections: one launch each for all B rows, so a weight row streams
         // once a layer instead of once a row (`denseBatch`'s bytes are `dense`'s, bit for bit)
         try denseBatch(s, b.xin, l.q, b.qraw, qw, H, B);
         try denseBatch(s, b.xin, l.k, b.kraw, kvw, H, B);
         try denseBatch(s, b.xin, l.v, b.vb, kvw, H, B);
+        // q, k and v side by side, before the per-head norm and the rotation: the projections the
+        // block's attention is built out of
+        try stageLayer(s, i, "qkv_{d}", &.{ .{ .ptr = b.qraw, .cols = qw }, .{ .ptr = b.kraw, .cols = kvw }, .{ .ptr = b.vb, .cols = kvw } }, B, qw + 2 * kvw, .bf16);
         try normRope(s, b.qraw, l.q_norm, b.q, qw, c.heads, pos, B);
         try normRope(s, b.kraw, l.k_norm, b.kb, kvw, c.kv_heads, pos, B);
         // the prefix's keys and values, into this layer's ring at the positions they were captured at
         try s.prefix(st, b, l, i, r);
         try attn(s, st, i, b, lo, r.ctx_len, B);
+        // `attn_i`'s clock covers this layer's prefix k/v projection as well as the attention: the
+        // engine projects the prefix once a layer, and the two cannot be separated without a second
+        // copy of the ring. The tensor is the attention's own output.
+        try stageLayer(s, i, "attn_{d}", &.{.{ .ptr = b.att, .cols = qw }}, B, qw, .bf16);
         try denseBatch(s, b.att, l.o, b.o, H, qw, B);
+        // the output projection's own rows: `attn_i` is the attention before `o_proj`
+        try stageLayer(s, i, "attn_proj_{d}", &.{.{ .ptr = b.o, .cols = H }}, B, H, .bf16);
         try dynConv(s, b.o, b.dyn, l.attn_base, b.h, b.h2, 1);
+        try stageLayer(s, i, "conv_attn_out_{d}", &.{.{ .ptr = b.h2, .cols = H }}, B, H, .bf16);
         // mlp: norm, prepare, gate/up/silu, down, finish
         try rmsnorm(s, b.h2, l.post_norm, b.x, B);
         try dense(s, b.x, l.mlp_conv, b.dyn, dyn, H, B);
         try dynConv(s, b.x, b.dyn, l.mlp_base, 0, b.xin, 0);
+        try stageLayer(s, i, "conv_mlp_in_{d}", &.{.{ .ptr = b.xin, .cols = H }}, B, H, .bf16);
         try denseBatch(s, b.xin, l.gate, b.gate, c.intermediate, H, B);
         try denseBatch(s, b.xin, l.up, b.up, c.intermediate, H, B);
         try siluMul(s, b.gate, b.up, b.act, B * c.intermediate);
         try denseBatch(s, b.act, l.down, b.o, H, c.intermediate, B);
+        try stageLayer(s, i, "mlp_{d}", &.{.{ .ptr = b.o, .cols = H }}, B, H, .bf16);
         try dynConv(s, b.o, b.dyn, l.mlp_base, b.h2, b.h, 1);
+        try stageLayer(s, i, "conv_mlp_out_{d}", &.{.{ .ptr = b.h, .cols = H }}, B, H, .bf16);
     }
 
     /// The layer's cross-attention context: the prefix's fused tap rows, `ctx_chunk` rows at a time,
@@ -849,6 +892,26 @@ fn copyOut(s: *Draft, dst: u64, len: usize, src: u64) !void {
     // a borrowed view of the destination: `copyFrom` writes rows, it does not own them
     const view: cuda.memory.DeviceBuffer = .{ .d = s.d, .ptr = dst, .len = len, .borrowed = true };
     try view.copyFrom(0, src, len, s.stream.handle);
+}
+
+/// One stage of the round, named as it stands: no collector, no work (`cuda_draft2_stages.zig`).
+fn stageNamed(s: *Draft, name: []const u8, parts: []const stage_dump.Part, rows: usize, cols: usize, dtype: stage_dump.Dtype) !void {
+    const k = s.stg orelse return;
+    try k.take(name, parts, rows, cols, dtype);
+}
+
+/// A stage with a clock and no tensor: the fusion, whose rows are not a block's.
+fn stageMark(s: *Draft, name: []const u8) !void {
+    const k = s.stg orelse return;
+    try k.mark(name);
+}
+
+/// A layer's stage, `fmt` filled with the layer index (`conv_attn_in_{d}`).
+fn stageLayer(s: *Draft, i: usize, comptime fmt: []const u8, parts: []const stage_dump.Part, rows: usize, cols: usize, dtype: stage_dump.Dtype) !void {
+    const k = s.stg orelse return;
+    var nb: [stage_dump.name_max]u8 = undefined;
+    const name = try std.fmt.bufPrint(&nb, fmt, .{i});
+    try k.take(name, parts, rows, cols, dtype);
 }
 
 /// The fused rows of positions `[at, at + n)` out of the round's fused ring, into `dst` in position
@@ -999,6 +1062,22 @@ fn headTopk(s: *Draft, x: u64, rows: usize, part: u64, ids: u64, val: u64, lg: u
     });
     // one candidate list a thread plus one a warp: `tf_fxd2_topf32` publishes every thread's list
     const slice_shared: usize = (threads + threads / 32) * c.topk * 8;
+    // TF_FLASHNEXT_LG_DUMP=<dir>: the head's input rows and its fp32 logits for row 0, so the GEMM
+    // and the top-k can be checked apart from each other. Off unless set.
+    if (std.c.getenv("TF_FLASHNEXT_LG_DUMP")) |p| {
+        try s.stream.synchronize();
+        const dir = std.mem.span(p);
+        var nb1: [512]u8 = undefined;
+        var nb2: [512]u8 = undefined;
+        const hb = try s.gpa.alloc(u8, rows * c.hidden * 2);
+        defer s.gpa.free(hb);
+        try cuda.memory.download(s.d, x, hb);
+        try std.Io.Dir.cwd().writeFile(s.io, .{ .sub_path = try std.fmt.bufPrint(&nb1, "{s}/head_in.bf16", .{dir}), .data = hb });
+        const lb = try s.gpa.alloc(u8, c.vocab * 4);
+        defer s.gpa.free(lb);
+        try cuda.memory.download(s.d, lg, lb);
+        try std.Io.Dir.cwd().writeFile(s.io, .{ .sub_path = try std.fmt.bufPrint(&nb2, "{s}/logits_r0.f32", .{dir}), .data = lb });
+    }
     try launch(s, s.fns.topf32, .{ @intCast(tiles), 1, 1 }, threads, @intCast(slice_shared), .{
         lg, part, ci(c.vocab), ci(c.topk), ci(rows), ci(head_tile),
     });

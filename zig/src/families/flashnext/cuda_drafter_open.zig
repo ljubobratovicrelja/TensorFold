@@ -73,7 +73,7 @@ pub fn Opener(comptime F: type) type {
             const declared = try draft2.read(gpa, io, dir, cfg);
             if (d2.tapsRefusal(declared.taps[0..declared.n_taps], e.n_layers)) |why| return why;
 
-            const head = try check.detile(gpa, e.driver, head_q.w.ptr, cfg.vocab, cfg.hidden);
+            const head = try check.detile(gpa, io, e.driver, head_q.w.ptr, cfg.vocab, cfg.hidden);
             // the detiled table's ownership passes to the drafter: every failure from here frees it
             const dr = try d2.Draft2.init(gpa, io, e.driver, e.stream.*, dir, cfg, .{
                 .embed = e.table.w.ptr,

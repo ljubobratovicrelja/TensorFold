@@ -82,6 +82,7 @@ const std = @import("std");
 const cuda = @import("cuda");
 const config = @import("config.zig");
 const debug = @import("cuda_draft2_debug.zig");
+const stage_dump = @import("cuda_draft2_stages.zig");
 const draft2 = @import("cuda_draft2.zig");
 const fwd = @import("cuda_draft2_fwd.zig");
 const weights = @import("cuda_prompt_wt.zig");
@@ -160,20 +161,22 @@ pub fn run(
     max_rounds: usize,
 ) !void {
     if (dir.len == 0) return error.DraftCheckNoDrafterDir;
+    // TF_FLASHNEXT_DRAFT_FIXTURE=<dir>: the same check, but over a ring on disk instead of the one
+    // this pass just captured — one round, at the position the fixture's manifest names. Before the
+    // capture's own ring is even looked at, because the capture is then only the way the engine got
+    // here.
+    if (fixtureDirFromEnv()) |fx| return runFixture(gpa, io, driver, stream, dir, m, fx);
     // refused before the head is detiled (a second of host work): a directory that is not a DFlash2
     // drafter is not one, whatever the rest of the environment says
     if (!draft2.declared(gpa, io, dir)) return error.DraftCheckNotADrafter;
-    if (m.embed == 0 or m.embed_rows != vocab) return error.DraftCheckNoEmbedTable;
-    if (m.head == 0) return error.DraftCheckNoHead;
-    if (!m.head_bf16) return error.DraftCheckHeadNotBf16;
-    if (m.head_rows != vocab or m.head_cols != hidden) return error.DraftCheckHeadNotWholeVocab;
+    try checkModel(m);
     const row_bytes = n_taps * hidden * 2;
     if (cap.rows < block or cap.ring.len != try std.math.mul(usize, cap.rows, row_bytes)) return error.DraftCheckNoRing;
     if (cap.ids.len < block + 2) return error.DraftCheckSequenceTooShort;
     if (max_rounds == 0) return error.DraftCheckNoRounds;
 
     // 1. the head the drafter's top-k reads, out of the tiles the engine keeps it in
-    var head = try detile(gpa, driver, m.head, vocab, hidden);
+    var head = try detile(gpa, io, driver, m.head, vocab, hidden);
     defer head.free();
 
     // 2. the drafter itself: the served checkpoint, its 81 tensors, its five layers' rings
@@ -246,6 +249,558 @@ pub fn run(
         @as(f64, @floatFromInt(advance_total)) / total,
         100.0 * @as(f64, @floatFromInt(zero)) / total,
     });
+}
+
+// -----------------------------------------------------------------------------------------------
+// Fixture mode: one round, at one position, over a ring on disk
+// -----------------------------------------------------------------------------------------------
+//
+// TF_FLASHNEXT_DRAFT_CHECK=1 with TF_FLASHNEXT_DRAFT_FIXTURE=<dir> runs exactly one round of the
+// CUDA drafter over the ring `<dir>` holds, at the position its `manifest.json` names, and writes
+// every intermediate to TF_FLASHNEXT_DRAFT_STAGES=<out>: a `.npy` a tensor and a `stages.json`.
+//
+// Why it exists: the walk above scores the drafter on a capture this engine just made, which is the
+// right question for "does the drafter predict" and the wrong one for "does this stage agree with
+// another implementation" — a PyTorch side of an alignment test can be fed bytes, not a prompt.
+// Fixture mode is the same production round (`fwd.Draft.draft`, the real kernels, the real 81-tensor
+// checkpoint) over frozen bytes, so a stage-by-stage diff compares arithmetic and not tokenizers.
+//
+// The round, exactly:
+//
+//   * block 8, window 2048, anchor position `P = pos_end - 1` from the fixture;
+//   * `ctx_len = min(window, P)`, context positions `[P - ctx_len, P)`, the row for absolute
+//     position `j` being ring slot `j % rows` — the context ends one position before the anchor and
+//     never contains it;
+//   * the block's ids are the anchor then `block - 1` mask tokens, at positions `P .. P + block`;
+//   * the proposals are the selector's walk over the head's rows 1..7.
+//
+// Inert unless both variables are set: no serving path reads either one.
+
+/// The fixture's mask token: `mask_token_id` in the drafter's config, pinned here so a checkpoint
+/// that disagrees is refused rather than silently drafting a different block.
+pub const mask_token: u32 = 248_077;
+
+/// The directory TF_FLASHNEXT_DRAFT_FIXTURE names, or null.
+pub fn fixtureDirFromEnv() ?[]const u8 {
+    const v = std.c.getenv("TF_FLASHNEXT_DRAFT_FIXTURE") orelse return null;
+    const text = std.mem.span(v);
+    return if (text.len == 0) null else text;
+}
+
+/// The directory TF_FLASHNEXT_DRAFT_STAGES names, or null.
+pub fn stageDirFromEnv() ?[]const u8 {
+    const v = std.c.getenv("TF_FLASHNEXT_DRAFT_STAGES") orelse return null;
+    const text = std.mem.span(v);
+    return if (text.len == 0) null else text;
+}
+
+/// TF_FLASHNEXT_STAGE_CTX_TENSOR=1: write the fused context rows as a `.npy` as well as a summary.
+/// Off by default, because the rows are a window wide (`ctx_len x hidden` bf16, 20 MB of f32 `.npy`
+/// at the served window) and a serving-sized dump does not need them.
+pub fn ctxTensorWanted() bool {
+    const v = std.c.getenv("TF_FLASHNEXT_STAGE_CTX_TENSOR") orelse return false;
+    return std.mem.eql(u8, std.mem.span(v), "1");
+}
+
+fn nowNs(io: std.Io) u64 {
+    const t = std.Io.Clock.Timestamp.now(io, .awake).raw.nanoseconds;
+    return @intCast(@max(0, t));
+}
+
+/// The target's two tensors, as every path in this file needs them.
+fn checkModel(m: Model) !void {
+    if (m.embed == 0 or m.embed_rows != vocab) return error.DraftCheckNoEmbedTable;
+    if (m.head == 0) return error.DraftCheckNoHead;
+    if (!m.head_bf16) return error.DraftCheckHeadNotBf16;
+    if (m.head_rows != vocab or m.head_cols != hidden) return error.DraftCheckHeadNotWholeVocab;
+}
+
+/// The fixture's manifest, as much of it as a round needs.
+const Man = struct {
+    rows: usize,
+    taps: []u32,
+    hidden: usize,
+    window: usize,
+    block: usize,
+    pos_end: usize,
+    row_bytes: usize,
+    source: []const u8 = "",
+    ring_file: []const u8 = "ring.bin",
+    ids_file: []const u8 = "ids.bin",
+};
+
+/// A fixture on the host: the ring, the ids it was produced from, and what they hash to.
+const Fixture = struct {
+    ring: []u8,
+    ids: []u32,
+    rows: usize,
+    row_bytes: usize,
+    hidden: usize,
+    block: usize,
+    n_taps: usize,
+    window: usize,
+    pos_end: usize,
+    sha: [3][64]u8 = .{ @splat('0'), @splat('0'), @splat('0') },
+
+    fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Fixture {
+        var path_buf: [1024]u8 = undefined;
+        const man_path = try std.fmt.bufPrint(&path_buf, "{s}/manifest.json", .{dir});
+        const text = try std.Io.Dir.cwd().readFileAlloc(io, man_path, gpa, .limited(1 << 20));
+        defer gpa.free(text);
+        var parsed = try std.json.parseFromSlice(Man, gpa, text, .{ .ignore_unknown_fields = true });
+        defer parsed.deinit();
+        const man = parsed.value;
+        if (man.taps.len != n_taps) return error.FixtureTapCount;
+
+        const ring_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, man.ring_file });
+        const ring = try std.Io.Dir.cwd().readFileAlloc(io, ring_path, gpa, .limited(1 << 30));
+        errdefer gpa.free(ring);
+
+        const ids_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ dir, man.ids_file });
+        const ids_bytes = try std.Io.Dir.cwd().readFileAlloc(io, ids_path, gpa, .limited(1 << 28));
+        defer gpa.free(ids_bytes);
+        if (ids_bytes.len % 4 != 0) return error.FixtureIdsShape;
+        const ids = try gpa.alloc(u32, ids_bytes.len / 4);
+        errdefer gpa.free(ids);
+        for (ids, 0..) |*id, i| id.* = std.mem.readInt(u32, ids_bytes[i * 4 ..][0..4], .little);
+
+        var f: Fixture = .{
+            .ring = ring,
+            .ids = ids,
+            .rows = man.rows,
+            .row_bytes = man.row_bytes,
+            .hidden = man.hidden,
+            .block = man.block,
+            .n_taps = man.taps.len,
+            .window = man.window,
+            .pos_end = man.pos_end,
+        };
+        f.sha[0] = sha256Hex(ring);
+        f.sha[1] = sha256Hex(ids_bytes);
+        f.sha[2] = sha256Hex(text);
+        return f;
+    }
+
+    fn deinit(f: *Fixture, gpa: std.mem.Allocator) void {
+        gpa.free(f.ring);
+        gpa.free(f.ids);
+    }
+};
+
+fn sha256Hex(bytes: []const u8) [64]u8 {
+    var digest: [32]u8 = undefined;
+    std.crypto.hash.sha2.Sha256.hash(bytes, &digest, .{});
+    return std.fmt.bytesToHex(digest, .lower);
+}
+
+/// One round of the production drafter over the fixture, dumped stage by stage.
+fn runFixture(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    driver: *cuda.Driver,
+    stream: cuda.Stream,
+    dir: []const u8,
+    m: Model,
+    fx_dir: []const u8,
+) !void {
+    const out_dir = stageDirFromEnv() orelse return error.DraftCheckNoStageDir;
+    if (!draft2.declared(gpa, io, dir)) return error.DraftCheckNotADrafter;
+    try checkModel(m);
+
+    var fx = try Fixture.open(gpa, io, fx_dir);
+    defer fx.deinit(gpa);
+    if (fx.hidden != hidden or fx.block != block or fx.n_taps != n_taps) return error.FixtureGeometry;
+    if (fx.row_bytes != n_taps * hidden * 2) return error.FixtureRowBytes;
+    if (fx.rows < block or fx.ring.len != try std.math.mul(usize, fx.rows, fx.row_bytes)) return error.FixtureRingShape;
+    if (fx.ids.len != fx.pos_end or fx.pos_end < block + 2) return error.FixtureIdsShape;
+    // the fixture is a ring, not a pass: a position past `pos_end` would read a slot another
+    // position overwrote, and the round would be quietly over the wrong rows
+    if (fx.pos_end > fx.rows + 1) return error.FixturePastRing;
+    const P = fx.pos_end - 1;
+
+    // 1. the head the drafter's top-k reads, out of the tiles the engine keeps it in
+    var head = try detile(gpa, io, driver, m.head, vocab, hidden);
+    defer head.free();
+
+    // 2. the drafter itself, exactly as a serving engine opens it
+    const d = try fwd.Draft.open(gpa, io, driver, stream, dir, targetConfig(), .{ .embed = m.embed, .head = head.ptr });
+    defer d.deinit();
+    if (d.c.mask != mask_token) return error.FixtureMaskMismatch;
+
+    // 3. the context span: `min(window, P)` positions ending where the block begins. This is the
+    // whole of the "clip to what the ring holds" rule: the span is the ring's own length, never the
+    // sequence's.
+    const win: usize = d.c.window;
+    const ctx_len = @min(win, P);
+    const lo = P - ctx_len;
+    var ctx = try cuda.DeviceBuffer.alloc(driver, try std.math.mul(usize, ctx_len, fx.row_bytes));
+    defer ctx.free();
+    const gather = try gpa.alloc(u8, ctx_len * fx.row_bytes);
+    defer gpa.free(gather);
+    for (0..ctx_len) |i| {
+        const slot = (lo + i) % fx.rows;
+        @memcpy(gather[i * fx.row_bytes ..][0..fx.row_bytes], fx.ring[slot * fx.row_bytes ..][0..fx.row_bytes]);
+    }
+    try ctx.upload(0, gather);
+
+    var st = try d.create();
+    defer st.deinit();
+
+    // 4. one round, stage by stage. The collector synchronises at every boundary, so its numbers
+    // are the work's and not the enqueue's.
+    var k = stage_dump.Collector.init(gpa, io, driver, stream);
+    defer k.deinit();
+    d.traceStages(&k);
+    var prop: [block - 1]u32 = @splat(0);
+    const t0 = nowNs(io);
+    try d.draft(&st, .{ .ctx = ctx.ptr, .ctx_len = ctx_len, .anchor = fx.ids[P], .position = P }, &prop);
+    const t1 = nowNs(io);
+    d.traceStages(null);
+    const round_ms = @as(f64, @floatFromInt(t1 - t0)) / 1e6;
+
+    // 5. the context: a window wide, and (TF_FLASHNEXT_STAGE_CTX_TENSOR=1) the one tensor a full
+    // round would otherwise only summarise. Off by default so a serving-sized window does not put
+    // 20 MB of `.npy` beside every dump; a harness that wants the fuse's own rows asks for them.
+    const ctx_host = try gpa.alloc(u8, ctx_len * hidden * 2);
+    defer gpa.free(ctx_host);
+    var done: usize = 0;
+    while (done < ctx_len) {
+        const n = @min(fwd.ctx_chunk, ctx_len - done);
+        const at = lo + done;
+        const slot = at % win;
+        const head_n = @min(n, win - slot);
+        try cuda.memory.download(driver, st.fused.ptr + slot * hidden * 2, ctx_host[done * hidden * 2 ..][0 .. head_n * hidden * 2]);
+        if (n > head_n) try cuda.memory.download(driver, st.fused.ptr, ctx_host[(done + head_n) * hidden * 2 ..][0 .. (n - head_n) * hidden * 2]);
+        done += n;
+    }
+    if (ctxTensorWanted()) {
+        const e = k.find("fc_ctx") orelse return error.StageMissing;
+        try k.addHost("fc_ctx_rows", ctx_host, ctx_len, hidden, .bf16, e.ms);
+    }
+
+    // 6. the selector's lattice scores, on the host, from the round's own tables
+    const sel = try selectorScores(gpa, driver, d, &k, fx.ids[P], &prop);
+    defer gpa.free(sel.scores);
+    try k.addHost("selector_scores", std.mem.sliceAsBytes(sel.scores), sel.rows, sel.topk, .f32, sel.ms);
+
+    // 7. the dumps
+    try writeStages(gpa, io, out_dir, .{
+        .drafter = dir,
+        .pos = P,
+        .ctx_len = ctx_len,
+        .ctx_lo = lo,
+        .window = win,
+        .anchor = fx.ids[P],
+        .round_ms = round_ms,
+        .ctx_stats = stage_dump.stats(ctx_host, ctx_len, hidden, .bf16),
+        .sel = sel,
+        .sha = fx.sha,
+    }, &k, &prop);
+
+    std.log.info("draftfix: position {d} ctx {d} from {d} anchor {d} proposals {any} round {d:.2} ms -> {s}", .{
+        P, ctx_len, lo, fx.ids[P], prop, round_ms, out_dir,
+    });
+    for (prop) |id| {
+        if (@as(usize, id) >= vocab) return error.FixtureProposalOutOfVocab;
+    }
+    var distinct: usize = 0;
+    for (0..prop.len) |i| {
+        var seen = false;
+        for (0..i) |j| {
+            if (prop[j] == prop[i]) seen = true;
+        }
+        if (!seen) distinct += 1;
+    }
+    if (distinct < 2) std.log.warn("draftfix: the walk is degenerate ({d} distinct ids)", .{distinct});
+}
+
+/// The selector's scores for the predecessors the walk actually took, recomputed on the host from
+/// the round's own dumped tables.
+///
+/// `tf_fxd2_select` keeps `score[]` in shared memory — only the proposals leave the kernel — so a
+/// reference implementation's lattice has no device buffer to be downloaded from. The recomputation
+/// is the kernel's arithmetic, element for element: `hp[j] = x[t] . wproj[j]`, then
+/// `ctx[r] = pred[prev][r] * hp[r]` and `score[c] = unary[c] + ctx . succ[cand[c]]`, all in fp32 with
+/// the same fused multiply-add and the same ascending order. `agree` is how many steps' argmax
+/// reproduces the kernel's own proposal, which is the only check that matters here: a recomputation
+/// that disagrees with the proposals is a different walk, and the JSON says so rather than hiding it.
+const Sel = struct {
+    scores: []f32,
+    rows: usize,
+    topk: usize,
+    ms: f64,
+    agree: usize,
+};
+
+fn selectorScores(
+    gpa: std.mem.Allocator,
+    driver: *const cuda.Driver,
+    d: *fwd.Draft,
+    k: *stage_dump.Collector,
+    anchor: u32,
+    prop: []const u32,
+) !Sel {
+    const hn = k.find("final_norm_block") orelse return error.StageMissingFinalNorm;
+    const cand = k.find("logits_top16_ids") orelse return error.StageMissingHeadIds;
+    const unary = k.find("logits_top16_vals") orelse return error.StageMissingHeadVals;
+    const rows = hn.rows;
+    const H = hn.cols;
+    const topk = cand.cols;
+    if (cand.rows != rows or unary.rows != rows or unary.cols != topk) return error.StageShapeMismatch;
+    if (prop.len != rows) return error.StageShapeMismatch;
+    const rank = d.c.rank;
+
+    const t0 = nowNs(k.io);
+    // the rank projection, [rank, H] bf16, and one row of each codebook at a time (both are
+    // [vocab, rank]: a step reads at most `topk` successors and one predecessor)
+    const wproj = try gpa.alloc(u8, try std.math.mul(usize, rank * H, 2));
+    defer gpa.free(wproj);
+    try cuda.memory.download(driver, d.w.hidden_proj, wproj);
+    const pred_row = try gpa.alloc(u8, rank * 2);
+    defer gpa.free(pred_row);
+    const succ_row = try gpa.alloc(u8, rank * 2);
+    defer gpa.free(succ_row);
+    const hp = try gpa.alloc(f32, rank);
+    defer gpa.free(hp);
+    const ctx = try gpa.alloc(f32, rank);
+    defer gpa.free(ctx);
+    const scores = try gpa.alloc(f32, rows * topk);
+    errdefer gpa.free(scores);
+
+    var agree: usize = 0;
+    for (0..rows) |t| {
+        // the predecessor this step walked from: the anchor at t = 0, else the previous proposal
+        const prev_token: u32 = if (t == 0) anchor else prop[t - 1];
+        if (@as(usize, prev_token) >= vocab) return error.StagePrevPastVocab;
+        for (0..rank) |j| {
+            const w = wproj[j * H * 2 ..][0 .. H * 2];
+            var s: f32 = 0;
+            for (0..H) |c| s = @mulAdd(f32, bf16At(hn.host, t * H + c), bf16At(w, c), s);
+            hp[j] = s;
+        }
+        try cuda.memory.download(driver, d.w.pred + @as(u64, prev_token) * @as(u64, rank) * 2, pred_row);
+        for (0..rank) |r| ctx[r] = bf16At(pred_row, r) * hp[r];
+        for (0..topk) |c| {
+            const cid = std.mem.readInt(u32, cand.host[(t * topk + c) * 4 ..][0..4], .little);
+            if (@as(usize, cid) >= vocab) return error.StageCandPastVocab;
+            try cuda.memory.download(driver, d.w.succ + @as(u64, cid) * @as(u64, rank) * 2, succ_row);
+            var s: f32 = 0;
+            for (0..rank) |r| s = @mulAdd(f32, ctx[r], bf16At(succ_row, r), s);
+            const unary_bits = std.mem.readInt(u32, unary.host[(t * topk + c) * 4 ..][0..4], .little);
+            scores[t * topk + c] = @as(f32, @bitCast(unary_bits)) + s;
+        }
+        var best: usize = 0;
+        for (1..topk) |c| {
+            if (scores[t * topk + c] > scores[t * topk + best]) best = c;
+        }
+        const picked = std.mem.readInt(u32, cand.host[(t * topk + best) * 4 ..][0..4], .little);
+        if (picked == prop[t]) agree += 1;
+    }
+    const t1 = nowNs(k.io);
+    return .{ .scores = scores, .rows = rows, .topk = topk, .ms = @as(f64, @floatFromInt(t1 - t0)) / 1e6, .agree = agree };
+}
+
+fn bf16At(bytes: []const u8, i: usize) f32 {
+    const bits = std.mem.readInt(u16, bytes[i * 2 ..][0..2], .little);
+    return @bitCast(@as(u32, bits) << 16);
+}
+
+/// What one fixture round was, beside the stages it produced.
+const RoundInfo = struct {
+    drafter: []const u8,
+    pos: usize,
+    ctx_len: usize,
+    ctx_lo: usize,
+    window: usize,
+    anchor: u32,
+    round_ms: f64,
+    ctx_stats: stage_dump.Stats,
+    sel: Sel,
+    sha: [3][64]u8,
+};
+
+/// Write `tensors/<stage>.npy` a stage and the `stages.json` beside them. Every stage is looked up
+/// by name in the order a round produces them, so a round that skipped one is an error here rather
+/// than a shorter list a reference implementation would diff against the wrong rows.
+fn writeStages(gpa: std.mem.Allocator, io: std.Io, out_dir: []const u8, info: RoundInfo, k: *stage_dump.Collector, prop: []const u32) !void {
+    var dir_buf: [1024]u8 = undefined;
+    var path_buf: [1200]u8 = undefined;
+    const tensors_dir = try std.fmt.bufPrint(&dir_buf, "{s}/tensors", .{out_dir});
+    const cwd = std.Io.Dir.cwd();
+    try cwd.createDirPath(io, out_dir);
+    try cwd.createDirPath(io, tensors_dir);
+
+    var text: std.Io.Writer.Allocating = .init(gpa);
+    defer text.deinit();
+    const w = &text.writer;
+    var cmd_buf: [4096]u8 = undefined;
+    const cmd = commandText(io, gpa, &cmd_buf) catch "(unknown)";
+    var ck_buf: [1024]u8 = undefined;
+    const checkpoint = checkpointPath(io, gpa, &ck_buf) catch "unknown";
+
+    try w.print(
+        "{{\"impl\":\"tensorfold-cuda\",\"device\":\"cuda\",\"dtype\":\"bf16\",\"checkpoint\":\"{s}\",\"drafter\":\"{s}\"," ++
+            "\"fixture_sha256\":{{\"ring.bin\":\"{s}\",\"ids.bin\":\"{s}\",\"manifest.json\":\"{s}\"}}," ++
+            "\"command\":\"{s}\",\"n_stages\":{d}," ++
+            "\"round\":{{\"position\":{d},\"anchor\":{d},\"ctx_len\":{d},\"ctx_lo\":{d},\"window\":{d},\"block\":{d}," ++
+            "\"mask\":{d},\"round_ms\":{d:.3},\"selector_argmax_agrees\":{d},\"proposals\":[{d},{d},{d},{d},{d},{d},{d}]}},\"stages\":[",
+        .{
+            checkpoint,                                         info.drafter,
+            info.sha[0][0..],                                   info.sha[1][0..],
+            info.sha[2][0..],                                   cmd,
+            countStages(),                                      info.pos,
+            info.anchor,                                        info.ctx_len,
+            info.ctx_lo,                                        info.window,
+            block,                                              mask_token,
+            info.round_ms,                                      info.sel.agree,
+            prop[0],                                            prop[1],
+            prop[2],                                            prop[3],
+            prop[4],                                            prop[5],
+            prop[6],
+        },
+    );
+
+    var name_buf: [stage_dump.name_max]u8 = undefined;
+    var n: usize = 0;
+    var sum_ms: f64 = 0;
+    // the context first: a window-wide tensor, summarised rather than written
+    {
+        const s = info.ctx_stats;
+        const e = k.find("fc_ctx") orelse return error.StageMissing;
+        try w.print(
+            "{{\"stage\":\"fc_ctx\",\"shape\":[{d}, {d}],\"dtype\":\"bf16\",\"src_dtype\":\"bf16\",\"mean\":{d:.8},\"std\":{d:.8}," ++
+                "\"l2norm\":{d:.8},\"sample\":[{d:.8},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8}],\"ms\":{d:.3},\"measured\":\"gpu\",\"stored\":\"summary\"}}",
+            .{
+                info.ctx_len, hidden, s.mean, s.std, s.l2norm,
+                s.sample[0], s.sample[1], s.sample[2], s.sample[3], s.sample[4], s.sample[5], s.sample[6], s.sample[7],
+                e.ms,
+            },
+        );
+        n += 1;
+        sum_ms += e.ms;
+    }
+    // ... and, when TF_FLASHNEXT_STAGE_CTX_TENSOR=1, the same rows as a tensor
+    if (k.find("fc_ctx_rows") != null) try writeOne(gpa, io, w, k, "fc_ctx_rows", tensors_dir, &path_buf, &n, &sum_ms);
+
+    const per_layer = [_][]const u8{ "conv_attn_in_{d}", "qkv_{d}", "attn_{d}", "attn_proj_{d}", "conv_attn_out_{d}", "conv_mlp_in_{d}", "mlp_{d}", "conv_mlp_out_{d}", "block_hidden_{d}" };
+    for (0..5) |i| {
+        inline for (per_layer) |fmt| {
+            const name = try std.fmt.bufPrint(&name_buf, fmt, .{i});
+            try writeOne(gpa, io, w, k, name, tensors_dir, &path_buf, &n, &sum_ms);
+        }
+    }
+    try writeOne(gpa, io, w, k, "final_norm_block", tensors_dir, &path_buf, &n, &sum_ms);
+    try writeOne(gpa, io, w, k, "logits_top16_ids", tensors_dir, &path_buf, &n, &sum_ms);
+    try writeOne(gpa, io, w, k, "logits_top16_vals", tensors_dir, &path_buf, &n, &sum_ms);
+    try writeOne(gpa, io, w, k, "logits_full", tensors_dir, &path_buf, &n, &sum_ms);
+    try writeOne(gpa, io, w, k, "selector_scores", tensors_dir, &path_buf, &n, &sum_ms);
+    try writeOne(gpa, io, w, k, "proposals", tensors_dir, &path_buf, &n, &sum_ms);
+
+    try w.print("],\"sum_stage_ms\":{d:.3}}}\n", .{sum_ms});
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/stages.json", .{out_dir});
+    try cwd.writeFile(io, .{ .sub_path = path, .data = text.written() });
+    std.log.info("draftfix: {d} stages, {d:.2} ms summed, written to {s}/stages.json", .{ n, sum_ms, out_dir });
+}
+
+/// The stages a dump has: the context, the block's embedding, nine a layer, the final norm, the
+/// head's three tables, the selector's scores, the context's own rows and the proposals.
+pub fn countStages() usize {
+    return 1 + 1 + 5 * 9 + 1 + 3 + 2 + 1;
+}
+
+fn writeOne(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    w: *std.Io.Writer,
+    k: *stage_dump.Collector,
+    name: []const u8,
+    tensors_dir: []const u8,
+    path_buf: *[1200]u8,
+    n: *usize,
+    sum_ms: *f64,
+) !void {
+    const e = k.find(name) orelse return error.StageMissing;
+    if (n.* != 0) try w.writeAll(",");
+    const rows = e.rows;
+    const cols = e.cols;
+    const flat = cols == 1 or cols == 0;
+    const total = rows * cols;
+    const st = stage_dump.stats(e.host, rows, cols, e.dtype);
+    const f32s = try stage_dump.widenAll(gpa, e.host, total, e.dtype);
+    defer gpa.free(f32s);
+    const path = try std.fmt.bufPrint(path_buf, "{s}/{s}.npy", .{ tensors_dir, name });
+    try stage_dump.writeNpy(io, path, rows, if (flat) 0 else cols, f32s);
+    var shape_buf: [48]u8 = undefined;
+    const shape = if (flat)
+        try std.fmt.bufPrint(&shape_buf, "[{d}]", .{rows})
+    else
+        try std.fmt.bufPrint(&shape_buf, "[{d}, {d}]", .{ rows, cols });
+    try w.print(
+        "{{\"stage\":\"{s}\",\"shape\":{s},\"dtype\":\"f32\",\"src_dtype\":\"{s}\",\"mean\":{d:.8},\"std\":{d:.8}," ++
+            "\"l2norm\":{d:.8},\"sample\":[{d:.8},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8},{d:.8}],\"ms\":{d:.3},\"measured\":\"{s}\",\"file\":\"tensors/{s}.npy\"}}",
+        .{
+            name, shape, e.dtype.text(), st.mean, st.std, st.l2norm,
+            st.sample[0], st.sample[1], st.sample[2], st.sample[3], st.sample[4], st.sample[5], st.sample[6], st.sample[7],
+            e.ms,
+            if (e.measured_gpu) @as([]const u8, "gpu") else @as([]const u8, "host"),
+            name,
+        },
+    );
+    n.* += 1;
+    sum_ms.* += e.ms;
+}
+
+/// The served checkpoint's directory, for the record: TF_ALIGN_CHECKPOINT, else the engine's own
+/// first argument (the `serve <model>` the round ran under). Copied into `buf`, because the argv it
+/// came from is freed before the JSON is written.
+fn checkpointPath(io: std.Io, gpa: std.mem.Allocator, buf: []u8) ![]const u8 {
+    if (std.c.getenv("TF_ALIGN_CHECKPOINT")) |v| {
+        const text = std.mem.span(v);
+        const n = @min(text.len, buf.len);
+        @memcpy(buf[0..n], text[0..n]);
+        return buf[0..n];
+    }
+    const arg = commandArg(io, gpa, 2) catch return error.NoCmdlineArg;
+    defer gpa.free(arg);
+    const n = @min(arg.len, buf.len);
+    @memcpy(buf[0..n], arg[0..n]);
+    return buf[0..n];
+}
+
+/// One space-joined line of this process's argv: the exact command the round ran under.
+fn commandText(io: std.Io, gpa: std.mem.Allocator, buf: []u8) ![]const u8 {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, "/proc/self/cmdline", gpa, .limited(1 << 16));
+    defer gpa.free(raw);
+    var out: usize = 0;
+    for (raw) |ch| {
+        if (out == buf.len) break;
+        buf[out] = if (ch == 0) ' ' else ch;
+        out += 1;
+    }
+    while (out > 0 and buf[out - 1] == ' ') out -= 1;
+    // procfs reports a size of 0, so a size-driven read can come back empty; TF_ALIGN_COMMAND is
+    // then the only way the exact invocation reaches the JSON
+    if (out == 0) {
+        if (std.c.getenv("TF_ALIGN_COMMAND")) |v| {
+            const text = std.mem.span(v);
+            const n = @min(text.len, buf.len);
+            @memcpy(buf[0..n], text[0..n]);
+            out = n;
+        }
+    }
+    return buf[0..out];
+}
+
+fn commandArg(io: std.Io, gpa: std.mem.Allocator, index: usize) ![]const u8 {
+    const raw = try std.Io.Dir.cwd().readFileAlloc(io, "/proc/self/cmdline", gpa, .limited(1 << 16));
+    defer gpa.free(raw);
+    var it = std.mem.splitScalar(u8, raw, 0);
+    var i: usize = 0;
+    while (it.next()) |part| : (i += 1) {
+        // the caller owns the copy: `raw` is freed when this returns
+        if (i == index) return try gpa.dupe(u8, part);
+    }
+    return error.NoCmdlineArg;
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -460,7 +1015,7 @@ pub fn detileRows(src: []const u16, dst: []u16, rows: usize, k: usize) void {
 
 /// The engine's head as one row-major `[n, k]` bf16 device buffer, a 64-row block at a time: 320 KiB
 /// a block at this checkpoint, so the host side of it is two small buffers rather than 1.2 GiB twice.
-pub fn detile(gpa: std.mem.Allocator, driver: *const cuda.Driver, tiles: u64, n: usize, k: usize) !cuda.DeviceBuffer {
+pub fn detile(gpa: std.mem.Allocator, io: std.Io, driver: *const cuda.Driver, tiles: u64, n: usize, k: usize) !cuda.DeviceBuffer {
     if (tiles == 0 or n == 0 or k == 0 or k % tile_rows != 0) return error.DraftCheckHeadShape;
     var out = try cuda.DeviceBuffer.alloc(driver, try std.math.mul(usize, try std.math.mul(usize, n, k), 2));
     errdefer out.free();
@@ -478,6 +1033,13 @@ pub fn detile(gpa: std.mem.Allocator, driver: *const cuda.Driver, tiles: u64, n:
         const at_row_block = row0 / tile_rows;
         try cuda.memory.download(driver, tiles + at_row_block * (k / tile_rows) * 4096 * 2, std.mem.sliceAsBytes(src));
         detileRows(src, dst[0 .. rows * k], rows, k);
+        // TF_FLASHNEXT_DETILE_DUMP=<dir>: write each detiled 64-row block (bf16 bits) so it can be
+        // checked against the checkpoint's own `lm_head.weight` outside the engine. Off unless set.
+        if (std.c.getenv("TF_FLASHNEXT_DETILE_DUMP")) |dump| {
+            var name: [512]u8 = undefined;
+            const path = try std.fmt.bufPrint(&name, "{s}/block{d}.bf16", .{ std.mem.span(dump), at_row_block });
+            try std.Io.Dir.cwd().writeFile(io, .{ .sub_path = path, .data = std.mem.sliceAsBytes(dst[0 .. rows * k]) });
+        }
         try out.upload(row0 * k * 2, std.mem.sliceAsBytes(dst[0 .. rows * k]));
     }
     return out;
