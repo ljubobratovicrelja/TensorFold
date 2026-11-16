@@ -31,6 +31,8 @@ pub const Draft = struct {
     window: usize,
     /// Channels a dynamic convolution group spans (`conv_group_size`).
     group: usize,
+    /// Taps a dynamic convolution spans (`conv_kernel_size`): the parser admits only 2.
+    conv_kernel: usize,
     /// The candidate selector's state rank and the head's top-k it re-ranks.
     rank: usize,
     topk: usize,
@@ -116,6 +118,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, target: config.Config) !
         .mask = @intCast(try whole(d.object, "mask_token_id")),
         .window = try int(o, "sliding_window"),
         .group = try int(d.object, "conv_group_size"),
+        .conv_kernel = try int(d.object, "conv_kernel_size"),
         .rank = try int(d.object, "selector_rank"),
         .topk = try int(d.object, "selector_top_k"),
         .eps = @floatCast(try num(o, "rms_norm_eps")),

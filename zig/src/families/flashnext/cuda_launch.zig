@@ -17,6 +17,8 @@ pub const modelopt_experts = @import("cuda_modelopt_experts.zig");
 /// a stream keeps for it. Both are declared here so the family's test build compiles them.
 pub const draft2 = @import("cuda_draft2.zig");
 pub const tap_ring = @import("cuda_tap_ring.zig");
+/// The drafter checkpoint's 81-tensor contract, refused before a token is drafted.
+pub const draft2_weights = @import("cuda_draft2_weights.zig");
 /// The MoE pass's native routed experts (NVFP4, block FP8), whose FP8 call a device test takes.
 pub const moe_native = @import("cuda_moe_native.zig");
 /// A prompt pass's expert exchange at --tp 2, which the two-rank device test runs against the all-reduce.
