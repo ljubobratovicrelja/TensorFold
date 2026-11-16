@@ -8,6 +8,7 @@ const wt = @import("cuda_prompt_wt.zig");
 const tk = @import("cuda_tile_kernels.zig");
 const load = @import("cuda_prompt_load.zig");
 const shared = @import("cuda_batch_side.zig");
+const tapring = @import("cuda_tap_ring.zig");
 const layers_n = wt.layers_n;
 const linear_n = wt.linear_n;
 const dims = wt.dims;
@@ -152,13 +153,20 @@ pub const Hooks = struct {
     host_logits: bool = true,
     /// Prompt cache marks inside this pass (TF_FLASHNEXT_KEEP_INPASS): each one's states go to its kept state's buffer.
     marks: [max_marks]Mark = .{ .{}, .{} },
-    /// A drafter's taps (DFlash2): the completed layer output after these layers, `wide` bytes a row,
-    /// written to `taps_out[i]` in tap order. 0 taps: none. Read by `tapDump` and, once the drafter
-    /// lands, by its cross-attention. A tapped layer's write-back is flushed early, so the rows it
-    /// copies are that layer's output and not a later layer's.
+    /// A drafter's taps (DFlash2): the completed layer output after these layers, written to
+    /// `taps_out[i]` as `wide` bytes a row in tap order. 0 taps: none. Read by `tapDump` and, once
+    /// the drafter lands, by its cross-attention. A tapped layer's write-back is flushed early, so
+    /// the rows it copies are that layer's output and not a later layer's.
     taps: [8]u32 = @splat(0),
     n_taps: usize = 0,
     taps_out: [8]u64 = @splat(0),
+    /// A drafter's live tap ring (cuda_tap_ring.zig): `tap_rows` slots of `n_taps * hidden` bf16 of
+    /// one stream, a tapped layer's completed output at slot `position % tap_rows`. 0: no ring, and
+    /// `taps_out` is the only consumer.
+    tap_ring: u64 = 0,
+    tap_rows: usize = 0,
+    /// Which single 2560-wide row of a tapped layer's four-stream output the ring keeps.
+    tap_source: tapring.TapSource = tapring.TapSource.default,
 };
 
 /// Whether `layer` is one of the pass's taps, and which tap slot it fills.

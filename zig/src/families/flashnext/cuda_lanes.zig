@@ -15,6 +15,9 @@ const slide_mod = @import("cuda_slide.zig");
 const train = @import("cuda_train.zig");
 const bytes = @import("cuda_lanes_bytes.zig");
 const kvl = @import("cuda_kv_lanes.zig");
+const tapring = @import("cuda_tap_ring.zig");
+const bt = @import("cuda_batch_state.zig");
+const d2 = @import("cuda_drafter2.zig");
 const be = lanes.backend;
 const ring = 1024;
 /// Streams a round takes at most (a round with more live streams takes them in turns).
@@ -26,6 +29,11 @@ pub const captured_head_entries = [_][]const u8{ "_rmsnorm", "_add_streams" };
 pub fn Namespace(comptime Tri: type) type {
     return struct {
         pub const model_type = "qwen4_exp";
+        /// --drafter is accepted here: DFlash2 drafts beside the MTP head, which stays the default
+        /// (`cuda_refusal.family` and `cuda_drafted.wrap` both read these off `native`, the
+        /// namespace this file returns — a decl on the module root is not seen).
+        pub const takes_drafter = true;
+        pub const openDrafter = @import("cuda_drafter_open.zig").Opener(@This()).openDrafter;
         pub const formats: []const []const u8 = &.{ "mlx-q4g32", "modelopt-mixed" };
         // the model's window: past 2,048 keys the block indexer picks each row's 512 best blocks of 4 (cuda_batch.zig)
         pub const default_context: i64 = @intCast(prompt.max_tokens);
@@ -176,6 +184,13 @@ pub fn Namespace(comptime Tri: type) type {
             /// --slide: the pocket's layout, from config.json at load.
             lay: living.Layout = undefined,
             kv: kvl.State = .{},
+            /// --drafter: the DFlash2 block drafter, and the tap ring each stream keeps for it. Null
+            /// without the flag, and then every tap path below is inert: a pass carries no taps, no
+            /// ring is allocated, and the MTP head drafts exactly as it did.
+            drafter: ?*d2.Draft2 = null,
+            /// The layers the drafter taps, in its own order (its config's `target_layer_ids`).
+            taps: [8]u32 = @splat(0),
+            n_taps: usize = 0,
 
             pub fn tri(self: *Cuda) Tri {
                 return .{ .set = if (self.set) |*x| x else null, .own = &self.glue, .s = self.stream };
@@ -205,6 +220,78 @@ pub fn Namespace(comptime Tri: type) type {
                 return self.ranks.?.keep(Tri, self.tri(), q, d, keep);
             }
 
+            // ---- the drafter's taps --------------------------------------------------------------
+
+            /// The drafter's tapped layers, before any stream's ring exists: each pass fills them after.
+            pub fn setTaps(self: *Cuda, taps: []const u32) !void {
+                if (self.lanes.count() != 0) return error.TapsAfterStreams;
+                if (d2.tapsRefusal(taps, self.engine.n_layers)) |why| return why;
+                // the ring's slots are the drafter's tap order: another list writes one layer's rows
+                // into another tap's slot, which drafts plausible tokens from the wrong layer
+                if (self.drafter) |d| if (!std.mem.eql(u32, d.taps(), taps)) return error.TapsMismatch;
+                for (taps, 0..) |t, i| self.taps[i] = t;
+                for (self.taps[taps.len..]) |*t| t.* = 0;
+                self.n_taps = taps.len;
+            }
+
+            /// Device bytes one stream's tap ring takes, for pricing a stream before its first pass.
+            pub fn tapBytes(self: *const Cuda) usize {
+                if (self.n_taps == 0) return 0;
+                if (self.drafter) |d| return d.ringBytes();
+                return tapring.bytes(1, d2.default_window, d2.block, self.n_taps, weights.dims);
+            }
+
+            /// `hk` with the stream's taps when a drafter keeps a ring for it, else `hk` untouched.
+            pub fn tapHooks(self: *Cuda, hk: bt.Hooks, s: *lanes.Stream) bt.Hooks {
+                const d = self.drafter orelse return hk;
+                return d.hooks(hk, s);
+            }
+
+            /// `ops()` with the stream's taps: its window's rows are the rows a drafter's next round reads.
+            pub fn opsTapped(self: *Cuda, s: *lanes.Stream) Ops {
+                var o = self.ops();
+                if (self.drafter) |d| o.tap = d.hooks(.{}, s);
+                return o;
+            }
+
+            /// Rows [start, start + count) of a stream's tap ring, `offset` the first row's position
+            /// (the drafter's absorb reads `buffer` as `tap_rows` slots, slot = position % rows).
+            fn featuresFn(ptr: *anyopaque, stream: *lanes.Stream, taps: []const u32, start: u64, count: u32) !be.Features {
+                const self = of(ptr);
+                const d = self.drafter orelse return error.NoDrafter;
+                if (!std.mem.eql(u32, taps, d.taps())) return error.TapsMismatch;
+                const st = d.state(stream) orelse return error.UnknownStream;
+                // a long prompt asks for more rows than the ring keeps: the drafter reads its window of
+                // the newest, and an earlier start is another stream's rows (or a restored prompt's zeroes)
+                if (count > 0 and (start + count > st.written or start < st.low(d.ringRows()))) return error.RowsNotHeld;
+                return .{ .buffer = st.ring.ptr, .offset = start, .rows = count, .row_bytes = @intCast(d.rowBytes()), .space = .device, .dtype = .bf16 };
+            }
+
+            /// A drafting stream's prompt, a chunk a pass, every chunk's rows handed to the drafter as it
+            /// lands: a prompt longer than the ring is absorbed as it is filled, never in one call.
+            fn prefillFeaturesFn(ptr: *anyopaque, s: *lanes.Stream, taps: []const u32, sink: be.FeatureSink) anyerror!void {
+                const self = of(ptr);
+                const d = self.drafter orelse return error.NoDrafter;
+                if (!std.mem.eql(u32, taps, d.taps())) return error.TapsMismatch;
+                const l = try self.open(s);
+                const ids = s.prompt();
+                var at: usize = l.filled orelse ids.len;
+                while (true) {
+                    const done = try self.step(s, l, 0);
+                    const to: usize = if (done) ids.len else (l.filled orelse ids.len);
+                    if (to > at) {
+                        const f = try featuresFn(ptr, s, taps, at, @intCast(to - at));
+                        try sink.take(sink.ptr, s, f, at);
+                    }
+                    at = to;
+                    if (done) break;
+                }
+            }
+
+            fn prepareFeaturesFn(ptr: *anyopaque, taps: []const u32) !void {
+                return of(ptr).setTaps(taps);
+            }
+
             pub fn backend(self: *Cuda) be.Backend {
                 const scoring_table: be.Backend.VTable = .{
                     .prefill = prefillFn,
@@ -221,6 +308,10 @@ pub fn Namespace(comptime Tri: type) type {
                     .probabilities = probabilitiesFn,
                     .score = @import("cuda_score.zig").Hook(Cuda, Tri).call,
                     .first_masked = firstMaskedFn,
+                    // --drafter: the tapped rows a stream's ring takes, and its prompt absorbed as it fills
+                    .prepare_features = prepareFeaturesFn,
+                    .features = featuresFn,
+                    .prefill_features = prefillFeaturesFn,
                 };
                 const ranked_table = comptime @import("cuda_score.zig").withoutScore(scoring_table);
                 return .{ .ptr = self, .proposal_head = if (self.head) |h| &h.service else null, .first_before_draft = mtp.firstEarly(), .vtable = if (self.ranks == null) &scoring_table else &ranked_table };
@@ -279,6 +370,8 @@ pub fn Namespace(comptime Tri: type) type {
             fn open(self: *Cuda, s: *lanes.Stream) !*Lane {
                 const ids = s.prompt();
                 if (ids.len == 0 or ids.len + s.max_new > self.context) return error.PromptTooLong;
+                // a drafting stream's ring exists before its first pass, or the pass writes no taps
+                if (self.drafter) |draft2| try draft2.ensure(s);
                 const gop = try self.lanes.getOrPut(self.gpa, s);
                 if (gop.found_existing) dropLane(self, gop.value_ptr);
                 const drafting = self.head != null and s.drafts;
@@ -348,11 +441,13 @@ pub fn Namespace(comptime Tri: type) type {
                 const last = cut.stop == ids.len;
                 self.engine.ngram.warmAhead(ids, cut.stop, @min(ids.len, cut.stop + rows));
                 if (l.draft) |*d| {
-                    try self.ops().prefillChunk(&l.seq, d, ids, at, cut.stop, marks);
+                    try self.opsTapped(s).prefillChunk(&l.seq, d, ids, at, cut.stop, marks);
                 } else if (self.ranks) |r| {
-                    try r.forward(Tri, self.tri(), &l.seq, ids[at..cut.stop], .{ .logits = if (last) .last else .none, .prompt = true });
-                } else try self.engine.forward(Tri, self.tri(), &l.seq, ids[at..cut.stop], .{ .logits = if (last) .last else .none, .prompt = true, .marks = marks });
+                    try r.forward(Tri, self.tri(), &l.seq, ids[at..cut.stop], self.tapHooks(.{ .logits = if (last) .last else .none, .prompt = true }, s));
+                } else try self.engine.forward(Tri, self.tri(), &l.seq, ids[at..cut.stop], self.tapHooks(.{ .logits = if (last) .last else .none, .prompt = true, .marks = marks }, s));
                 l.filled = if (last) null else cut.stop;
+                // the ring holds this chunk's rows from here on: the drafter drafts from them, not before
+                if (self.drafter) |draft2| draft2.note(s, at, cut.stop);
                 if (cut.kept > 0) try snaps.handOver(self, s, l, marks[0..cut.kept]);
                 if (!last and std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(cut.stop)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(cut.stop));
                 return last;
@@ -374,6 +469,9 @@ pub fn Namespace(comptime Tri: type) type {
 
         pub fn release(p: *anyopaque) void {
             const own: *Cuda = @ptrCast(@alignCast(p));
+            // the drafter is closed before this (cuda_host_close.zig's order): a pointer left here would
+            // name memory another owner freed
+            own.drafter = null;
             cuda.completion.drain(own.engine.driver, own.stream, "flashnext: release did not drain");
             var it = own.lanes.valueIterator();
             while (it.next()) |l| dropLane(own, l);
@@ -491,12 +589,19 @@ pub fn Namespace(comptime Tri: type) type {
                 if (w.tokens.len > 0) @memcpy(o.drafts[0..w.tokens.len], w.tokens);
             }
             const env_rows = try @import("sys").environment.read(usize, "TF_FLASHNEXT_WINDOW_ROWS", mtp.round_rows);
-            const cap = @min(@min(env_rows, mtp.round_rows), self.engine.chunk);
+            // a shared verify writes no tap ring (one pass, many lanes: `Pass.tapRingWrite` refuses it), so
+            // with --drafter each drafted window runs as its own pass and keeps its lane's rows. The cost
+            // is the batching a drafted verify would have had; the alternative is a round drafted from
+            // another stream's taps.
+            const cap = if (self.drafter != null) 1 else @min(@min(env_rows, mtp.round_rows), self.engine.chunk);
             try @import("cuda_lanes_verify.zig").windows(self, windows, out, drafted[0..held], row_ids, cap);
             var at: usize = 0;
             while (at < plain) : (at += round_streams) {
                 const n = @min(round_streams, plain - at);
-                if (self.ranks) |r| try r.round(Tri, self.tri(), seqs[at..][0..n], ids[at..][0..n], self.logits.ptr) else try self.engine.round(Tri, self.tri(), seqs[at..][0..n], ids[at..][0..n], self.logits.ptr);
+                // a lone lane's round writes its own tap row; a shared one cannot (one ring a pass)
+                const tap: bt.Hooks = if (n == 1) self.tapHooks(.{}, windows[at_window[at]].stream) else .{};
+                if (self.ranks) |r| try r.round(Tri, self.tri(), seqs[at..][0..n], ids[at..][0..n], self.logits.ptr) else try self.engine.round(Tri, self.tri(), seqs[at..][0..n], ids[at..][0..n], self.logits.ptr, tap);
+                if (n == 1) if (self.drafter) |draft2| draft2.note(windows[at_window[at]].stream, seqs[at].fed - 1, seqs[at].fed);
             }
             for (seqs[0..plain], at_window[0..plain]) |q, wi| out[wi].sampled[0] = try self.tokenAt(q, windows[wi].stream, windows[wi].positions[0], windows[wi].masks);
         }

@@ -20,8 +20,14 @@ test "dense serving: owned CUDA images retain their reviewed lane and decode byt
     // #2933's bytes: served one-row steps skip the rollback copy nothing reads (#2908); replies unchanged
     try std.testing.expectEqualStrings("f16fa3d48336cfe7bcdc071ef791247d8ef3c06e26a9eaa95a54e1febd803332", &hash(@embedFile("kernels/cuda/qwen35.cu")));
     try std.testing.expectEqualStrings("7d916f0bb75d636ed15d8f30a7108cf05a6c5a833bd76beb8b627e6567a641db", &hash(@embedFile("kernels/cuda/qwen35.cuh")));
-    // 67711a6aa7's bytes: the opt-in DSpine draft kernels (#2633); default serving unchanged
-    try std.testing.expectEqualStrings("df06cb0ef07d12ca2296f7d1691678d0649a148f4abcbb3cb69f0d839e45295c", &hash(@embedFile("kernels/cuda/qwen35_draft.cu")));
+    // 67711a6aa7's df06cb0e plus flashnext's DFlash2 drafter entries appended after the includes:
+    // tf_fxd2_fuse, tf_fxd2_rmsnorm, tf_fxd2_knorm, tf_fxd2_attn, tf_fxd2_head_topk,
+    // tf_fxd2_select, tf_fxd2_silu_mul (cuda_draft2_fwd.zig). Nothing above them changed, and
+    // none of the qwen3_5 drafter's launches or arguments moved. tf_fxd2_select was then reworked
+    // to walk a round's steps in one block over the head's own `[rows, topk]` tables (it took a
+    // block base on top of a step base, and read 511 GB past a codebook), and to refuse any
+    // codebook index at or past the vocabulary instead of reading it.
+    try std.testing.expectEqualStrings("76cb6ab5e28a22f7b7a96503c5ad22201d26b3089b4b898841da6970ce45a9ca", &hash(@embedFile("kernels/cuda/qwen35_draft.cu")));
     try std.testing.expectEqualStrings("403cf841b89ad61da0818bdad8976ed4b286b3282c8c22df7171921b7e06eb6d", &hash(@embedFile("kernels/cuda/qwen35_keep.cu")));
     try std.testing.expectEqualStrings("d1a379a98cf7504a7ed3b3f2d24c8ab6a39fe5511bcded6449e598ce5c3c79e7", &hash(@embedFile("kernels/cuda/scan_rows.cu")));
 }

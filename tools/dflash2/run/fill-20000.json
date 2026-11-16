@@ -1,0 +1,10 @@
+{
+  "target": 20000,
+  "words": 14636,
+  "sha256": "ebec5fa2778ecfeea9ea26661003b284d32640e21a7de983380dc933babddd8b",
+  "prompt_tokens": 19995,
+  "error": -0.00025,
+  "tolerance": 0.05,
+  "model_id": "qwen3.8-flash-next",
+  "ts": "2026-11-16T11:53:24+01:00"
+}

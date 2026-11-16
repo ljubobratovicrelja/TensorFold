@@ -9,6 +9,8 @@ pub const batch = @import("cuda_batch.zig");
 const fb = @import("cuda_fn_back.zig");
 const pocket = @import("cuda_pocket.zig");
 const chunks = @import("cuda_chunk.zig");
+const tapdump = @import("cuda_tap_dump.zig");
+const draftcheck = @import("cuda_draft2_check.zig");
 const layers_n = weights.layers_n;
 const linear_n = weights.linear_n;
 const attn_n = weights.attn_n;
@@ -394,6 +396,15 @@ pub const Engine = struct {
         if ((hooks.keep != null or hooks.logits == .all) and ids.len > e.chunk) return error.UnexpectedTensor;
         const s = try e.reserve(@min(ids.len, e.chunk));
         const scores = try e.reserveScores(seq.cap, s.cap);
+        // TF_FLASHNEXT_TAP_DUMP: one prompt pass records its tap ring to disk (research only, and the
+        // only caller of the ring until a drafter is attached). The window graph is skipped for it,
+        // because a capture flushes from this function.
+        var capture: ?tapdump.Active = null;
+        defer if (capture) |*c| c.deinit(e.gpa);
+        if (tapdump.dirFromEnv()) |dir| {
+            if (hooks.n_taps == 0) capture = try tapdump.begin(e.gpa, e.driver, dir, ids, s.cap);
+        }
+        const hk = if (capture) |*c| c.hooks() else hooks;
         var p: batch.Pass(Tri) = .{
             .gpa = e.gpa,
             .io = e.io,
@@ -403,9 +414,9 @@ pub const Engine = struct {
             .s = s,
             .m = if (seq.untaught) e.shipped() else e.model(),
             .seq = seq.view(scores),
-            .hooks = hooks,
+            .hooks = hk,
         };
-        if (try @import("cuda_prompt_windows.zig").forwardGraph(e, Tri, &p, seq, ids, hooks)) return;
+        if (capture == null) if (try @import("cuda_prompt_windows.zig").forwardGraph(e, Tri, &p, seq, ids, hk)) return;
         var at: usize = 0;
         while (at < ids.len) {
             const n = @min(s.cap, ids.len - at);
@@ -417,6 +428,30 @@ pub const Engine = struct {
             at += n;
         }
         if (hooks.logits == .none) try e.complete();
+        if (capture) |*c| {
+            try e.complete();
+            try tapdump.flush(c, e.gpa, e.io, e.driver, c.dir);
+            // TF_FLASHNEXT_DRAFT_CHECK=1: score the drafter on the ring this pass produced, in the
+            // engine's log. Inert unless the variable says 1; it drafts for no reply and holds no
+            // cache, and a refusal is a named error rather than a silent skip.
+            if (draftcheck.enabled()) {
+                // The capture's ids are the pass's own tokens, which the check reads as positions
+                // 0..n-1; that is only true of a fresh pass, and a scored walk over the wrong
+                // positions would look plausible and be meaningless.
+                if (seq.fed != 0) return error.DraftCheckNotAFreshPass;
+                const dir = draftcheck.dirFromEnv() orelse return error.DraftCheckNoDrafterDir;
+                // The drafter reads the target's own two tensors, as this engine loaded them: the
+                // dense embedding table and the head's bf16 tiles (cuda_draft2_check.zig detiles them).
+                try draftcheck.run(e.gpa, e.io, e.driver, e.stream.*, dir, .{
+                    .embed = if (e.table.dense) e.table.w.ptr else 0,
+                    .embed_rows = if (e.table.dense) e.table.rows else 0,
+                    .head = e.head_q.w.ptr,
+                    .head_rows = e.head_q.n,
+                    .head_cols = e.head_q.k,
+                    .head_bf16 = e.head_q.native != null,
+                }, .{ .ring = c.host, .rows = c.rows, .ids = c.ids, .dir = c.dir }, draftcheck.roundsFromEnv());
+            }
+        }
         seq.fed += ids.len;
     }
     /// A stream's window in a shared pass and the pass over several (cuda_prompt_windows.zig).
@@ -424,7 +459,10 @@ pub const Engine = struct {
     pub const windows = @import("cuda_prompt_windows.zig").windows;
 
     /// One decode round: each of `seqs` takes its token of `ids` in one batched pass; scores as if alone.
-    pub fn round(e: *Engine, comptime Tri: type, tri: Tri, seqs: []const *Seq, ids: []const u32, out: u64) !void {
+    /// One decode round over `seqs`. `hk` carries a drafter's tap hooks, and only a single-lane round
+    /// may use them: `Pass.tapRingWrite` writes one ring, so a shared round has no per-lane ring to fill.
+    pub fn round(e: *Engine, comptime Tri: type, tri: Tri, seqs: []const *Seq, ids: []const u32, out: u64, hk: batch.Hooks) !void {
+        const tap = if (seqs.len == 1) hk else batch.Hooks{};
         if (seqs.len == 0 or seqs.len != ids.len) return error.UnexpectedTensor;
         var cap: usize = 0;
         for (seqs) |q| {
@@ -456,7 +494,15 @@ pub const Engine = struct {
             .m = if (reads == .none) e.shipped() else e.model(),
             .seq = rows[0].seq,
             .lanes = rows,
-            .hooks = .{ .logits = .all, .logits_out = out },
+            .hooks = .{
+                .logits = .all,
+                .logits_out = out,
+                .taps = tap.taps,
+                .n_taps = tap.n_taps,
+                .tap_ring = tap.tap_ring,
+                .tap_rows = tap.tap_rows,
+                .tap_source = tap.tap_source,
+            },
         };
         const has_media = for (seqs) |q| {
             if (q.media != null) break true;

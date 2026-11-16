@@ -66,6 +66,18 @@ pub fn Ring(comptime Buf: type) type {
     };
 }
 
+/// The tap source a run records: TF_FLASHNEXT_TAP_SOURCE=readout|normed|mean4, the default otherwise.
+/// Read once at a ring's allocation so nothing in the pass branches on the choice; `mean4` needs the
+/// four-stream collapse this tree does not have yet and is refused where it would be written.
+pub fn sourceFromEnv() TapSource {
+    const v = std.c.getenv("TF_FLASHNEXT_TAP_SOURCE") orelse return TapSource.default;
+    const text = std.mem.span(v);
+    if (std.mem.eql(u8, text, "readout")) return .readout;
+    if (std.mem.eql(u8, text, "normed")) return .normed;
+    if (std.mem.eql(u8, text, "mean4")) return .mean4;
+    return TapSource.default;
+}
+
 /// The three candidate sources for a tap row, from flashnext's four-stream hyper-connection layer.
 ///
 /// MEASURED against the served target's weights, and the reason this is an enum rather than a

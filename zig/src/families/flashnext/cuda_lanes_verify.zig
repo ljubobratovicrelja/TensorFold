@@ -26,7 +26,13 @@ pub fn windows(self: anytype, wins: []const be.Window, out: []be.Verified, draft
             rows += w.rows();
         }
         if (n == 1 or cap <= 1) {
-            for (seqs[0..n], ds[0..n], idss[0..n]) |q, d, ids| try self.ops().verify(q, d, ids);
+            for (drafted[at..][0..n], seqs[0..n], ds[0..n], idss[0..n]) |wi, q, d, ids| {
+                // a lone window is a pass over one stream's own rows: its tap ring takes them, and the
+                // drafter finds them here (a batched pass writes no ring at all, which is why
+                // cuda_lanes.zig gives a drafting round `cap = 1`)
+                try self.opsTapped(wins[wi].stream).verify(q, d, ids);
+                if (self.drafter) |draft2| draft2.note(wins[wi].stream, q.fed, q.fed + @as(u64, @intCast(ids.len)));
+            }
         } else if (self.ranks) |r| {
             try r.verifyMany(@TypeOf(self.tri()), self.tri(), seqs[0..n], ds[0..n], idss[0..n], self.logits.ptr);
         } else try self.ops().verifyMany(seqs[0..n], ds[0..n], idss[0..n], self.logits.ptr);

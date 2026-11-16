@@ -221,7 +221,7 @@ pub const Session = struct {
         const bytes = raw[0 .. seqs.len * 12];
         const h = try s.command(.{ .kind = .round, .bytes = @intCast(bytes.len) }, bytes);
         errdefer s.poison();
-        try s.engine.round(Tri, tri, seqs, ids, out);
+        try s.engine.round(Tri, tri, seqs, ids, out, .{});
         try s.ack(h);
     }
 
@@ -347,7 +347,7 @@ pub const Session = struct {
                     ids[i] = std.mem.readInt(u32, payload[i * 12 + 8 ..][0..4], .little);
                     if (seqs[i].fed >= seqs[i].cap) return error.UnexpectedTensor;
                 }
-                try s.engine.round(Tri, tri, seqs[0..n], ids[0..n], logits);
+                try s.engine.round(Tri, tri, seqs[0..n], ids[0..n], logits, .{});
             },
             .verify => {
                 if (!s.drafting) return error.UnsupportedRankOperation;

@@ -17,9 +17,9 @@ Branch **`dflash2`**, worktree `~/Projects/tf-wt/dflash2`, pushed to `origin` at
 
 | step | state | what exists |
 | --- | --- | --- |
-| 0 tap-row measurement | **BLOCKED** | harness exists (`tools/dflash2/reference.py`), target forward does not — see below |
+| 0 tap-row measurement | **MECHANISM DONE; blocked on the torch reference** | engine exposes `TF_FLASHNEXT_TAP_DUMP`, real dumps on disk; `tools/dflash2/reference.py` scores 0/7 — see §0.6 |
 | 1 MTP baseline E2E | **DONE** | measured, see §0.2 |
-| 2 tap capture | **DONE (hook only)** | `Pass.tapDump` + `Hooks.taps/taps_out`; **no caller fills `taps_out` yet** |
+| 2 tap capture | **RING WRITE DONE (single stream, readout/normed)** | `Hooks.tap_ring/tap_rows/tap_source`, `Pass.tapRingWrite`; persistence through Snap/disk still missing |
 | 3 drafter forward on CUDA | not started | spec in `flashnext-dflash2-kernels.md` |
 | 4 candidate selector on CUDA | not started | same spec, §2.5 |
 | 5 `openDrafter` wiring | not started | `cuda_drafted.wrap` still refuses flashnext |
@@ -99,6 +99,76 @@ already exists to slice a candidate vocab; **measure the head's share before opt
 and be prepared for the honest answer that DFlash2 loses to MTP on this box.
 
 ---
+
+### 0.6 State after the 2026-11-16 session (verified, not planned)
+
+The ring exists in the engine and produces real rows. What landed:
+
+- `Hooks.tap_ring / tap_rows / tap_source` (`cuda_batch_state.zig`), `Pass.tapRingWrite`
+  (`cuda_batch.zig`), and `TF_FLASHNEXT_TAP_SOURCE=readout|normed` (`cuda_tap_ring.zig`).
+- The tap is **deferred by one layer on purpose**: the mixed/normed row over layer L's output is
+  produced by layer L+1's input mix, so `tapDump` only names the slot and `tapRingWrite` copies it
+  at the top of the next layer. Writing at `tapDump` time can only give the four-stream `s.h`.
+- `TF_FLASHNEXT_TAP_DUMP=<dir>` (`cuda_tap_dump.zig`, wired in `Engine.forward`) writes
+  `ids.bin`/`ring.bin`/`manifest.json` for one prompt pass; `tools/dflash2/tap_dump_run.py` drives it.
+- Trap paid for twice here: `copyCols` takes **byte** addresses but **value-unit** pitches and
+  width. A contiguous `copy` is wrong for a ring whose slots interleave five taps.
+
+Measured on this box, 1455-token prompt, fp8 KV, 32768 window:
+
+| claim | measured |
+| --- | --- |
+| ring is the drafter's fixed cost | 2064 slots × 5 × 2560 bf16 = 52,838,400 B |
+| the taps are real residuals | layer-45 tap (unweighted rms) through the target's `lm_head` puts the true next token at rank **107 / 7 / 5 / 0** of 248,320; layers 5/15/25/35 degrade as expected |
+| same logits under fp8 and bf16 KV | identical `token_sha256` `499ef81c…` |
+| taps bit-identical across KV precision | **no — 4.9% mean relative delta, max 4.3.** §4.4's bit-identity expectation is wrong; e4m3 KV cannot give bit-identical residuals. The gate is the sha plus a bounded delta, and the acceptance experiment must use **fp8** taps because that is the served configuration. |
+
+`tools/dflash2/reference.py` still scores **0.000 of 7 accepted at 100% of rounds** (mean advance
+1.000) on the real dump, including its leaky control — at chance, so the torch forward is
+structurally wrong while taps/head/embed are proven good by the rank test above. Until it is fixed
+there is no numeric ground truth to gate a Zig port against, which makes it the next task rather
+than an optional one.
+
+### 0.65 The CUDA drafter runs in the engine and reproduces the reference (2026-11-16)
+
+`TF_FLASHNEXT_DRAFT_CHECK=1` runs the real CUDA drafter inside the engine over a captured tap
+ring, prefix context and all, and reports the same metric as the torch harness:
+
+| path | mean advance | accepted of 7 | zero-accept |
+| --- | ---: | ---: | ---: |
+| torch reference (`tap_accept.py`, same dump) | 1.342 | 0.342 | 80.0% |
+| **engine (`draftcheck`, same prompt, fp8)** | **1.317** | 0.317 | 81.7% |
+
+Machinery is in `cuda_draft2_check.zig` (the walk, head detile, dumps) + `cuda_draft2_fwd.zig`
+(`Round.ctx/ctx_len`, `ctx_chunk` prefix → k/v → ring). Two bugs were caught on the way, both by
+instrument rather than by reading: `compute-sanitizer` named `tf_fxd2_select` reading a codebook
+511 GB past its allocation (a row offset applied twice — the candidate table is `[rows, topk]` with
+no block base, and the address it hit was a *logit* reinterpreted as a token id), and the head
+normalised block rows 0..6 instead of 1..7, which lags every proposal one slot and reads as chance
+agreement (1.008 → 1.317 once fixed).
+
+Still missing before a serving row exists: `openDrafter` for flashnext and the per-round drafting in
+the batched lane path, so `--drafter` can serve. The check is a diagnostic, not a serving path.
+
+### 0.7 The comparison the DFlash2 path must beat (measured 2026-11-16)
+
+`tools/dflash2/matrix_bench.py`, warm (one unmeasured pass of the same prompts per cell, every
+measured row 100% `cached_tokens`), 3 reps a cell, fp8 KV, 131k window, 4-lane server,
+`--max-tokens 256`, thinking off, request model `qwen3.8-flash-next`:
+
+| fill | 1 agent | 2 agents | 4 agents | 4-agent aggregate |
+| --- | ---: | ---: | ---: | ---: |
+| 0 (76-token prompt) | 107.2 tok/s | 96.0 | 84.6 | 321.5 |
+| 20k (19,995) | 106.9 | 84.6 | 67.0 | 237.6 |
+| 100k (100,178) | 102.5 | 78.8 | 59.6 | 204.6 |
+
+Single-stream decode is flat across fill (107 → 102), so the cost is per-round work at lanes, not
+context length. TTFT 0.06 s at 4 short agents, 0.54 s (max 0.96) at 4×100k. Receipt:
+`tools/dflash2/run/matrix.jsonl` + `matrix-mtp-report.md`.
+
+MTP is also proven unregressed against `3e8531e6a` with the same 3-rep protocol: baseline median
+70.40 tok/s vs 68.87 on the changed tree, ranges overlapping and `token_sha256` identical in all
+six runs — the plan's earlier 78.66 was a single unrepresentative sample.
 
 ## 1. What the drafter is (read from the checkpoint)
 

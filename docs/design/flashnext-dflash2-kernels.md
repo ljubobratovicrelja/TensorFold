@@ -44,8 +44,14 @@ Per layer, in order (mirrors `reference.py`'s `DraftLayer.forward`, which is ver
 2. **input-side conv**: `delta = kernel_projection @ xn` (640×2560 matmul) then `tf_q35d_dyn_conv(xn, delta, base, null, xn_conv, 2560, 16, 0)`.
 3. `q = xn_conv @ q_proj^T` → `[rows, 32, 128]`, `k_n = xn_conv @ k_proj^T` → `[rows, 8, 128]`, `v_n = xn_conv @ v_proj^T`.
 4. `k_ctx = ctx @ k_proj^T`, `v_ctx = ctx @ v_proj^T` (the fused tap rows — **this is the cross-attention context**).
-5. `q_norm`/`k_norm` then RoPE via `tf_q35d_norm_rope` (positions = context length + block row).
-6. `tf_q35d_attn` variant (§2.3) over `[k_ctx, k_n]` and `[v_ctx, v_n]`.
+5. `q_norm`/`k_norm` then RoPE via `tf_q35d_norm_rope` — block rows at `p + r`, and each context row
+   at the **absolute position it was captured at** (`[p - ctx_len + 1, p]`). Not at zero or at
+   `ctx_len + r`: `reference.py` rotates the context keys at their own positions (`ctx_positions`),
+   and rotating them all alike destroys the q/k geometry the taps were trained against.
+6. `tf_q35d_attn` variant (§2.3) over `[k_ctx, k_n]` and `[v_ctx, v_n]`. In the engine the context is
+   the **prefix** — the fused taps of `[p - ctx_len + 1, p]`, i.e. what the target had already
+   computed when it proposed the block — never the block's own eight tap rows, which is the "leaky"
+   variant `tools/dflash2/tap_accept.py` keeps behind `--ctx-mode block`.
 7. `o_proj`, then **output-side conv**: `finish` with the stored delta, `branch = 1`.
 8. residual add; then the MLP with the same shape: `post_attention_layernorm` → conv prepare → `gate`/`up`/`silu` → `down` → conv finish → residual.
 
@@ -72,15 +78,28 @@ Per layer, in order (mirrors `reference.py`'s `DraftLayer.forward`, which is ver
 
 ### 2.5 Candidate selector: `tf_fxd2_select`
 Three steps, and they are cheap — worth knowing before optimising anything else:
-1. `h_proj = hidden @ hidden_projection^T` → `[rows, 256]` (1.3 MB of weights).
+1. `h_proj = hidden @ hidden_projection^T` → `[rows, 256]` (1.3 MB of weights), **one row a step**.
 2. **lattice:** for every position `t` and every (predecessor, successor) pair,
    `score[t, p, c] = unary[t, c] + sum_r ( pred[prev(t,p), r] * h_proj[t, r] * succ[cand[t,c], r] )`.
    With top-k 16 that is 8 × 16 × 16 pairs, each a 256-long dot — a `[16, 256]` gather times a
    `[16, 256]` gather, i.e. 65 k MACs a position.
 3. **greedy path:** a serial walk, `t`-sequential, argmax over the 16 successors given the previous
-   choice. The reference's `greedy_path` is a Python `for` over positions; on device it is 8 sequential
-   argmaxes of 16 values a row — best done by one thread a row (grid `(rows)`, 1 thread), not a warp,
-   because the dependency is strictly serial.
+   choice. The reference's `greedy_path` is a Python `for` over positions and the dependency is strict:
+   step `t` needs the *index* step `t - 1` picked, and its own `h_proj` row.
+
+- **Geometry:** one block for the whole round, 256 threads. Not a block a position: a block a position
+  cannot see the previous block's choice, and it would give every step the wrong `h_proj` row. Serial
+  in `t`, parallel in the projection and in the 16 successors of one step.
+- **Layout:** the head's `cand` and `unary` are `[rows, topk]` for the round, and step `t` reads
+  `cand[t * topk + lane]`, `unary[t * topk + lane]`, `X + t * H`. Nothing adds a block base on top of
+  the step — doing both addresses row `2 * rows - 2` of a `rows`-row table, which is the fp32 `unary`
+  table next to it, and a logit's bit pattern (0.00457 → 999,663,115) as a codebook row is a read
+  ~1e9 × 512 B past the codebook.
+- **Guard:** every codebook index (both `pred[prev]` and `succ[cand]`) is compared against the
+  vocabulary *before* the read. An index at or past it writes `0xFFFFFFFF` into the round's proposals
+  plus one `Fault` record (which codebook, which step, which index), and the host refuses the round
+  with `error.SelectorIndexOutOfVocab` naming all three. It cannot clamp: an out-of-vocabulary index
+  is a layout fault, and the round is all of its positions or none.
 
 - **Difficulty:** low-medium. The codebooks are 255.6 MB but each step touches only 16+16 rows of 256.
 
@@ -101,7 +120,7 @@ Three steps, and they are cheap — worth knowing before optimising anything els
 | --- | ---: | ---: |
 | drafter KV rings (5 layers × 2 × 2064 rows × 1024 × 2 B) | 42.3 MB | 0.16 GiB |
 | tap ring (2064 × 12,800 × 2 B) | 52.8 MB | 0.20 GiB |
-| head top-k / lattice scratch (8 × 16 × 16 × 4 B, plus 8 × 16 × 4) | ~8.5 KB | ~34 KB |
+| head top-k / lattice scratch (8 × 16 × 16 × 4 B, plus 8 × 16 × 4, plus a 16 B fault record) | ~8.5 KB | ~34 KB |
 
 Weights: 1.21 GB bf16, of which 255.6 MB is the selector's codebooks (not quantisable).
 `--drafter-bits 4` takes the backbone to ~238 MB, so ~0.49 GB total.

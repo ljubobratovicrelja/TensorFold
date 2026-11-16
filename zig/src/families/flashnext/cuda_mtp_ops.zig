@@ -88,12 +88,28 @@ pub fn Ops(comptime Tri: type) type {
         tri: Tri,
         h: *Head,
         main: ?Main = null,
+        /// The taps this stream's passes write into its ring (`cuda_batch_state.zig`'s `Hooks`): a
+        /// drafter's five layers and the ring, or zero for none. Only the target's passes take them —
+        /// the head's own pass reads and writes its own caches and taps nothing.
+        tap: batch.Hooks = .{},
 
         const Self = @This();
 
+        /// `hk` with this stream's taps, when it has any: a pass without them writes no ring.
+        fn tapped(o: Self, hk: batch.Hooks) batch.Hooks {
+            if (o.tap.n_taps == 0) return hk;
+            var h = hk;
+            h.taps = o.tap.taps;
+            h.n_taps = o.tap.n_taps;
+            h.tap_ring = o.tap.tap_ring;
+            h.tap_rows = o.tap.tap_rows;
+            h.tap_source = o.tap.tap_source;
+            return h;
+        }
+
         fn forwardMain(o: Self, seq: *prompt.Seq, ids: []const u32, hooks: batch.Hooks) !void {
-            if (o.main) |m| return m.forward(m.ptr, seq, ids, hooks);
-            return o.e.forward(Tri, o.tri, seq, ids, hooks);
+            if (o.main) |m| return m.forward(m.ptr, seq, ids, o.tapped(hooks));
+            return o.e.forward(Tri, o.tri, seq, ids, o.tapped(hooks));
         }
 
         fn stream(o: Self) cuda.Stream {
@@ -289,7 +305,9 @@ pub fn Ops(comptime Tri: type) type {
             d.history = seq.history;
             @memcpy(d.ids[0..n], ids);
             if (keeps) try copyAsync(o.stream(), d.saved.ptr + d.layout.tail_at, seq.tail.ptr, ple_tail_n * wide * 2);
-            try o.e.forward(Tri, o.tri, seq, ids, .{ .logits = .all, .logits_out = d.logits.ptr, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .host_logits = @import("cuda_batch_state.zig").verifyHostLogits() });
+            // a window's rows are the target's own rows: the stream's tap ring takes them here, which is
+            // what a drafter's next round reads (a shared verify writes no ring — one pass, many lanes)
+            try o.e.forward(Tri, o.tri, seq, ids, o.tapped(.{ .logits = .all, .logits_out = d.logits.ptr, .keep = if (keeps) &d.keep else null, .streams = d.streams.ptr, .host_logits = @import("cuda_batch_state.zig").verifyHostLogits() }));
             if (keeps) try copyAsync(o.stream(), d.saved.ptr + d.layout.nrow_at, o.e.batch_s.?.ple_nrow, n * wide * 2);
             d.open = keeps;
         }

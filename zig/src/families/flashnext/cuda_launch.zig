@@ -19,6 +19,11 @@ pub const draft2 = @import("cuda_draft2.zig");
 pub const tap_ring = @import("cuda_tap_ring.zig");
 /// The drafter checkpoint's 81-tensor contract, refused before a token is drafted.
 pub const draft2_weights = @import("cuda_draft2_weights.zig");
+/// The drafter's forward: one draft round over the target's taps (five Qwen3 layers + selector).
+pub const draft2_fwd = @import("cuda_draft2_fwd.zig");
+/// The drafter in the serving path: a tap ring a stream, and one block round a stream (`--drafter`).
+pub const draft2_drafter = @import("cuda_drafter2.zig");
+/// `serve --drafter <dir>`: the family's opener, which `native/cuda_drafted.zig` looks for by this name.
 /// The MoE pass's native routed experts (NVFP4, block FP8), whose FP8 call a device test takes.
 pub const moe_native = @import("cuda_moe_native.zig");
 /// A prompt pass's expert exchange at --tp 2, which the two-rank device test runs against the all-reduce.
@@ -566,4 +571,11 @@ test "a captured entry takes the whole layer's heads only" {
 
 test {
     _ = @import("cuda_score.zig").CapabilityCases(native.Cuda);
+}
+
+// A module reached only through an unreferenced `pub const` never has its test blocks collected, so
+// the DFlash2 drafter's selector-walk equivalence is anchored here rather than being silently skipped.
+test {
+    _ = @import("cuda_draft2_fwd_test.zig");
+    _ = draft2_drafter; // its spans, its refusal list and its advance rule, pinned without a device
 }

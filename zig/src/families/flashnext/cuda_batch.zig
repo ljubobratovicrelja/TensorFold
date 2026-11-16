@@ -113,6 +113,9 @@ pub fn Pass(comptime Tri: type) type {
         pos0: usize = 0,
         /// The MoE write-back the next layer (or the head) applies first, and the layer it came from.
         pending: ?usize = null,
+        /// The tap slot whose ring row this pass still owes: a tapped layer's read-out rows are made
+        /// by the next layer's input mix, so `tapRingWrite` copies them one layer after `tapDump`.
+        tap_slot: ?usize = null,
         /// K slices the last out projection wrote to part (1 when the prompt tile folded them).
         out_slices: usize = out_sk,
         prepared: bool = false,
@@ -197,12 +200,56 @@ pub fn Pass(comptime Tri: type) type {
         /// The write-back is flushed here rather than left for the head because `s.h` holds only the
         /// most recent layer's output — read it after a later layer and the tap silently holds the
         /// wrong layer, which shows up as a weak drafter rather than as an error.
+        ///
+        /// A live ring wants one `hidden`-wide row instead, and its read-out row does not exist yet:
+        /// the mixed/normed row over this layer's output is made by the *next* layer's input mix, so
+        /// the ring's copy is deferred to `tapRingWrite` and this only names the slot.
         pub fn tapDump(self: *Self, layer: usize) !void {
             const slot = parts.tapSlot(self.hooks, layer) orelse return;
-            const dst = self.hooks.taps_out[slot];
-            if (dst == 0) return;
             try self.writeback(0, self.rows);
-            try self.copy(dst, self.s.h, self.rows * wide * 2);
+            const dst = self.hooks.taps_out[slot];
+            if (dst != 0) try self.copy(dst, self.s.h, self.rows * wide * 2);
+            if (self.hooks.tap_ring != 0) self.tap_slot = slot;
+            if (std.c.getenv("TF_FLASHNEXT_TAP_DEBUG") != null) {
+                std.debug.print("tapdump: layer {d} slot {d} rows {d} pos0 {d}\n", .{ layer, slot, self.rows, self.pos0 });
+            }
+        }
+
+        /// The ring's copy of the tapped layer `tap_slot` names: the read-out rows over that layer's
+        /// output, which this pass made for the layer now starting. Called immediately after the
+        /// input-mix read-out of a layer, so `s.mixed`/`s.norm` hold that layer's predecessor.
+        pub fn tapRingWrite(self: *Self, n: usize) !void {
+            const slot = self.tap_slot orelse return;
+            self.tap_slot = null;
+            const ring = self.hooks.tap_ring;
+            const rows = self.hooks.tap_rows;
+            if (ring == 0 or rows == 0) return error.TapRingMissing;
+            // A shared round writes one row a lane at that lane's own position, so its taps cannot go
+            // through this path (the ring is per stream and the rows are not one lane's). One lane is
+            // fine: its rows are its own, at its own position.
+            if (self.lanes.len > 1) return error.TapRingSharedRound;
+            const base = if (self.lanes.len == 1) self.lanes[0].pos else self.pos0;
+            const src = switch (self.hooks.tap_source) {
+                .readout => self.s.mixed,
+                .normed => self.s.norm,
+                // The control needs a four-stream collapse kernel this path does not have yet; refuse
+                // by name rather than silently storing the wrong row.
+                .mean4 => return error.TapSourceMean4NotBuilt,
+            };
+            if (std.c.getenv("TF_FLASHNEXT_TAP_DEBUG") != null) {
+                std.debug.print("tap: layer slot {d} rows {d} pos0 {d} ring_rows {d} mixed {x} norm {x}\n", .{ slot, n, self.pos0, rows, self.s.mixed, self.s.norm });
+            }
+            var at: usize = 0;
+            while (at < n) {
+                const pos = base + at;
+                const first = pos % rows;
+                const run = @min(n - at, rows - first);
+                // A tap's row at tap index `slot` sits `slot * hidden` into its ring slot, so the run
+                // is strided: one contiguous copy lands 5 slots' worth in the first slot and is wrong.
+                // copyCols takes byte addresses but its pitches and width in 16-bit values.
+                try self.copyCols(src + at * dims * 2, dims, ring + (first * self.hooks.n_taps + slot) * dims * 2, self.hooks.n_taps * dims, dims, run);
+                at += run;
+            }
         }
 
         /// readout, keeping what its backward reads (rows r0 = 0 on): the streams, normed rows, v, up rows, gates.
@@ -554,6 +601,9 @@ pub fn Pass(comptime Tri: type) type {
                     try self.writeback(0, n);
                     try self.readoutKeep(lw.attn_hc, 0, n, keep.attn_hc);
                 }
+                // A layer whose output was tapped has its read-out rows only now, made by this layer's
+                // input mix: the ring's copy belongs here, not in `tapDump`.
+                try self.tapRingWrite(n);
                 self.zero_slices = zs.usable(self.s.part_zero, keep.mix_branch, self.m.collective != null, lw.out.native != null);
                 if (lw.linear) {
                     try self.gdnBlock(lw, layer, wt.linearIndex(layer), keep);

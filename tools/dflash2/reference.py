@@ -132,7 +132,7 @@ class DraftLayer:
         self.up = w.get(f"{p}.mlp.up_proj.weight")
         self.down = w.get(f"{p}.mlp.down_proj.weight")
 
-    def forward(self, x, ctx_k, ctx_v, ctx_len, positions, cfg):
+    def forward(self, x, ctx_k, ctx_v, ctx_len, positions, cfg, ctx_positions=None):
         h = x.shape[-1]
         heads, kvh, hd = cfg["heads"], cfg["kv_heads"], cfg["head_dim"]
         eps = cfg["eps"]
@@ -155,7 +155,18 @@ class DraftLayer:
         v = v.transpose(1, 2)
         q = rope(q, positions, cfg["theta"])
         p1 = positions if positions.dim() == 2 else positions[None, :]
-        k = rope(k, torch.cat([p1.new_zeros(1, ctx_len), p1], dim=1), cfg["theta"])
+        # The context keys are rotary'd at their *own* absolute positions, not at
+        # zero: dflash.py's apply_rotary_pos_emb takes the full cos for k -- which
+        # spans the context rows and then the block rows -- and slices the last
+        # q_len rows for q. Zeroing the context half (what this file used to do)
+        # gives every context key the same rotation, which destroys the q/k
+        # relative geometry the taps were trained against.
+        if ctx_positions is None:
+            # context rows end at the block's first position and run backwards
+            off = torch.arange(1 - ctx_len, 1, device=positions.device, dtype=positions.dtype)
+            ctx_positions = positions[..., :1] + off  # [1, ctx_len] or [B, ctx_len]
+        c1 = ctx_positions if ctx_positions.dim() == 2 else ctx_positions[None, :]
+        k = rope(k, torch.cat([c1, p1], dim=1), cfg["theta"])
 
         k = k.repeat_interleave(rep, dim=1)
         v = v.repeat_interleave(rep, dim=1)
@@ -221,18 +232,49 @@ class DFlash2Draft:
         self.lm_head = lm_head  # the target's head, fp32, [vocab, hidden]
         self.embed: Optional[torch.Tensor] = None  # the target's embedding, set by the caller
 
-    def forward(self, taps: torch.Tensor, block_ids: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(self, taps: torch.Tensor, block_ids: torch.Tensor, positions: torch.Tensor,
+                ctx_positions: Optional[torch.Tensor] = None,
+                trace: Optional[dict] = None) -> torch.Tensor:
+        # `trace`, when a dict is passed, is filled with the very tensors this forward computed
+        # (nothing is recomputed and no rounding is added) so tools/dflash2/draft_compare.py can put
+        # a stage of the CUDA round against the same stage here instead of against a mean advance.
         # taps: [B, ctx, 5*hidden] -> [B, ctx, hidden]
         ctx = rms_norm(taps @ self.fc.T, self.hidden_norm, self.cfg["eps"])
+        if trace is not None:
+            trace["ctx"] = ctx
         x = F.embedding(block_ids, self.embed)  # set by caller
-        for layer in self.layers:
-            x = layer.forward(x, ctx, ctx, ctx.shape[1], positions, self.cfg)
-        return rms_norm(x, self.norm, self.cfg["eps"])
+        if trace is not None:
+            trace["embed"] = x
+        for i, layer in enumerate(self.layers):
+            x = layer.forward(x, ctx, ctx, ctx.shape[1], positions, self.cfg, ctx_positions)
+            if trace is not None:
+                trace[f"layer{i}"] = x
+        hidden = rms_norm(x, self.norm, self.cfg["eps"])
+        if trace is not None:
+            # the final hidden state *before* the norm, for a caller that wants to check the norm
+            # itself rather than only what it produced
+            trace["hidden_full"] = x
+            trace["normed"] = hidden
+        return hidden
 
-    def propose(self, hidden: torch.Tensor, anchor_ids: torch.Tensor) -> torch.Tensor:
+    def propose(self, hidden: torch.Tensor, anchor_ids: torch.Tensor,
+                trace: Optional[dict] = None) -> torch.Tensor:
+        # Block row r sits at position p+r and its head reads the token *at* p+r,
+        # so row 0 only re-predicts the anchor (the block's row-0 input). Drop it:
+        # dflash.py's _sample_draft_tokens heads `draft_hidden[:, -block_size+1:]`
+        # and writes the result into block slots 1..7. Returning 8 rows here made
+        # every caller compare row r against the token of row r+1.
+        hidden = hidden[:, -self.cfg["block"] + 1:]
         unary = hidden @ self.lm_head.T
         top, cand = unary.topk(self.selector.top_k, dim=-1)
-        return self.selector.greedy_path(cand, top, hidden, anchor_ids)
+        path = self.selector.greedy_path(cand, top, hidden, anchor_ids)
+        if trace is not None:
+            # the rows the head actually read, its top-k, and the walk's tokens
+            trace["hn"] = hidden
+            trace["head_unary"] = top
+            trace["head_ids"] = cand
+            trace["proposals"] = path
+        return path
 
 
 def load(path: str | Path, lm_head: Optional[torch.Tensor] = None, embed: Optional[torch.Tensor] = None):
