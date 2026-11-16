@@ -35,6 +35,7 @@ pub const Model = struct {
     window_costs_lone: bool = false, // window_costs price a lone stream only; shared forwards use shared_costs
     shared_drafts: u32 = 0, // allocate_shared_drafts: a shared round's most head drafts a stream (0: drafts)
     mtp_step_ms: f64 = 0.0, // one chained head step (timed at load)
+    draft_ms: f64 = 0.0, // a fixed-forward drafter's round cost, paid at any drafted depth (Model.draft_ms)
     shared_step_ms: ?f64 = null, // a separate shared head step; null keeps mtp_step_ms
     draft_step_ms: f64 = 0.0, // a shared round's draft past a stream's first, as the backend's head runs it (0: priced free)
     streams_exact: bool = true, // shared forwards keep each stream's bits
@@ -105,6 +106,7 @@ pub const Config = struct {
     shared_costs: Table,
     lane_costs: Table, // window ms by rows to 64 (lanes/plan_lanes.zig)
     mtp_step_ms: f64,
+    draft_ms: f64 = 0, // Model.draft_ms: a fixed-forward drafter's round cost at any drafted depth
     draft_step_ms: f64 = 0, // Model.draft_step_ms
     shared_drafts: u32 = 0, // Model.shared_drafts
     lone_cost_tile: u32 = 0, // Model.lone_cost_tile
@@ -182,6 +184,7 @@ pub const Config = struct {
             .shared_costs = try alloc.extendCosts(gpa, timed.items, batch_rows),
             .lane_costs = try alloc.extendCosts(gpa, m.lane_costs, 64),
             .mtp_step_ms = m.mtp_step_ms,
+            .draft_ms = m.draft_ms,
             .k = .{
                 .shared_step_ms = m.shared_step_ms,
                 .depth_rate = if (m.depth_rate > 0) m.depth_rate else (Constants{}).depth_rate,

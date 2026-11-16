@@ -11,6 +11,7 @@ pub const Facts = struct {
     limit_shared_drafts: bool = false, // retain the depth rule's head-step price before reserving shared rows
     depth: u32, // drafts a round at most
     step_ms: f64, // one more draft's cost (timed at load); the rule prices a round as forward(rows) + step_ms x drafts
+    draft_ms: f64 = 0, // a fixed-forward drafter's round cost, paid at any depth >= 1 (DFlash2: the whole block runs whatever verifies)
     prior: []const f64 = &.{}, // acceptance by depth until a stream has its own
     plain_guard: bool = true, // plain rounds compete with drafted depths (the rule may choose no drafts)
     batched: bool = false, // hold() runs a shared round's streams as one batch

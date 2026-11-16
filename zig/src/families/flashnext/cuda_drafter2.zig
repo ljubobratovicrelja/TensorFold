@@ -256,9 +256,11 @@ pub const Draft2 = struct {
     states: std.AutoHashMapUnmanaged(*Stream, *State) = .empty,
     /// States between streams: allocated and touched once, so no request pays the driver's stall.
     pool: std.ArrayList(*State) = .empty,
-    /// One more draft's cost in ms (the round's own round, divided over its proposals), which the
-    /// round loop's depth rule prices as `forward(rows) + step_ms x drafts`.
-    step_ms: f64 = 1.0,
+    /// The drafter's own round in ms: the forward computes the whole block whatever a round
+    /// verifies, so the depth rule prices it as a fixed cost at any drafted depth (`Facts.draft_ms`);
+    /// the marginal step (`step_ms`, `forward(rows) + step_ms x drafts`'s) is therefore 0.
+    draft_ms: f64 = 1.0,
+    step_ms: f64 = 0.0,
 
     const Self = @This();
 
@@ -379,6 +381,7 @@ pub const Draft2 = struct {
         return .{
             .depth = @intCast(depth),
             .step_ms = self.step_ms,
+            .draft_ms = self.draft_ms,
             .plain_guard = true,
             .batched = false,
             // saturating rather than erroring: a facts() has no error to give, and an overflow here is
@@ -609,7 +612,12 @@ pub const Draft2 = struct {
             // the first rounds pay the driver's stalls, which no later round does
             if (i >= 2) quickest = @min(quickest, ns / 1e6);
         }
-        if (std.math.isFinite(quickest)) self.step_ms = quickest / @as(f64, @floatFromInt(depth));
+        if (std.math.isFinite(quickest)) {
+            // the fixed forward runs the whole block whatever depth the target verifies: the round's
+            // cost is the round, and a further draft beyond the one at hand costs nothing more
+            self.draft_ms = quickest;
+            self.step_ms = 0.0;
+        }
     }
 };
 

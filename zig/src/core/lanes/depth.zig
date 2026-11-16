@@ -52,6 +52,7 @@ pub const Rule = struct {
     family_costs: *const Table,
     shared_costs: *const Table,
     mtp_step_ms: f64,
+    draft_ms: f64 = 0, // a fixed-forward drafter's round cost, paid at any depth >= 1 (0: marginal heads only)
     draft_step_ms: f64 = 0, // a shared round's draft past a stream's first (budgets price it)
     plain_guard: bool,
     node_probabilities: bool,
@@ -127,7 +128,7 @@ pub const Rule = struct {
         const table = try r.costs(who);
         if (table.get(drafts)) |v| return v;
         const forward = r.family_costs.get(drafts + 1) orelse return null;
-        var modeled = forward + r.mtp_step_ms * @as(f64, @floatFromInt(drafts));
+        var modeled = forward + (if (drafts > 0) r.draft_ms else 0.0) + r.mtp_step_ms * @as(f64, @floatFromInt(drafts));
         if (r.plain_guard) {
             // untimed: its model plus the least time a row of a timed round took beyond its model
             var least: ?f64 = null;
@@ -444,6 +445,22 @@ test "a depth's acceptance estimate moves by the configured weight of the newest
     try rule.observeDepth(who, 2, 1); // the first draft landed, the second did not
     try std.testing.expectApproxEqAbs(@as(f64, 0.54), st.?.p[0], 1e-12);
     try std.testing.expectApproxEqAbs(@as(f64, 0.46), st.?.p[1], 1e-12);
+}
+
+test "a fixed-forward drafter's round is priced at its full cost, not the marginal step" {
+    const gpa = std.testing.allocator;
+    var fc: Table = .{};
+    defer fc.deinit(gpa);
+    for (1..9) |w| try fc.put(gpa, @intCast(w), 45.0); // the batched verify: flat past the anchor
+    const shared: Table = .{};
+    var rule: Rule = .{ .gpa = gpa, .prior = &.{ 0.5, 0.5 }, .most_drafts = 7, .family_costs = &fc, .shared_costs = &shared, .mtp_step_ms = 0.0, .draft_ms = 74.0, .plain_guard = false, .node_probabilities = false, .batch_rows = 8 };
+    defer rule.deinit();
+    // DFlash2's forward computes the whole 7-proposal block whatever the round verifies: 74 ms
+    // fixed at any depth >= 1, so the 74/7 marginal (10.6) must not be spread over shallow depths.
+    for (1..8) |d| {
+        const cost = (try rule.roundCost(@intCast(d), null)).?;
+        try std.testing.expectApproxEqAbs(@as(f64, 45.0 + 74.0), cost, 1e-6);
+    }
 }
 
 test "depth picks the most tokens a ms and probes deeper" {
