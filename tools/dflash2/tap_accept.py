@@ -153,6 +153,8 @@ def main(argv=None) -> int:
     ap.add_argument("--ctx-mode", choices=["prefix", "block"], default="prefix",
                     help="prefix = taps of the known prefix (default); block = taps_for(p..p+7), leaky")
     ap.add_argument("--ctx-rows", type=int, default=0, help="cap the context window (0 = manifest window)")
+    ap.add_argument("--ctx-shift", type=int, default=0,
+                    help="shift the context window by this many positions: 0 keeps [p-ctx+1, p], -1 is the vendor's [p-ctx, p-1], where the anchor's own position is not in the keys")
     ap.add_argument("--start-p", type=int, default=0,
                     help="first anchor position (default 0 = right after the ring's valid start). "
                          "Raise it to score against a real prefix instead of an empty one.")
@@ -202,8 +204,9 @@ def main(argv=None) -> int:
         block_ids[0, 0] = int(ids[p])
         positions = torch.arange(p, p + args.block, dtype=torch.long, device=args.device)
 
-        lo = p if leaky else max(0, p - ctx_rows + 1)
-        hi = p + args.block - 1 if leaky else p
+        hi_end = p + args.ctx_shift
+        lo = p if leaky else max(0, hi_end - ctx_rows + 1)
+        hi = p + args.block - 1 if leaky else hi_end
         taps = block_taps(ring, lo, hi)
         # The context rows are rotary'd at the positions they were captured at, so
         # pass them explicitly: the prefix (and the leaky variant) do not end at p-1.

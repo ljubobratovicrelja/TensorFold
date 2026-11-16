@@ -221,6 +221,9 @@ pub const State = struct {
         s.written = 0;
         s.covered = 0;
         s.st.end = 0;
+        // a pooled state handed to another stream must not answer with the previous request's fused
+        // rows at the same positions: the fusion is cached across a stream's rounds, not across streams
+        s.st.fusedReset();
     }
 
     /// The oldest position the ring still holds: `rows` writes back from its newest, or the stream's
