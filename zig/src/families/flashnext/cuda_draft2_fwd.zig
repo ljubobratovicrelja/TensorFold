@@ -997,7 +997,8 @@ fn headTopk(s: *Draft, x: u64, rows: usize, part: u64, ids: u64, val: u64, lg: u
         @as(c_int, 1),          @as(c_int, @intCast(rows)),          @as(c_int, @intCast(c.vocab)),
         @as(c_int, @intCast(c.hidden)), @as(c_int, 1),
     });
-    const slice_shared: usize = (threads / 32) * c.topk * 8;
+    // one candidate list a thread plus one a warp: `tf_fxd2_topf32` publishes every thread's list
+    const slice_shared: usize = (threads + threads / 32) * c.topk * 8;
     try launch(s, s.fns.topf32, .{ @intCast(tiles), 1, 1 }, threads, @intCast(slice_shared), .{
         lg, part, ci(c.vocab), ci(c.topk), ci(rows), ci(head_tile),
     });

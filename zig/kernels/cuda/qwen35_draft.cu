@@ -543,7 +543,11 @@ extern "C" __global__ void __launch_bounds__(256) tf_fxd2_headmerge(const Fxd2Ca
 extern "C" __global__ void __launch_bounds__(256) tf_fxd2_topf32(const float* __restrict__ X, Fxd2Cand* __restrict__ PARTIAL,
                                                                   int V, int topk, int rows, int tile) {
     extern __shared__ Fxd2Cand fxd2_shm[];
-    Fxd2Cand* all = fxd2_shm;
+    // one list a thread (blockDim.x * topk), then one a warp (warps * topk): the v loop below is
+    // per-THREAD, so publishing only lane 0's list would restrict the tile's candidates to
+    // ids ≡ warp*32 (mod warps*32) — measured as every candidate id a multiple of 32.
+    Fxd2Cand* per = fxd2_shm;
+    Fxd2Cand* all = per + (size_t)blockDim.x * topk;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
     const int first = blockIdx.x * tile, last = min(V, first + tile);
     for (int r = 0; r < rows; r++) {
@@ -554,8 +558,20 @@ extern "C" __global__ void __launch_bounds__(256) tf_fxd2_topf32(const float* __
             mine[i].id = 0;
         }
         for (int v = first + warp * 32 + lane; v < last; v += warps * 32) fxd2_insert(mine, topk, x[v], v);
-        if (lane == 0)
-            for (int i = 0; i < topk; i++) all[warp * topk + i] = mine[i];
+        for (int i = 0; i < topk; i++) per[(size_t)threadIdx.x * topk + i] = mine[i];
+        __syncthreads();
+        if (lane == 0) {
+            Fxd2Cand w[FXD2_TOP];
+            for (int i = 0; i < topk; i++) {
+                w[i].v = -INFINITY;
+                w[i].id = 0;
+            }
+            for (int t = 0; t < 32 * topk; t++) {
+                const Fxd2Cand c = per[(size_t)warp * 32 * topk + t];
+                fxd2_insert(w, topk, c.v, c.id);
+            }
+            for (int i = 0; i < topk; i++) all[warp * topk + i] = w[i];
+        }
         __syncthreads();
         if (threadIdx.x == 0) {
             Fxd2Cand out[FXD2_TOP];
