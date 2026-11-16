@@ -1,10 +1,102 @@
 # Flash Next + DFlash 2 drafter: feasibility and integration plan
 
-Status: **plan, nothing implemented.** Target: `Qwen3.8-Flash-Next-FP4-Local` (family `flashnext`) drafting
-with `incoai/Qwen3.8-Flash-Next-DFlash2` instead of — or beside — its own MTP head.
+Status: **in progress.** Steps 1, 2 (hook only) and 8 landed; step 0 is blocked on an engine-side tap
+dump; steps 3-7 not started. Target: `Qwen3.8-Flash-Next-FP4-Local` (family `flashnext`) drafting with
+`incoai/Qwen3.8-Flash-Next-DFlash2` instead of — or beside — its own MTP head.
+
+**A new agent should read §0 first: it holds the per-step status, the measured MTP baseline that any
+DFlash2 run must beat, the dead ends already ruled out, and the traps.**
 
 Written 2026-11-16 against `running` @ `bb95ab741`. Checkpoint facts below were read from the downloaded
 file, not from the model card; the card's numbers are quoted as the vendor's and labelled as such.
+
+## 0. Where the work stands (read this first)
+
+Branch **`dflash2`**, worktree `~/Projects/tf-wt/dflash2`, pushed to `origin` at `1fffa44b0`.
+`running` is untouched at `bb95ab741` and still serves the box. Nothing here has been merged.
+
+| step | state | what exists |
+| --- | --- | --- |
+| 0 tap-row measurement | **BLOCKED** | harness exists (`tools/dflash2/reference.py`), target forward does not — see below |
+| 1 MTP baseline E2E | **DONE** | measured, see §0.2 |
+| 2 tap capture | **DONE (hook only)** | `Pass.tapDump` + `Hooks.taps/taps_out`; **no caller fills `taps_out` yet** |
+| 3 drafter forward on CUDA | not started | spec in `flashnext-dflash2-kernels.md` |
+| 4 candidate selector on CUDA | not started | same spec, §2.5 |
+| 5 `openDrafter` wiring | not started | `cuda_drafted.wrap` still refuses flashnext |
+| 6 ring persistence (snapshot/disk tier) | not started | risk memo in `flashnext-dflash2-tap-ring.md` |
+| 7 final two-path E2E | not started | harness exists (`tools/dflash2/two_paths.py`) |
+| 8 tensor contract | **DONE** | `cuda_draft2_weights.zig`, 6 tests |
+
+### 0.1 Step 0 is blocked, and here is why (do not re-try the torch route)
+
+The plan's step 0 assumed the target could be run in torch to capture taps. It cannot, on this box:
+
+- `Qwen4ExpForCausalLM` **does** exist in transformers 5.22 (an earlier note claiming otherwise is stale).
+- But a bf16 conversion is **225 GiB of routed experts alone** — 512 experts x 640 x 2560 x 48 layers —
+  against ~108 GB available. Loading the FP4-Local checkpoint OOM-killed at 2% (`RC=137`).
+- The official `Qwen/Qwen3.8-Flash-Next-FP8` is 172.8 GiB and the bf16 original 335.3 GiB; neither fits.
+- The checkpoint needs modelopt dequant that transformers cannot do on load.
+
+**So the tap row must be measured through the engine.** The mechanism is in place for it: `Hooks.taps_out`
+is already copied per tapped layer. What is missing is a caller that allocates those buffers and writes
+them to disk — a `TF_FLASHNEXT_TAP_DUMP=<dir>` env path that sets `hooks.taps`, `hooks.n_taps` and
+`hooks.taps_out` for one prompt pass, then dumps the five `[rows, 4 x 2560]` bf16 tensors. Feed those
+to `tools/dflash2/reference.py` (which runs the real drafter end to end) and compare acceptance length
+for `TapSource.readout` / `.normed` / `.mean4`. That is the whole experiment.
+
+### 0.2 The MTP baseline that DFlash2 must beat (measured, not inherited)
+
+`dflash2` build, 32k window, 2 lanes, 256 greedy tokens, prompt in `tools/dflash2/two_paths.py`:
+
+| path | tok/s | TTFT | `token_sha256` |
+| --- | ---: | ---: | --- |
+| MTP | 78.66 | 0.235 s | `5d72e1f7006dd05be1b68f6bad045dfe8c4984a72fdc4ab9472c19a53ab5d54d` |
+| no drafts | 25.36 | 0.159 s | same |
+| MTP after the tap hook | 80.33 | 0.182 s | same |
+
+Three facts a new agent needs: the two paths already agree byte for byte, 3.1x of decode rate is
+speculation, and the tap hook did not perturb either. **Any DFlash2 run must reproduce that sha and
+beat 78.66 tok/s**, or the integration is wrong somewhere.
+
+### 0.3 What was built, file by file
+
+- `zig/src/families/flashnext/cuda_draft2.zig` (288 lines) — the drafter's config parsing and refusals.
+  Self-contained because families are separate build modules: flashnext imports only
+  `cuda/core/lanes/qwen_vision/living/engine_api`, **not** `qwen3_5`, so its parser could not be shared.
+  Adds two checks qwen3_5 cannot make: the drafter's `hidden` and `vocab` must equal the target's.
+- `zig/src/families/flashnext/cuda_tap_ring.zig` (154) — ring arithmetic (`p % rows`), `Ring.covers` to
+  catch a restore that wrapped early, and `TapSource { readout, normed, mean4 }` with one `default`.
+- `zig/src/families/flashnext/cuda_draft2_weights.zig` (234) — the 81-tensor contract. Exact byte
+  accounting: **1,206,131,200 bytes** of tensors, 8,808 less than the file (header + padding). The real
+  count is **6 + 15 x layers**, not the `4 + 16 x layers + 3` an early prompt guessed.
+- `cuda_batch_state.zig` / `cuda_batch.zig` — `Hooks.taps/n_taps/taps_out`, `tapSlot`, and
+  `Pass.tapDump`, called after `moeAdds` while `s.h` still holds that layer's output. Inert at
+  `n_taps = 0`; pinned by a test that runs at `cuda_batch_state_test` 179/288.
+- `tools/dflash2/reference.py` (274) — torch port that runs the **real checkpoint** end to end
+  (forward + selector), verified: batch-2 is bit-identical to batch-1.
+- `tools/dflash2/two_paths.py` (105) — the equivalence check above.
+- `tools/dflash2/tfsrv.sh` (54) — test server by pidfile. **Never `pkill -f tensorfold-native`**: the
+  pattern matches the caller's own `bash -c` and killed the shell once while writing this.
+
+### 0.4 Traps a new agent will hit
+
+- **Subagents are unusable right now.** Every `delegate_task` in this session died at ~44s with
+  "API call failed after 3 retries: Connection error" — the children inherit the qwen-next provider,
+  which is served by the very service this work touches. Do the work inline.
+- **The service is down by Relja's hand** (he stopped `dgx-flashnext` to free the box). Never start,
+  stop or restart it. Test servers on other ports, by pidfile, are fine and were used throughout.
+- **`zig build test` takes ~4-6 min and `zig build -Dgpu=spark` ~12-15 min.** Run them serially, never
+  two at once. Judge by `RC`, not by `error:` lines: the suite prints hundreds on purpose.
+- **Build before serving.** `zig build -Dgpu=spark -Dnvcc=/usr/local/cuda/bin/nvcc` from the worktree;
+  the binary is `zig-out/native/bin/tensorfold-native`.
+
+### 0.5 The one risk that could sink the payoff
+
+The drafter scores the **full 248,320-token head** every verify round, where the MTP head only scores
+its own draft vocabulary. That is ~2.0 M logits a round against ~0.3 G MACs of backbone — plausibly
+more expensive than the MTP chain it replaces. `core.proposal_vocab` (used by `cuda_mtp_load.zig`)
+already exists to slice a candidate vocab; **measure the head's share before optimising anything else**,
+and be prepared for the honest answer that DFlash2 loses to MTP on this box.
 
 ---
 
@@ -107,7 +199,15 @@ per tapped layer into a per-stream ring.
 
 ## 4. The blockers, in order of how much they hurt
 
-### 4.1 Tap semantics on a 4-stream family — **RESOLVED against the weights, no experiment needed**
+### 4.1 Tap semantics on a 4-stream family — **narrowed against the weights; the choice still needs one measurement**
+
+**What is settled (measured, no experiment):** the target's hyper-connection mix is a *learned*
+`[320, 10240]` projection, not a uniform mean, so the SGLang capture patch's `.mean(dim=-2)` does not
+transfer, and a layer's output is genuinely 4 x 2560 wide. That leaves a small, named set of candidate
+rows rather than an open field — `TapSource { readout, normed, mean4 }` in `cuda_tap_ring.zig`.
+
+**What is not settled:** which of those three the drafter was trained against. That is decided by
+acceptance length, and it is blocked on the engine-side tap dump (§0.1).
 
 `docs/drafter-release.md` §"Not in version 1" says it outright: *"A tap that merges several residual
 streams. `stream` has one value until a family needs another."* DFlash2 for Flash-Next is exactly
@@ -222,23 +322,27 @@ band is a finding, not a confirmation.
 Ordered so every step is falsifiable and cheap before the expensive ones. Nothing here touches the
 serving unit; all work is on a short branch off `running`, in `~/Projects/tf-wt/dflash2`.
 
-**Step 0 — settle the tap row (½–1 day, decides the port).**
+The step numbering below is the plan's own. §0 maps it to what actually landed; the two differ in
+places (the memory fit moved into step 1's measurement, and the original step 0 is blocked), so read
+§0 for status and this section for intent.
+
+**Step 0 — settle the tap row (½–1 day, decides the port).** **BLOCKED — see §0.1.**
 Not "does the port work" — that is known. This is "which of flashnext's rows is the tap": the
-read-out row, the down-projected row, or the normed variant (§4.1). Build a small offline harness
-(not the server): run the target's forward on one fixed prompt capturing all three candidates at
-layers 5/15/25/35/45, feed each through the real checkpoint's drafter via the SpecForge reference
-port (runnable with `transformers`), and compare acceptance length on ~20 prompts. The definition
-that lands in the card's acceptance-length band (2.8–3.3) wins. **If none reaches ~2.5, stop — the
-port is not worth starting.**
+read-out row, the down-projected row, or the normed variant (§4.1). The original route (a torch
+target forward) is impossible on this box, so the experiment now runs through the engine's
+`Hooks.taps_out` and `tools/dflash2/reference.py`. The definition that lands in the card's
+acceptance-length band (2.8–3.3) wins. **If none reaches ~2.5, stop — the port is not worth starting.**
 
 **Step 1 — prove the memory fit (1 h, needs the box).**
 Start the real shape with a stub drafter allocation (weights only, no drafting):
 `--context 262144 --parallel 4 --kv-cache fp8 --vision` + drafter resident. Read the startup
 arithmetic line. Record the exact `Z GiB left`. No drafting yet.
+Measured sizes for this (§4.3): ~0.85 GiB at `--drafter-bits 4`, so the fit is not in doubt — the
+start is still the fact and the arithmetic the claim.
 
-**Step 2 — tap ring in flashnext (the correctness work).**
-`setTaps`-equivalent in `families/flashnext`, tap written from `cuda_batch_hc.zig`'s read-out,
-ring sized into `streamBytes`, carried through `Snap`/keep/snapshot/disk-tier with a kv8 precision
+**Step 2 — tap ring in flashnext (the correctness work).** **HOOK DONE, persistence not.**
+`Pass.tapDump` + `Hooks.taps/taps_out` exist and are inert when unset. Still missing: a caller that
+allocates the ring, and carrying it through `Snap`/keep/snapshot/disk-tier with a kv8 precision
 match. Gate: a recorded tap ring on a fixed prompt is byte-identical across (a) plain run,
 (b) fp8 KV run, (c) snapshot-restore run. This is where the silent-bug risk lives.
 
@@ -247,6 +351,8 @@ Port `fc`+`hidden_norm`, 5 × (Qwen3 layer + 2 grouped convs), `norm`, then head
 qwen3_5 `cuda_draft*.zig` gives the layer shape for free; the new kernels are `grouped_conv`
 (2-tap, group 16) and `candidate_selector` (lattice + greedy path). Gate: greedy acceptance on a
 fixed prompt matches the PyTorch reference from step 0 token-for-token.
+Kernel-by-kernel spec, including what is reusable unchanged from `qwen35_draft.cu`:
+`flashnext-dflash2-kernels.md`.
 
 **Step 4 — wire it up.**
 `F.openDrafter` in `families/flashnext/cuda_native.zig`, `cost_adapter.identify(…, .dflash)`, window
@@ -258,7 +364,7 @@ central claim, and our standard equivalence check).
 `tools/bench_serving.py` for the fixed table plus `bench_concurrent` for lanes 1/2/4. Every cell
 ≥3 reps (floor), sampling at temp 1.0/top-p 0.95/top-k 20, greedy rows labelled greedy. Compare
 against MTP on the *same build* via `--no-drafts` and the MTP path, never against a remembered number.
-Report `not measured` where not run.
+Report `not measured` where not run. The MTP bar to beat is in §0.2.
 
 **Step 6 — decide.**
 Ship as an option (`--drafter`) only if 4-lane aggregate wins ≥5% at equal context. Otherwise keep
