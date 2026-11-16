@@ -296,10 +296,11 @@ extern "C" __global__ void __launch_bounds__(32) tf_fxd2_knorm(const __nv_bfloat
     for (int i = 0; i < 4; i++) out[4 * t + i] = __float2bfloat16_rn(rbf(rbf(v[i] * inv) * bf(W[4 * t + i])));
 }
 
-// DFlash2's block attention: a row sees ring positions [max(begin, p - window + 1), pos0 + ctx) and
-// every block row, with no causal guard (is_causal: false). The `ctx` ring rows at pos0 .. pos0 +
-// ctx are this round's fused-tap keys and values, written by ring_put just before. A warp a
-// (row, head); grid (rows, heads), as the Qwen3.5 drafter's.
+// DFlash2's block attention: with no causal guard (is_causal: false), a block row sees every block
+// row, but the sliding window still trims the OLDEST context columns from the later rows — row `m`
+// starts at `begin + m` (see the body). The `ctx` ring rows at pos0 .. pos0 + ctx are this round's
+// fused-tap keys and values, written by ring_put just before. A warp a (row, head); grid
+// (rows, heads), as the Qwen3.5 drafter's.
 extern "C" __global__ void __launch_bounds__(32) tf_fxd2_attn(const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ KB,
                                                               const __nv_bfloat16* __restrict__ VB, const __nv_bfloat16* __restrict__ RK,
                                                               const __nv_bfloat16* __restrict__ RV, int rows, int heads, int kv_heads, int W,
@@ -318,9 +319,15 @@ extern "C" __global__ void __launch_bounds__(32) tf_fxd2_attn(const __nv_bfloat1
         o[i] = 0.0f;
     }
     float mx = -INFINITY, l = 0.0f;
+    // The reference builds its mask with `_attention_mask(is_causal=false, sliding_window=window)`,
+    // and under that flag the window hides the OLDEST columns from the later block rows: block row
+    // `m` (whose position is `pos0 + m`) cannot see the first `m` context columns, because the
+    // window is anchored on the row's own position and the block extends past it. Measured against
+    // the reference's own mask: row 0 sees all `ctx` columns, row 7 sees `ctx - 7`, missing 0..6.
+    // Scanning from `begin` alone gave every row the full context and was the per-block divergence.
     const long long p = pos0 + m;
-    long long first = p - window + 1;
-    if (first < begin) first = begin;
+    long long first = begin + m;
+    if (first < p - window + 1) first = p - window + 1;
     const long long last = pos0 + ctx;  // this round's context rows are visible to every block row
     for (long long pos = first; pos < last; pos++) {
         const __nv_bfloat16* k = RK + (size_t)(pos % W) * width + kvh * HD + lane * DPL;

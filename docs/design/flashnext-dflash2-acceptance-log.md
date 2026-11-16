@@ -208,6 +208,26 @@ checkable statically, in one grep across the drafter's kernels for accumulate ty
 reapplied each block". The isolation shows it is not reapplied — it is constant per block. The
 conclusion (our drafter and the reference are not computing the same function) stands.
 
+**The fault, found: the block attention never applied the sliding window to its own rows.**
+`tf_fxd2_attn` scanned from `max(begin, p - window + 1)` with `begin = pos0`, so **every** block row
+saw the **whole** context. The reference builds its mask with
+`_attention_mask(is_causal=false, sliding_window=window)`, and under that flag the window hides the
+*oldest* columns from the later block rows: read directly off the reference's own mask, row 0 sees all
+2047 context columns, row `m` sees `2047 - m` and loses columns `0..m-1`. Row 7 was attending seven
+positions it is not allowed to see.
+
+That is a constant-size error at every block (picking up a handful of extra context terms), which is
+exactly what the isolation measured — and it explains why the effect did not grow with depth per
+block, and why `qkv` was healthy (4e-3) while `attn` jumped to 2.8e-2 seven-fold.
+
+Fixed in `qwen35_draft.cu` (`first = max(begin + m, p - window + 1)`), kernel header comment corrected,
+`dense_serving_test.zig`'s source pin regenerated with `sha256sum` and verified by hand
+(`57b6ee2b…`, from `abaaefa3…`). Two hypotheses were killed on the way and should not be reopened:
+accumulation precision (all drafter accumulators are `float`, and recomputing the conv in numpy with
+per-step bf16 rounding versus fp32 accum produced differences that had **cosine -0.0007** with the
+observed gap), and the RMSNorm order (the reference returns to bf16 *before* the weight multiply,
+exactly as `rbf(rbf(v * inv) * w)` does).
+
 **Harness note (fixed).** The first run of this comparison reported cosine ≈ 0 and rel-L2 exactly
 1.000 on *every* stage, which is a dump fault, not a finding: `writeNpy` padded the header so
 `10 + hlen` was a multiple of 64 and then stored `hlen - 10`, so numpy read every array ten bytes
