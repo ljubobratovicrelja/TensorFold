@@ -535,6 +535,42 @@ extern "C" __global__ void __launch_bounds__(256) tf_fxd2_headmerge(const Fxd2Ca
     }
 }
 
+// The head's first pass over logits the tensor-core matmul produced: a row-major fp32 X [rows, V],
+// each row's top `topk` of its tile into PARTIAL at ((blockIdx.x * rows) + row) * topk, which is
+// exactly what `tf_fxd2_headtile` left behind, so `tf_fxd2_headmerge` follows unchanged. Grid
+// (tiles), 256 threads, dynamic shared of (blockDim.x / 32) * topk * 8 bytes. A warp walks its
+// 32-entry stride unrolled, so the tile's floats stream once as coalesced 128-byte reads.
+extern "C" __global__ void __launch_bounds__(256) tf_fxd2_topf32(const float* __restrict__ X, Fxd2Cand* __restrict__ PARTIAL,
+                                                                  int V, int topk, int rows, int tile) {
+    extern __shared__ Fxd2Cand fxd2_shm[];
+    Fxd2Cand* all = fxd2_shm;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, warps = blockDim.x >> 5;
+    const int first = blockIdx.x * tile, last = min(V, first + tile);
+    for (int r = 0; r < rows; r++) {
+        const float* x = X + (size_t)r * V;
+        Fxd2Cand mine[FXD2_TOP];
+        for (int i = 0; i < topk; i++) {
+            mine[i].v = -INFINITY;
+            mine[i].id = 0;
+        }
+        for (int v = first + warp * 32 + lane; v < last; v += warps * 32) fxd2_insert(mine, topk, x[v], v);
+        if (lane == 0)
+            for (int i = 0; i < topk; i++) all[warp * topk + i] = mine[i];
+        __syncthreads();
+        if (threadIdx.x == 0) {
+            Fxd2Cand out[FXD2_TOP];
+            for (int i = 0; i < topk; i++) {
+                out[i].v = -INFINITY;
+                out[i].id = 0;
+            }
+            for (int i = 0; i < warps * topk; i++) fxd2_insert(out, topk, all[i].v, all[i].id);
+            Fxd2Cand* dst = PARTIAL + ((size_t)blockIdx.x * rows + r) * topk;
+            for (int i = 0; i < topk; i++) dst[i] = out[i];
+        }
+        __syncthreads();
+    }
+}
+
 // The candidate selector (reference.py's CandidateSelector): h_proj = x @ WPROJ^T a step, then the
 // lattice score of every (predecessor, successor) pair and the greedy path over it.
 //

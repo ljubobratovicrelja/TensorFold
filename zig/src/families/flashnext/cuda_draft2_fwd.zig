@@ -98,6 +98,11 @@ pub fn headTiles(c: Config) usize {
     return (c.vocab + head_tile - 1) / head_tile;
 }
 
+/// glm_mm16_16's dynamic shared: three stages of 16 rows of x and a 64-column weight tile.
+fn m16Shared() u32 {
+    return 3 * (16 * 128 + 8 * 32 * 8 * 4 + 128);
+}
+
 /// One round's inputs: a block of `block` rows to draft, and the prefix it cross-attends to.
 pub const Round = struct {
     /// `[ctx_len, n_taps * hidden]` bf16 on the device: the fused tap rows of the positions
@@ -213,6 +218,9 @@ pub const Bufs = struct {
     /// table for the round, which the selector reads by (step, lane) and by nothing else.
     cand: u64,
     unary: u64,
+    /// The tensor-core head's fp32 logits, `[block - 1, vocab]`, the slice top-k reads: the matmul's
+    /// whole-vocabulary output lands here before `tf_fxd2_topf32` trims it a row's tile.
+    lg: u64,
     /// The proposals the selector walked, `[block - 1]` u32.
     prop: u64,
     /// The selector's one fault record (`Fault`), cleared before a round and written by the kernel
@@ -356,6 +364,7 @@ const Fns = struct {
     attn: cuda.Function,
     head_tile: cuda.Function,
     head_merge: cuda.Function,
+    topf32: cuda.Function,
     select: cuda.Function,
     silu_mul: cuda.Function,
     dyn_conv: cuda.Function,
@@ -385,6 +394,12 @@ pub const Draft = struct {
     mod: cuda.Module,
     rows: cuda.qwen35_bf16_rows.Kernels,
     fns: Fns,
+    /// The tensor-core head: glm_mm's bf16 kernels over the target's lm_head, tiled once at open
+    /// (`headw`), so a round's head is one matmul into fp32 logits plus the slice top-k.
+    mm: cuda.Module,
+    m16: cuda.Function,
+    tile16: cuda.Function,
+    headw: cuda.DeviceBuffer,
     /// Where the next round's internals are copied, or null (`Debug`). Set by `trace`, off by default,
     /// and read only by the two copy sites a round has.
     dbg: ?Debug = null,
@@ -414,7 +429,7 @@ pub const Draft = struct {
 
         const s = try gpa.create(Self);
         errdefer gpa.destroy(s);
-        s.* = .{ .gpa = gpa, .io = io, .d = d, .stream = stream, .c = c, .w = undefined, .target = target, .mod = undefined, .rows = undefined, .fns = undefined };
+        s.* = .{ .gpa = gpa, .io = io, .d = d, .stream = stream, .c = c, .w = undefined, .target = target, .mod = undefined, .rows = undefined, .fns = undefined, .mm = undefined, .m16 = undefined, .tile16 = undefined, .headw = undefined };
         s.mod = try cuda.Module.load(d, cuda.kernels.qwen35_draft);
         errdefer s.mod.unload();
         s.rows = try cuda.qwen35_bf16_rows.Kernels.load(d);
@@ -428,12 +443,29 @@ pub const Draft = struct {
             .attn = try s.mod.function("tf_fxd2_attn"),
             .head_tile = try s.mod.function("tf_fxd2_headtile"),
             .head_merge = try s.mod.function("tf_fxd2_headmerge"),
+            .topf32 = try s.mod.function("tf_fxd2_topf32"),
             .select = try s.mod.function("tf_fxd2_select"),
             .silu_mul = try s.mod.function("tf_fxd2_silu_mul"),
             .dyn_conv = try s.mod.function("tf_q35d_dyn_conv"),
             .norm_rope = try s.mod.function("tf_q35d_norm_rope"),
             .ring_put = try s.mod.function("tf_q35d_ring_put"),
         };
+        // the tensor-core head: glm_mm's bf16 row kernels and the one-time tiling of lm_head into
+        // their column-tile layout (glm_mm_tile16). The tiled bytes equal the source's — the tiling
+        // is a permutation — so the target's own row-major head stays for the check path.
+        s.mm = try cuda.Module.load(d, cuda.kernels.glm_mm);
+        errdefer s.mm.unload();
+        s.m16 = try s.mm.function("glm_mm16_16");
+        try s.m16.allowDynamicShared(m16Shared());
+        s.tile16 = try s.mm.function("glm_mm_tile16");
+        s.headw = try cuda.DeviceBuffer.alloc(d, s.c.vocab * s.c.hidden * 2);
+        errdefer s.headw.free();
+        var targs: cuda.Args = .{};
+        targs.add(s.target.head);
+        targs.add(s.headw.ptr);
+        targs.add(@as(c_int, @intCast(s.c.vocab)));
+        targs.add(@as(c_int, @intCast(s.c.hidden)));
+        try cuda.launch.launch(s.tile16, .{ .grid = .{ .x = @intCast((s.c.vocab / 8) * (s.c.hidden / 64) * 32 / 256), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s.stream, &targs);
         s.w = try loadWeights(gpa, io, s, dir);
         errdefer s.w.deinit(gpa);
         if (std.c.getenv("TF_DRAFT2_TIME")) |p| {
@@ -445,8 +477,10 @@ pub const Draft = struct {
 
     pub fn deinit(s: *Self) void {
         s.w.deinit(s.gpa);
+        s.headw.free();
         s.rows.unload();
         s.mod.unload();
+        s.mm.unload();
         s.gpa.destroy(s);
     }
 
@@ -581,7 +615,7 @@ pub const Draft = struct {
             rt = tL;
         }
         try rmsnorm(s, b.h + c.hidden * 2, s.w.norm, b.hn, rows);
-        try headTopk(s, b.hn, rows, b.part, b.cand, b.unary);
+        try headTopk(s, b.hn, rows, b.part, b.cand, b.unary, b.lg);
         if (s.timing) {
             try s.stream.synchronize();
             tH = nowNs(s.io);
@@ -932,7 +966,7 @@ fn embed(s: *Draft, ids: u64, out: u64) !void {
 /// fp32 logits, the top `topk` a row descending, ids and values as `[rows, topk]` tables the
 /// selector walks by step. A logit that ties across a tile boundary orders by which list the merge
 /// read first, which is the same caveat `fxd2_insert` already carries for threads.
-fn headTopk(s: *Draft, x: u64, rows: usize, part: u64, ids: u64, val: u64) !void {
+fn headTopk(s: *Draft, x: u64, rows: usize, part: u64, ids: u64, val: u64, lg: u64) !void {
     const c = s.c;
     // `cand` and `unary` are booked for the block's first `block - 1` rows and no more: a row past
     // that writes past the scratch, and a caller that scored eight rows would be as wrong as one
@@ -940,15 +974,19 @@ fn headTopk(s: *Draft, x: u64, rows: usize, part: u64, ids: u64, val: u64) !void
     if (rows == 0 or rows > c.block - 1) return error.BadProposalCount;
     const tiles = headTiles(c);
     const threads: u32 = 256;
-    const lists: usize = threads / 32; // the tile pass keeps one list a warp
-    // a tile CTA keeps one list a warp, the merge CTA one list a thread: the merge's shared is the
-    // wider of the two, and both fit the 48 KiB a dynamic launch may ask for without opting in
-    const tile_shared = c.hidden * 2 + lists * c.topk * 8;
-    const merge_shared = @as(usize, threads) * c.topk * 8;
-    if (tile_shared > 48 * 1024 or merge_shared > 48 * 1024) return error.HeadTopkSharedTooLarge;
-    try launch(s, s.fns.head_tile, .{ @intCast(tiles), 1, 1 }, threads, @intCast(tile_shared), .{
-        x, s.target.head, part, ci(c.hidden), ci(c.vocab), ci(c.topk), ci(rows), ci(head_tile),
+    // the dot on glm_mm's tensor cores: [rows, H] x [V, H]^T into fp32 logits — one BM=16 block
+    // (rows <= 7 fit it) streaming the tiled head once — then the slice top-k over those logits
+    // and the merge, which is exactly the two thirds the old fused tile pass split into
+    try launch(s, s.m16, .{ @intCast((c.vocab + 63) / 64), 1, 1 }, 128, m16Shared(), .{
+        x,                      @as(c_longlong, @intCast(c.hidden)), s.headw.ptr, @as(u64, 0), lg, @as(u64, 0),
+        @as(c_int, 1),          @as(c_int, @intCast(rows)),          @as(c_int, @intCast(c.vocab)),
+        @as(c_int, @intCast(c.hidden)), @as(c_int, 1),
     });
+    const slice_shared: usize = (threads / 32) * c.topk * 8;
+    try launch(s, s.fns.topf32, .{ @intCast(tiles), 1, 1 }, threads, @intCast(slice_shared), .{
+        lg, part, ci(c.vocab), ci(c.topk), ci(rows), ci(head_tile),
+    });
+    const merge_shared = @as(usize, threads) * c.topk * 8;
     try launch(s, s.fns.head_merge, .{ @intCast(rows), 1, 1 }, threads, @intCast(merge_shared), .{
         part, ids, val, ci(tiles), ci(rows), ci(c.topk),
     });
@@ -1076,6 +1114,9 @@ pub fn place(c: Config, base: u64, out: ?*Bufs) !usize {
         // the head's first pass: one `topk` list a tile a row, `{f32 logit, u32 id}` together, in
         // `tf_fxd2_headtile`'s tile-major order
         .{ "part", try bytes(.{ headTiles(c), R, c.topk, 8 }) },
+        // the tensor-core head's logits, `[R, vocab]` fp32, read by the slice top-k; the tiled path
+        // splits the dot and the slice into two kernels, so the whole-vocabulary output needs a home
+        .{ "lg", try bytes(.{ R, c.vocab, 4 }) },
     };
     var total: usize = 0;
     inline for (sizes) |s| {
@@ -1136,7 +1177,7 @@ test "a round's scratch is one block plus one context chunk, 256-byte aligned, a
     const c = try draft2.parse(std.testing.allocator, served_json, testTarget());
     const total = try scratchBytes(c);
     try std.testing.expectEqual(total, try place(c, 0, null));
-    try std.testing.expect(total < 4 << 20);
+    try std.testing.expect(total < 16 << 20);
     var b: Bufs = undefined;
     _ = try place(c, 4096, &b);
     // every row starts on a 256-byte boundary inside the buffer
@@ -1160,7 +1201,7 @@ test "a round's scratch is one block plus one context chunk, 256-byte aligned, a
     // at the served shape, 213 KiB — and the second pass reads exactly that and nothing else. It is
     // the round's only table sized by the tile count, so its bytes move with `head_tile` alone.
     try std.testing.expectEqual(@as(u64, 256), b.part - b.err);
-    try std.testing.expectEqual(headTiles(c) * (c.block - 1) * c.topk * 8, total - @as(usize, @intCast(b.part - 4096)));
+    try std.testing.expectEqual(headTiles(c) * (c.block - 1) * c.topk * 8 + (c.block - 1) * c.vocab * 4, total - @as(usize, @intCast(b.part - 4096)));
     try std.testing.expectEqual(@as(usize, 243), headTiles(c));
     // the head's shared plane is inside the default 48 KiB a dynamic launch may ask for
     try std.testing.expect(c.hidden * 2 + 256 * c.topk * 8 <= 48 * 1024);
