@@ -20,8 +20,9 @@
 //!    RoPE, block attention (bidirectional over the block, plus the whole prefix), output conv,
 //!    then the MLP with its own conv. Both convs are `tf_q35d_dyn_conv` unchanged; the attention is
 //!    `tf_fxd2_attn`, which is the Qwen3.5 drafter's loop with DFlash2's visibility.
-//! 3. **head**: the target's `lm_head` over the whole 248,320-token vocabulary, top-16 a row
-//!    (`tf_fxd2_head_topk`); no softcap and no output multiplier, as the reference's
+//! 3. **head**: the target's `lm_head` over the whole 248,320-token vocabulary, top-16 a row, in
+//!    two passes (`tf_fxd2_headtile` scores 1,024 entries of one row a CTA, `tf_fxd2_headmerge`
+//!    merges the tiles' lists a row); no softcap and no output multiplier, as the reference's
 //!    `transform_unary_logits` is an identity here.
 //! 4. **select**: `hidden_projection`, the predecessor/successor lattice, and the serial greedy walk
 //!    of `reference.py`'s `greedy_path` (`tf_fxd2_select`). The head's two tables are the round's,
@@ -80,6 +81,22 @@ pub fn tapsFrom(src: tap_ring.Source) ?u64 {
 /// one chunk's scratch rather than one window's. Every step of it is per row, so a chunk boundary
 /// changes no byte.
 pub const ctx_chunk = 64;
+
+/// The vocabulary head's tile: the entries of the target's vocabulary one CTA scores in the head's
+/// first pass.
+///
+/// The head is the round's one bandwidth-bound stage — 248,320 rows of 2,560 bf16 is 1.27 GB read a
+/// round — and one CTA a row is seven CTAs for the whole card, so the stage ran at whatever seven of
+/// twenty SMs can keep in flight (93 ms, against 5-15 ms of the bytes at a full grid). Tiling the
+/// vocabulary turns the scan into `tiles * rows` CTAs (1,701 at the served shape, 5 MiB of `lm_head`
+/// each) and costs one partial top-k a tile that the second pass merges.
+pub const head_tile = 1024;
+
+/// The head's first pass's CTAs a row: the tiles that cover the vocabulary, the last one fewer
+/// entries.
+pub fn headTiles(c: Config) usize {
+    return (c.vocab + head_tile - 1) / head_tile;
+}
 
 /// One round's inputs: a block of `block` rows to draft, and the prefix it cross-attends to.
 pub const Round = struct {
@@ -192,6 +209,11 @@ pub const Bufs = struct {
     /// The selector's one fault record (`Fault`), cleared before a round and written by the kernel
     /// only if a codebook index is at or past the vocabulary.
     err: u64,
+    /// The head's first pass's candidates, `[tiles, block - 1, topk]` of `Fxd2Cand` (`{f32 logit,
+    /// u32 id}`): tile `t` of row `r` at `(t * rows + r) * topk`, so a tile CTA writes one
+    /// contiguous list and the merge pass reads its row strided. Written whole before the second
+    /// pass reads a slot, so it needs no clearing between rounds.
+    part: u64,
 };
 
 /// The proposal `tf_fxd2_select` writes instead of a token when it refuses a codebook index: no
@@ -297,7 +319,7 @@ pub const Target = struct {
     /// The embedding table, `[vocab, hidden]` bf16, row-major: a round's `block` rows start from it.
     embed: u64,
     /// The LM head, `[vocab, hidden]` bf16, row-major: the drafter's head IS this one, and
-    /// `tf_fxd2_head_topk` reads it a row at a time. Note that the engine's resident head is the same
+    /// `tf_fxd2_headtile` reads it a row at a time. Note that the engine's resident head is the same
     /// tensor repacked into matrix-core tiles (`cuda/qmmf.zig`), which none of this module's kernels
     /// can address: a serving caller has to hand over rows, not tiles (see `cuda_draft2_check.zig`).
     head: u64,
@@ -316,12 +338,15 @@ fn nowNs(io: std.Io) u64 {
 /// position 0 — is deliberately not among them: a round's prefix keys are rotated at the positions
 /// they were captured at, so `tf_q35d_norm_rope` is the entry it resolves. The kernel stays in the
 /// image because `kernels/cuda/qwen35_draft.cu`'s bytes are pinned by `dense_serving_test.zig`,
-/// which is a reviewed-bytes gate rather than this module's to move.
+/// which is a reviewed-bytes gate rather than this module's to move. `tf_fxd2_head_topk` is in the
+/// image and not resolved for the same reason: the round runs the head as the two passes below, and
+/// the single-pass entry stays as the statement of the answer those passes reproduce.
 const Fns = struct {
     fuse: cuda.Function,
     rmsnorm: cuda.Function,
     attn: cuda.Function,
-    head_topk: cuda.Function,
+    head_tile: cuda.Function,
+    head_merge: cuda.Function,
     select: cuda.Function,
     silu_mul: cuda.Function,
     dyn_conv: cuda.Function,
@@ -392,7 +417,8 @@ pub const Draft = struct {
             .fuse = try s.mod.function("tf_fxd2_fuse"),
             .rmsnorm = try s.mod.function("tf_fxd2_rmsnorm"),
             .attn = try s.mod.function("tf_fxd2_attn"),
-            .head_topk = try s.mod.function("tf_fxd2_head_topk"),
+            .head_tile = try s.mod.function("tf_fxd2_headtile"),
+            .head_merge = try s.mod.function("tf_fxd2_headmerge"),
             .select = try s.mod.function("tf_fxd2_select"),
             .silu_mul = try s.mod.function("tf_fxd2_silu_mul"),
             .dyn_conv = try s.mod.function("tf_q35d_dyn_conv"),
@@ -546,7 +572,7 @@ pub const Draft = struct {
             rt = tL;
         }
         try rmsnorm(s, b.h + c.hidden * 2, s.w.norm, b.hn, rows);
-        try headTopk(s, b.hn, rows, b.cand, b.unary);
+        try headTopk(s, b.hn, rows, b.part, b.cand, b.unary);
         if (s.timing) {
             try s.stream.synchronize();
             tH = nowNs(s.io);
@@ -665,7 +691,7 @@ pub const Draft = struct {
         const c = s.c;
         const H = c.hidden;
         const kvw = c.kvWidth();
-        const lo: u64 = r.position + 1 - r.ctx_len;
+        const lo: u64 = r.position - r.ctx_len;
         var done: usize = 0;
         var t = nowNs(s.io);
         while (done < r.ctx_len) {
@@ -712,8 +738,8 @@ pub const Draft = struct {
         const c = s.c;
         const H = c.hidden;
         const k = c.n_taps * H;
-        const lo: u64 = r.position + 1 - r.ctx_len;
-        const hi: u64 = r.position + 1;
+        const lo: u64 = r.position - r.ctx_len;
+        const hi: u64 = r.position;
         var p: u64 = fuseFrom(lo, hi, st.fused_lo, st.fused_end);
         var t = nowNs(s.io);
         while (p < hi) {
@@ -858,17 +884,40 @@ fn embed(s: *Draft, ids: u64, out: u64) !void {
     return s.rows.embedRows(s.stream, ids, s.target.embed, out, s.c.block, s.c.hidden, 0);
 }
 
-/// tf_fxd2_head_topk(X, HEAD, IDS, VAL, H, V, topk): grid (rows), 256 threads,
-/// `H * 2 + 256 * topk * 8` shared.
-fn headTopk(s: *Draft, x: u64, rows: usize, ids: u64, val: u64) !void {
+/// The head, two passes: `tf_fxd2_headtile(X, HEAD, PARTIAL, H, V, topk, rows, tile)` on grid
+/// (tiles, rows), then `tf_fxd2_headmerge(PARTIAL, IDS, VAL, tiles, rows, topk)` on grid (rows);
+/// 256 threads each, `part` between them a `[tiles, rows, topk]` table of candidates.
+///
+/// The split is occupancy, not arithmetic: the scan reads 1.27 GB of `lm_head` a round, and one CTA
+/// a row is seven CTAs of the card's twenty SMs, which measured 93 ms against a 5-15 ms band. The
+/// tiles are `head_tile` entries each, so `tiles * rows` CTAs stream the same bytes at a grid the
+/// card can fill; a CTA's list covers a 1,024-entry slice, which is enough headroom over `topk` that
+/// the merge pass sees every entry that could be in the row's top-k.
+///
+/// What the passes must reproduce is the single-pass form's answer (`tf_fxd2_head_topk`): the head's
+/// fp32 logits, the top `topk` a row descending, ids and values as `[rows, topk]` tables the
+/// selector walks by step. A logit that ties across a tile boundary orders by which list the merge
+/// read first, which is the same caveat `fxd2_insert` already carries for threads.
+fn headTopk(s: *Draft, x: u64, rows: usize, part: u64, ids: u64, val: u64) !void {
     const c = s.c;
     // `cand` and `unary` are booked for the block's first `block - 1` rows and no more: a row past
     // that writes past the scratch, and a caller that scored eight rows would be as wrong as one
-    // that scored none.
+    // that scored none. `part` is booked for `rows` the same way.
     if (rows == 0 or rows > c.block - 1) return error.BadProposalCount;
-    const shared = c.hidden * 2 + 256 * c.topk * 8;
-    if (shared > 48 * 1024) return error.HeadTopkSharedTooLarge;
-    try launch(s, s.fns.head_topk, .{ @intCast(rows), 1, 1 }, 256, @intCast(shared), .{ x, s.target.head, ids, val, ci(c.hidden), ci(c.vocab), ci(c.topk) });
+    const tiles = headTiles(c);
+    const threads: u32 = 256;
+    const lists: usize = threads / 32; // the tile pass keeps one list a warp
+    // a tile CTA keeps one list a warp, the merge CTA one list a thread: the merge's shared is the
+    // wider of the two, and both fit the 48 KiB a dynamic launch may ask for without opting in
+    const tile_shared = c.hidden * 2 + lists * c.topk * 8;
+    const merge_shared = @as(usize, threads) * c.topk * 8;
+    if (tile_shared > 48 * 1024 or merge_shared > 48 * 1024) return error.HeadTopkSharedTooLarge;
+    try launch(s, s.fns.head_tile, .{ @intCast(tiles), @intCast(rows), 1 }, threads, @intCast(tile_shared), .{
+        x, s.target.head, part, ci(c.hidden), ci(c.vocab), ci(c.topk), ci(rows), ci(head_tile),
+    });
+    try launch(s, s.fns.head_merge, .{ @intCast(rows), 1, 1 }, threads, @intCast(merge_shared), .{
+        part, ids, val, ci(tiles), ci(rows), ci(c.topk),
+    });
 }
 
 /// tf_fxd2_select(X, WPROJ, PRED, SUCC, CAND, UNARY, OUT, ERR, H, rank, topk, rows, vocab, anchor):
@@ -990,6 +1039,9 @@ pub fn place(c: Config, base: u64, out: ?*Bufs) !usize {
         .{ "prop", try bytes(.{ R, 4 }) },
         // `Fault`: flag, kind, position, index
         .{ "err", try bytes(.{ 4, 4 }) },
+        // the head's first pass: one `topk` list a tile a row, `{f32 logit, u32 id}` together, in
+        // `tf_fxd2_headtile`'s tile-major order
+        .{ "part", try bytes(.{ headTiles(c), R, c.topk, 8 }) },
     };
     var total: usize = 0;
     inline for (sizes) |s| {
@@ -1070,6 +1122,12 @@ test "a round's scratch is one block plus one context chunk, 256-byte aligned, a
     try std.testing.expectEqual(@as(u64, 512), b.unary - b.cand);
     try std.testing.expectEqual(@as(u64, 512), b.prop - b.unary);
     try std.testing.expectEqual(@as(u64, 256), b.err - b.prop);
+    // The head's first pass leaves `[tiles, rows, topk]` candidates behind — 243 tiles of 16 a row
+    // at the served shape, 213 KiB — and the second pass reads exactly that and nothing else. It is
+    // the round's only table sized by the tile count, so its bytes move with `head_tile` alone.
+    try std.testing.expectEqual(@as(u64, 256), b.part - b.err);
+    try std.testing.expectEqual(headTiles(c) * (c.block - 1) * c.topk * 8, total - @as(usize, @intCast(b.part - 4096)));
+    try std.testing.expectEqual(@as(usize, 243), headTiles(c));
     // the head's shared plane is inside the default 48 KiB a dynamic launch may ask for
     try std.testing.expect(c.hidden * 2 + 256 * c.topk * 8 <= 48 * 1024);
     // the ring is what a stream costs besides: the window, a block, a tile of slack

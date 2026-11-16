@@ -354,11 +354,16 @@ extern "C" __global__ void __launch_bounds__(32) tf_fxd2_attn(const __nv_bfloat1
     for (int i = 0; i < DPL; i++) OUT[((size_t)m * heads + h) * HD + lane * DPL + i] = __float2bfloat16_rn(o[i] / l);
 }
 
-// The head over the target's whole vocabulary: logits = x @ HEAD^T in fp32, then the top `topk` of
-// each row, descending, as token ids and values. No softcap and no output multiplier: the
+// The head over the target's whole vocabulary in one pass: logits = x @ HEAD^T in fp32, then the top
+// `topk` of each row, descending, as token ids and values. No softcap and no output multiplier: the
 // reference's transform_unary_logits is an identity here. Grid (rows), 256 threads, dynamic shared
 // of H * 2 + 256 * topk * 8 bytes. H % 8 == 0. Each thread keeps the best `topk` of its own stride
 // of the vocabulary in registers, the block merges 256 lists in shared.
+//
+// Kept as the reference shape of the head's answer rather than launched: `rows` CTAs cannot stream a
+// 1.27 GB head — that is seven CTAs on a twenty-SM card, and it measured 93 ms against a 5-15 ms
+// band — so a round runs `tf_fxd2_headtile` and `tf_fxd2_headmerge` below, which produce the same
+// tables from the same arithmetic.
 extern "C" __global__ void __launch_bounds__(256) tf_fxd2_head_topk(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ HEAD,
                                                                     unsigned* __restrict__ IDS, float* __restrict__ VAL,
                                                                     int H, int V, int topk) {
@@ -406,6 +411,114 @@ extern "C" __global__ void __launch_bounds__(256) tf_fxd2_head_topk(const __nv_b
             out[i].id = 0;
         }
         for (int i = 0; i < (blockDim.x >> 5) * topk; i++) fxd2_insert(out, topk, all[i].v, all[i].id);
+        for (int i = 0; i < topk; i++) {
+            VAL[(size_t)blockIdx.x * topk + i] = out[i].v;
+            IDS[(size_t)blockIdx.x * topk + i] = (unsigned)out[i].id;
+        }
+    }
+}
+
+// The same head over the same vocabulary, split by vocabulary instead of by row, because occupancy
+// and not access pattern is what bounds the single-pass form: seven CTAs of 256 threads leave the
+// card's other SMs idle whatever the read pattern, and a warp-coalesced scan of the 1.27 GB head
+// through seven CTAs still measured 93 ms. A tile CTA scores one slice of the vocabulary and leaves
+// its own top-k of that slice; the second pass merges the tiles' lists a row.
+//
+// The tile lists are tile-major, `((tile * rows) + row) * topk`: the first pass is the one that pays
+// for the layout, so its write is one contiguous list a CTA, and the merge pass reads its row strided
+// — a few thousand cached reads against the scan's 1.27 GB of weights.
+
+// The head's first pass: logits = X[blockIdx.y] @ HEAD^T in fp32 over vocabulary entries
+// [tile * blockIdx.x, min(V, +tile)), then the top `topk` of that slice, descending, into PARTIAL at
+// ((blockIdx.x * rows) + blockIdx.y) * topk as the candidates `tf_fxd2_headmerge` reads. Grid
+// (tiles, rows), 256 threads, dynamic shared of H * 2 + (blockDim.x / 32) * topk * 8 bytes.
+// H % 8 == 0 and topk <= FXD2_TOP.
+extern "C" __global__ void __launch_bounds__(256) tf_fxd2_headtile(const __nv_bfloat16* __restrict__ X, const __nv_bfloat16* __restrict__ HEAD,
+                                                                  Fxd2Cand* __restrict__ PARTIAL,
+                                                                  int H, int V, int topk, int rows, int tile) {
+    extern __shared__ __nv_bfloat16 fxd2_sh[];
+    __nv_bfloat16* xs = fxd2_sh;
+    Fxd2Cand* all = reinterpret_cast<Fxd2Cand*>(fxd2_sh + H);
+    const __nv_bfloat16* x = X + (size_t)blockIdx.y * H;
+    for (int i = threadIdx.x; i < H; i += blockDim.x) xs[i] = x[i];
+    __syncthreads();
+    Fxd2Cand mine[FXD2_TOP];
+    for (int i = 0; i < topk; i++) {
+        mine[i].v = -INFINITY;
+        mine[i].id = 0;
+    }
+    const uint4* xv = reinterpret_cast<const uint4*>(xs);
+    const int words = H / 8;
+    // A warp owns one entry at a time and its lanes split that entry's words, so the tile streams as
+    // coalesced 512-byte reads; a thread an entry would read the same bytes as 32-byte sectors, five
+    // KiB apart.
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    const int first = blockIdx.x * tile;
+    const int last = min(V, first + tile);
+    for (int v = first + warp; v < last; v += warps) {
+        const uint4* w = reinterpret_cast<const uint4*>(HEAD + (size_t)v * H);
+        float s = 0.0f;
+        for (int c = lane; c < words; c += 32) {
+            const uint4 a = xv[c], b = w[c];
+            const __nv_bfloat16* ab = reinterpret_cast<const __nv_bfloat16*>(&a);
+            const __nv_bfloat16* bb = reinterpret_cast<const __nv_bfloat16*>(&b);
+#pragma unroll
+            for (int e = 0; e < 8; e++) s = fmaf(bf(ab[e]), bf(bb[e]), s);
+        }
+#pragma unroll
+        for (int off = 16; off > 0; off >>= 1) s += __shfl_down_sync(0xffffffffu, s, off);
+        if (lane == 0) fxd2_insert(mine, topk, s, v);
+    }
+    // the tile's candidates are split by warp, so the merge reads every warp's list, not one thread's
+    if (lane == 0)
+        for (int i = 0; i < topk; i++) all[warp * topk + i] = mine[i];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        Fxd2Cand out[FXD2_TOP];
+        for (int i = 0; i < topk; i++) {
+            out[i].v = -INFINITY;
+            out[i].id = 0;
+        }
+        for (int i = 0; i < warps * topk; i++) fxd2_insert(out, topk, all[i].v, all[i].id);
+        Fxd2Cand* dst = PARTIAL + ((size_t)blockIdx.x * rows + blockIdx.y) * topk;
+        for (int i = 0; i < topk; i++) dst[i] = out[i];
+    }
+}
+
+// The head's second pass: the top `topk` of block row blockIdx.x's union of its tiles' lists, into
+// IDS and VAL descending, the tables `tf_fxd2_head_topk` wrote when it scanned the whole vocabulary
+// itself. Grid (rows), 256 threads, dynamic shared of blockDim.x * topk * 8 bytes. `tiles * topk` is
+// a few thousand candidates, so a thread keeps the best `topk` of its stride and the block merges its
+// lists in shared rather than one thread walking the union.
+extern "C" __global__ void __launch_bounds__(256) tf_fxd2_headmerge(const Fxd2Cand* __restrict__ PARTIAL,
+                                                                   unsigned* __restrict__ IDS, float* __restrict__ VAL,
+                                                                   int tiles, int rows, int topk) {
+    // the whole dynamic span is this pass's candidate lists, so it is typed as one
+    extern __shared__ Fxd2Cand fxd2_shm[];
+    Fxd2Cand* all = fxd2_shm;
+    Fxd2Cand mine[FXD2_TOP];
+    for (int i = 0; i < topk; i++) {
+        mine[i].v = -INFINITY;
+        mine[i].id = 0;
+    }
+    // the lists are tile-major, so slot j of the union is tile j / topk's slot j % topk of this row
+    const int n = tiles * topk;
+    for (int j = threadIdx.x; j < n; j += blockDim.x) {
+        const int t = j / topk;
+        const Fxd2Cand c = PARTIAL[((size_t)t * rows + blockIdx.x) * topk + (j - t * topk)];
+        fxd2_insert(mine, topk, c.v, c.id);
+    }
+    for (int i = 0; i < topk; i++) all[threadIdx.x * topk + i] = mine[i];
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        Fxd2Cand out[FXD2_TOP];
+        for (int i = 0; i < topk; i++) {
+            out[i].v = -INFINITY;
+            out[i].id = 0;
+        }
+        for (int i = 0; i < blockDim.x * topk; i++) fxd2_insert(out, topk, all[i].v, all[i].id);
         for (int i = 0; i < topk; i++) {
             VAL[(size_t)blockIdx.x * topk + i] = out[i].v;
             IDS[(size_t)blockIdx.x * topk + i] = (unsigned)out[i].id;
