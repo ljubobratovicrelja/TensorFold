@@ -33,6 +33,18 @@ Commits on this branch that matter:
   step was done that was not)
 - `6b82f7094` — the drafter serves, lossless, and is 5× slow
 - `d9a46d23b` — the prefix ends before the anchor; the round's cost attributed
+- `337a308c2` — the test build compiles again (detile dims as `usize`, the verify fixture
+  gets `opsTapped`/`drafter`)
+- `419442c0b` — span/refusal tests pin the prefix-before-anchor semantics
+- `cb4c9ccb3` — the depth rule prices a fixed-forward drafter at its full round cost
+  (`Facts.draft_ms`), not the per-draft marginal
+- `11c05be97` — the head runs on `glm_mm` tensor cores (lm_head tiled once at open)
+- `ac60d534e` — the block's seven projections run in one batched launch
+  (`tf_q35_dense_bf16_batch`, bit-identical sums)
+- `d9bd10563` — the CUDA test runner builds again (three MTP call sites pass the `kv8`
+  flag they predate)
+
+All of §13's commits are pushed to `origin/dflash2` (`3e8531e6a..d9bd10563`).
 
 ---
 
@@ -297,5 +309,80 @@ per round + an fp32 slice-topk pass reusing `tf_fxd2_headmerge` — head 39.8 ->
 drafting ~17-19 t/s. (2) the block's projections batched, killing the per-element `tf_q35_dense_bf16`
 streams (the ~24 ms inside `layers`), for parity with the no-draft path. Then acceptance work on
 top.
+
+## 13. 2026-11-16 (afternoon) — depth pricing, tensor-core head, batched projections: landed
+
+Visible work after §12 (all on `dflash2`, pushed to `origin/dflash2`; TDD throughout —
+red test first, narrow filters, full-suite only ever as the last gate):
+
+- **Depth-pricing fix (`cb4c9ccb3`).** `Rule.roundCost(d)` was `forward + mtp_step_ms × d`
+  with `step_ms = 74/7 ≈ 10.6` — the measured fixed forward divided over 7 proposals, so a
+  depth-1 round was priced ~55 ms while really costing ~119 (full forward + verify) and the
+  rule settled on 2-row windows. New `draft_ms` term through `Facts → Model → Config → Rule`:
+  a fixed-forward drafter pays its full round cost at any drafted depth (`step_ms = 0` — the
+  block runs entirely whatever verifies). Red test recorded in `depth.zig` first
+  ("a fixed-forward drafter's round is priced at its full cost, not the marginal step"),
+  55.6 ≠ 119 observed, fixed, green with the whole 164-test depth suite.
+
+- **Tensor-core head (`11c05be97`).** The tiled-head plan above, executed: `lm_head`
+  [248320, 2560] bf16 tiled once at drafter open (`glm_mm_tile16`, ~1 s, +1.27 GB RAM, the
+  tiling is a permutation so bytes are unchanged), a round's head = one `glm_mm16_16` matmul
+  (7 rows fit one BM=16 block) into a new fp32 logits scratch buffer + a thin
+  `tf_fxd2_topf32` slice top-k + the unchanged `tf_fxd2_headmerge`. **Head 39.5 → 5.9 ms**
+  with the SHA exactly equal to no-drafts (every proposal identical — the bit-identity rule
+  from §9/skill held via same order in the top-k, not the GEMM).
+
+- **Batched block projections (`ac60d534e`) — delegated with a TDD brief, orchestrator
+  verified.** `tf_q35_dense_bf16_batch` in `qwen35_bf16_rows.cu`: grid (n, 1), 256 threads,
+  one CTA = one output column for all 8 block rows, W row streamed once, NO shared memory (the
+  staged form was measured 1.1–2× *slower* at every served width — 40 KiB caps a 256-thread
+  CTA at 2/SM — and the mid-flight design change that dropped staging but left the host
+  passing `.shared` + tests pinning the budget was caught in orchestrator review and steered).
+  Bit-identity: same stride-256 uint4 walk, `__fmaf_rn`, warp `__shfl_xor`, thread-0 warp-order
+  sum. Gates: in-repo `tf-cuda-test qwen35-dense-batch` (9 shapes `sameBytes` vs the
+  per-element kernel + a 5e-3-of-magnitude float64 band — the 1e-5 gate first written fails
+  healthy data at ~1.8e-4, which is just bf16's store floor), the seven-projections host test
+  in `cuda_draft2_fwd.zig`, and the runner itself needed 3 preexisting `MTP.Draft.init`
+  call sites to carry the `kv8` flag (`d9bd10563`) plus measured fixes. **Layers 31.8 → 15.1
+  ms** in the served round.
+
+**Measured ladder** (one server, per-request draft flag, temp 0, 1451-token probe, 160
+tokens, `TF_DRAFT2_TIME=1`):
+
+| build | drafting tok/s | nodrafts | stages @1600 ctx (layers/head/select) | round |
+|---|---|---|---|---|
+| `614aa3c2a` baseline | 8.89 | 20.79 | 93.0/39.5/0.9 | ~180 ms |
+| +incremental K/V `92ed00596` | 12.72 | 20.79 | 33/39.5/0.9 | ~123 ms |
+| +tensor-core head `11c05be97` | 11.2–12.5 | 21.7 | 31.8/5.9/0.4 | ~82 ms |
+| +batched projections `ac60d534e` | **13.99** | 22.63 | **15.1/6.1/0.5** | **~66 ms** |
+
+SHA identical to nodrafts at every step (the four cost cuts never moved a token). The
+dropped verify floor is untouched: ~44–47 ms a round is now the dominant term.
+
+## 14. What I would investigate next, in order
+
+1. **Measure real full-depth acceptance under the fixed depth rule — the one number this
+   whole project is about.** Force depth 7 vs depth 1 on the same prompt (`TF_FLASHNEXT_DRAFTS`),
+   one server, and read `rounds=`/`accepted=` from the logs with the fixed pricing in place.
+   The honest prior for "working": ~2.4–3.3 accepted/round (vendor's block-8 class; our lane
+   MTP does 2.3). At 66 ms a round that is ~45–50 tok/s drafted vs 22.6 nodrafts — i.e. the
+   point of the exercise. At the measured ~1.5 it stays ~14 and the next item stops mattering.
+   Teacher-forced replays still say ~0.26/round against the vendor's own code on the same
+   tap dump (§12), so expect the forward to fix the price while exposing the real acceptance
+   gap — that gap is the *block's proposals*, not the timing.
+2. **The tap input tensor, last unsettled axis (§5.1 today).** `readout` (what we serve) is
+   proven the right row and position by the logit lens (l45 median rank 6, top-10
+   probability 0.572 of the next token); still unbuilt/unmeasured is the `mean4` basis (the
+   four-hyperconnection-stream mixture the vendor's `spec_aux_hidden_state` commits) and the
+   `normed` capture is a known stride bug (poisons experiments, not served). If (1) shows
+   acceptance stuck near threshold, this is where the difference lives.
+3. **The ~44–47 ms verify floor.** After (1)+(2) set the acceptance, the verify is the last
+   cost that keeps a round near 60 ms instead of ~30. Profile it (the batched 8-row window
+   costs ~1 pass per §7 "batched verify amortises", so the ms are elsewhere: look at
+   per-round state save/restore, the custom metric, or the no-graph eager path from §9).
+4. **Then the throughput enablers, in order:** prompt-cache restore carrying the tap ring
+   (§5.6 — every warm-benchmark DFlash2 cell 500s), multi-lane tap rings (§5.7), and the 13
+   image-lane GPU test ABRTs. A proper `tools/bench_serving.py` row exists for MTP; run it
+   for DFlash2 once the matrix cells can actually serve.
 
 
