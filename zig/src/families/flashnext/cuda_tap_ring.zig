@@ -320,7 +320,7 @@ test "mean4: a tap's rows land in its own slot, at the ring's wrap, and nowhere 
     // what tap 0 of ring row 0 holds, and tap 1 of ring row 2 what tap 0 of ring row 2 holds.
     var other: [rows * n_taps * hidden]u16 = @splat(sentinel);
     Mean4.place(&src, &other, rows, n_taps, hidden, 1, 2, 2);
-    try std.testing.expectEqualSlices(u16, &ring[0..hidden], &other[hidden .. 2 * hidden]);
+    try std.testing.expectEqualSlices(u16, ring[0..hidden], other[hidden .. 2 * hidden]);
     const at2 = 2 * n_taps * hidden;
     try std.testing.expectEqualSlices(u16, ring[at2 .. at2 + hidden], other[at2 + hidden .. at2 + 2 * hidden]);
     // Ring row 1 holds neither position's row: one tap's slot never reaches into the other's, and the
