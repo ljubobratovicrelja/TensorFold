@@ -620,7 +620,7 @@ extern "C" __global__ void __launch_bounds__(256) tf_fxd2_select(const __nv_bflo
                                                                 const __nv_bfloat16* __restrict__ PRED, const __nv_bfloat16* __restrict__ SUCC,
                                                                 const unsigned* __restrict__ CAND, const float* __restrict__ UNARY,
                                                                 unsigned* __restrict__ OUT, unsigned* __restrict__ ERR,
-                                                                int H, int rank, int topk, int rows, int vocab, int anchor) {
+                                                                int H, int rank, int topk, int rows, int vocab, int anchor, int no_sel) {
     __shared__ float hp[FXD2_RANK];
     __shared__ float ctx[FXD2_RANK];
     __shared__ float score[FXD2_TOP];
@@ -664,14 +664,23 @@ extern "C" __global__ void __launch_bounds__(256) tf_fxd2_select(const __nv_bflo
             fxd2_fault(OUT, ERR, FXD2_KIND_SUCCESSOR, t, CAND[t * topk + bad], rows);
             return;
         }
-        const __nv_bfloat16* p = PRED + (size_t)prev_token * rank;
-        for (int r = tid; r < rank; r += blockDim.x) ctx[r] = bf(p[r]) * hp[r];
+        // A/B: `no_sel` is uniform across the block, so the walk degenerates to a per-slot argmax
+        // over the unary logits — DFlash1's behaviour, with the path selector removed but every
+        // other part of the round untouched. `prev` still advances; no score reads it.
+        if (!no_sel) {
+            const __nv_bfloat16* p = PRED + (size_t)prev_token * rank;
+            for (int r = tid; r < rank; r += blockDim.x) ctx[r] = bf(p[r]) * hp[r];
+        }
         __syncthreads();
         if (tid < topk) {
-            const __nv_bfloat16* sc = SUCC + (size_t)cid * rank;
-            float s = 0.0f;
-            for (int r = 0; r < rank; r++) s = fmaf(ctx[r], bf(sc[r]), s);
-            score[tid] = UNARY[t * topk + tid] + s;
+            if (no_sel) {
+                score[tid] = UNARY[t * topk + tid];
+            } else {
+                const __nv_bfloat16* sc = SUCC + (size_t)cid * rank;
+                float s = 0.0f;
+                for (int r = 0; r < rank; r++) s = fmaf(ctx[r], bf(sc[r]), s);
+                score[tid] = UNARY[t * topk + tid] + s;
+            }
         }
         __syncthreads();
         int best = 0;

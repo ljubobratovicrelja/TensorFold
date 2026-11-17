@@ -265,8 +265,12 @@ Settled this session (evidence in `tools/dflash2`, /tmp/voa_*.json, replays in
   reference/bench repo; its README routes serving to the runtime forks. Production =
   **SGLang PR #35371** ("DFlash2: local convolution + candidate selector"): `srt/models/dflash.py`,
   `srt/speculative/dflash_worker_v2.py`, `spec_aux_hidden_state.py` + Triton selector (same team's
-  ports: vLLM #52816, llama.cpp #27342, oMLX). Production numbers (Qwen3.8-27B, block 8):
-  4.39-5.46 accepted tokens a step, 236.1 t/s vs 68.9 autoregressive (3.43x, GSM8K conc 1).
+  ports: vLLM #52816, llama.cpp #27342, oMLX).
+  Production numbers there are for **Qwen3.8-27B** (block 8): 4.39-5.46 accepted tokens a step,
+  236.1 t/s vs 68.9 autoregressive (3.43x, GSM8K conc 1). **That is NOT our target and NOT our
+  bar** — a 64-layer dense model on H200, not Flash-Next; see `flashnext-dflash2-divergence-brief.md`
+  §1. Our bar is the Flash-Next card: 1.63-1.82x over autoregressive at block 4 on GB300, and
+  3.26 vs 3.08 accept length against the target's own MTP head.
 - **Our reference.py matches the production forward op-for-op.** z-lab torch model vs reference.py:
   stage rel_rms 2e-7..1.5e-6, proposals identical (the vendor's 8-row propose is the generate
   loop's slice `[:, 1-verify_size:, :]` applied outside). SGLang's conventions agree with ours:

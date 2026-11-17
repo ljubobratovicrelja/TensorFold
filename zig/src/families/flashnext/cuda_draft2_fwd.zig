@@ -1112,9 +1112,12 @@ fn select(s: *Draft, x: u64, rows: usize, ids: u64, val: u64, err: u64, anchor: 
     // exactly the rows `cand`, `unary`, `prop` and `hn` are booked for (`place`'s `block - 1`): the
     // walk reads every one of them, and one more row is a read past the head's table
     if (rows != c.block - 1) return error.BadProposalCount;
+    // A/B: TF_FLASHNEXT_NO_SELECTOR removes the path selector (per-slot argmax), leaving every
+    // other stage of the round identical. Read per call so one binary serves both arms.
+    const no_sel: c_int = if (std.c.getenv("TF_FLASHNEXT_NO_SELECTOR") != null) 1 else 0;
     try launch(s, s.fns.select, .{ 1, 1, 1 }, 256, 0, .{
         x,      s.w.hidden_proj, s.w.pred, s.w.succ, ids, val, out, err,
-        ci(c.hidden), ci(c.rank), ci(c.topk), ci(rows), ci(c.vocab), @as(c_int, @intCast(anchor)),
+        ci(c.hidden), ci(c.rank), ci(c.topk), ci(rows), ci(c.vocab), @as(c_int, @intCast(anchor)), no_sel,
     });
 }
 
