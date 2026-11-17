@@ -29,6 +29,8 @@ const usage =
     \\  --fixture DIR   a pre-collected ring (manifest.json, ids.bin, ring.bin)
     \\  --out DIR       where rep{i}/ is written
     \\  --repeat N      rounds to capture, each into its own rep (default 1)
+    \\  --warm N        untraced rounds on the same state first: the served (reuse) path, not the
+    \\                  cold one that projects and fuses the whole window (default 0)
     \\
 ;
 
@@ -42,6 +44,7 @@ const Args = struct {
     fixture: []const u8 = "",
     out: []const u8 = "",
     repeat: usize = 1,
+    warm: usize = 0,
 };
 
 fn parse(args: []const []const u8) !Args {
@@ -62,6 +65,8 @@ fn parse(args: []const []const u8) !Args {
             a.out = v;
         } else if (std.mem.eql(u8, flag, "--repeat")) {
             a.repeat = std.fmt.parseInt(usize, v, 10) catch return error.BadRepeat;
+        } else if (std.mem.eql(u8, flag, "--warm")) {
+            a.warm = std.fmt.parseInt(usize, v, 10) catch return error.BadRepeat;
         } else return error.UnknownFlag;
     }
     if (a.drafter.len == 0 or a.target.len == 0 or a.fixture.len == 0 or a.out.len == 0)
@@ -143,7 +148,7 @@ pub fn main(init: std.process.Init, argv: []const [:0]const u8) !u8 {
         try std.Io.Dir.cwd().createDirPath(io, rep);
         try std.Io.File.stdout().writeStreamingAll(io, rep);
         try std.Io.File.stdout().writeStreamingAll(io, "\n");
-        try draftcheck.runFixtureAt(gpa, io, &driver, stream, o.drafter, m, o.fixture, rep);
+        try draftcheck.runFixtureAt(gpa, io, &driver, stream, o.drafter, m, o.fixture, rep, o.warm);
     }
     return 0;
 }

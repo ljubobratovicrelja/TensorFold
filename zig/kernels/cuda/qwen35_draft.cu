@@ -361,6 +361,100 @@ extern "C" __global__ void __launch_bounds__(32) tf_fxd2_attn(const __nv_bfloat1
     for (int i = 0; i < DPL; i++) OUT[((size_t)m * heads + h) * HD + lane * DPL + i] = __float2bfloat16_rn(o[i] / l);
 }
 
+// Tiled block attention: one CTA a KV head, a warp a (row, head) pair, K/V staged per position tile.
+//
+// `tf_fxd2_attn` gives each (row, head) its own warp CTA, so the 32 queries that share one KV head
+// each stream the whole context from global: 32x the ring's bytes, at one position per iteration with
+// a warp reduction in the dependency chain (measured 16.5-16.9 ms a layer against an 8.4 MB ring).
+// Here one CTA holds all of them and stages each tile of K/V into shared once.
+//
+// The per-(row, head) arithmetic is `tf_fxd2_attn`'s, unchanged and in the same order — the same
+// 4-term per-lane dot, the same `warp_sum`, the same online softmax walked over positions in the same
+// sequence — so the output is bit-identical; only where the keys are read from changes.
+#define FXD2_TILE 64
+extern "C" __global__ void __launch_bounds__(1024) tf_fxd2_attn_tile(const __nv_bfloat16* __restrict__ Q, const __nv_bfloat16* __restrict__ KB,
+                                                                   const __nv_bfloat16* __restrict__ VB, const __nv_bfloat16* __restrict__ RK,
+                                                                   const __nv_bfloat16* __restrict__ RV, int rows, int heads, int kv_heads, int W,
+                                                                   long long begin, long long pos0, int window, int ctx,
+                                                                   __nv_bfloat16* __restrict__ OUT) {
+    extern __shared__ __nv_bfloat16 fxd2_tile_sh[];
+    __nv_bfloat16* shk = fxd2_tile_sh;
+    __nv_bfloat16* shv = fxd2_tile_sh + FXD2_TILE * HD;
+
+    constexpr int DPL = HD / 32;
+    const int tid = threadIdx.x;
+    const int lane = tid & 31;
+    const int warp = tid >> 5;
+    const int m = warp % rows;                       // the block row
+    const int h = warp / rows;                       // the head within the KV group
+    const int kvh = blockIdx.x;
+    const int hh = kvh * (heads / kv_heads) + h;
+    const int width = kv_heads * HD;
+    const float scale = rsqrtf((float)HD);
+
+    float q[DPL], o[DPL];
+#pragma unroll
+    for (int i = 0; i < DPL; i++) {
+        q[i] = bf(Q[((size_t)m * heads + hh) * HD + lane * DPL + i]);
+        o[i] = 0.0f;
+    }
+    float mx = -INFINITY, l = 0.0f;
+
+    const long long p = pos0 + m;
+    long long first = begin + m;
+    if (first < p - window + 1) first = p - window + 1;
+    const long long last = pos0 + ctx;
+
+    // 1024 threads cover 128 dims x 8 positions a pass
+    const int dcol = tid & (HD - 1);
+    const int prow = tid >> 7;
+
+    for (long long t0 = begin; t0 < last; t0 += FXD2_TILE) {
+        const int n = (int)((last - t0) < FXD2_TILE ? (last - t0) : FXD2_TILE);
+        for (int pp = prow; pp < n; pp += 1024 / HD) {
+            const long long slot = (t0 + pp) % W;
+            const __nv_bfloat16* krow = RK + (size_t)slot * width + kvh * HD;
+            const __nv_bfloat16* vrow = RV + (size_t)slot * width + kvh * HD;
+            shk[pp * HD + dcol] = krow[dcol];
+            shv[pp * HD + dcol] = vrow[dcol];
+        }
+        __syncthreads();
+        const long long from = t0 > first ? t0 : first;
+        for (long long pos = from; pos - t0 < n; pos++) {
+            const int pp = (int)(pos - t0);
+            const __nv_bfloat16* k = shk + pp * HD + lane * DPL;
+            float dot = 0.0f;
+#pragma unroll
+            for (int i = 0; i < DPL; i++) dot = fmaf(q[i], bf(k[i]), dot);
+            const float s = warp_sum(dot) * scale;
+            const float mn = fmaxf(mx, s);
+            const float a = __expf(mx - mn), b = __expf(s - mn);
+            l = l * a + b;
+            const __nv_bfloat16* v = shv + pp * HD + lane * DPL;
+#pragma unroll
+            for (int i = 0; i < DPL; i++) o[i] = fmaf(b, bf(v[i]), o[i] * a);
+            mx = mn;
+        }
+        __syncthreads();
+    }
+    for (int r = 0; r < rows; r++) {
+        const __nv_bfloat16* k = KB + ((size_t)r * kv_heads + kvh) * HD + lane * DPL;
+        float dot = 0.0f;
+#pragma unroll
+        for (int i = 0; i < DPL; i++) dot = fmaf(q[i], bf(k[i]), dot);
+        const float s = warp_sum(dot) * scale;
+        const float mn = fmaxf(mx, s);
+        const float a = __expf(mx - mn), b = __expf(s - mn);
+        l = l * a + b;
+        const __nv_bfloat16* v = VB + ((size_t)r * kv_heads + kvh) * HD + lane * DPL;
+#pragma unroll
+        for (int i = 0; i < DPL; i++) o[i] = fmaf(b, bf(v[i]), o[i] * a);
+        mx = mn;
+    }
+#pragma unroll
+    for (int i = 0; i < DPL; i++) OUT[((size_t)m * heads + hh) * HD + lane * DPL + i] = __float2bfloat16_rn(o[i] / l);
+}
+
 // The head over the target's whole vocabulary in one pass: logits = x @ HEAD^T in fp32, then the top
 // `topk` of each row, descending, as token ids and values. No softcap and no output multiplier: the
 // reference's transform_unary_logits is an identity here. Grid (rows), 256 threads, dynamic shared

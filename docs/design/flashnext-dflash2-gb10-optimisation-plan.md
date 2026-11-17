@@ -123,3 +123,27 @@ whole cached context, so the attention finding carries over to serving unchanged
 incremental/recompute behaviour, then quantization of the drafter's decoder layers. Draft-vocab
 reduction is dropped — a 2% ceiling does not justify it.
 
+
+## Correction (2026-11-18): the stage profile above is the COLD round, not the served one
+
+The profile attributed 95% of the round to `fc_ctx` (75.7%) and attention (19.0%). Both numbers
+come from a **cold** round — a fresh `State`, so the fuse and every layer's prefix k/v projection
+run over the whole 2047-row window. A serving round is warm: `fuseFrom(lo, hi, kv_lo, kv_end)`
+returns `max(lo, kv_end)` once `hi > kv_end`, so a round advances the position by the accepted run
+and only re-fuses/re-projects those ~`accepted + 1` rows.
+
+Measured, not assumed: two warm rounds on the same state over `fixture/window` still report
+**435.8 ms against 438.0 cold**, because replaying one fixture position gives `hi == kv_end` and the
+engine deliberately re-fuses a rewound prefix. So **a single-position fixture cannot measure the
+served steady state**, and the 76%/19% split must not be used to rank optimisation work.
+
+Consistent with that: the served DFlash2 round is ~74 ms at ~1600 ctx, 6x below the fixture's 438 ms.
+
+Consequence for the plan:
+
+- Attention is **not** the first lever. A tiled rewrite (`tf_fxd2_attn_tile`: one CTA a KV head, a
+  warp a (row, head), K/V staged in shared instead of 32x from global) is bit-identical and only
+  marginal on the cold path — because the `attn_i` stage window covers the layer's **prefix k/v
+  projection** as well as the attention kernel (see `layer()`'s stage markers).
+- Profiling the served round needs a fixture whose **positions advance** across rounds, carrying
+  real taps for each. That is the next harness change, before any further kernel work.

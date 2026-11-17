@@ -375,6 +375,7 @@ const Fns = struct {
     fuse: cuda.Function,
     rmsnorm: cuda.Function,
     attn: cuda.Function,
+    attn_tile: cuda.Function,
     head_tile: cuda.Function,
     head_merge: cuda.Function,
     topf32: cuda.Function,
@@ -395,6 +396,9 @@ pub const Draft = struct {
     t_tail: u64 = 0,
     t_rounds: u64 = 0,
     timing: bool = false,
+    /// Keep `tf_fxd2_attn` (one warp CTA a (row, head), 32x the ring's bytes) instead of the tiled
+    /// kernel. `TF_FLASHNEXT_ATTN_LEGACY=1`; the two are bit-identical, so this is only for A/B.
+    attn_legacy: bool = false,
     gpa: std.mem.Allocator,
     io: std.Io,
     d: *const cuda.Driver,
@@ -464,6 +468,7 @@ pub const Draft = struct {
             .fuse = try s.mod.function("tf_fxd2_fuse"),
             .rmsnorm = try s.mod.function("tf_fxd2_rmsnorm"),
             .attn = try s.mod.function("tf_fxd2_attn"),
+            .attn_tile = try s.mod.function("tf_fxd2_attn_tile"),
             .head_tile = try s.mod.function("tf_fxd2_headtile"),
             .head_merge = try s.mod.function("tf_fxd2_headmerge"),
             .topf32 = try s.mod.function("tf_fxd2_topf32"),
@@ -494,6 +499,10 @@ pub const Draft = struct {
         if (std.c.getenv("TF_DRAFT2_TIME")) |p| {
             const v = std.mem.span(p);
             s.timing = v.len != 0 and !std.mem.eql(u8, v, "0");
+        }
+        if (std.c.getenv("TF_FLASHNEXT_ATTN_LEGACY")) |p| {
+            const v = std.mem.span(p);
+            s.attn_legacy = v.len != 0 and !std.mem.eql(u8, v, "0");
         }
         return s;
     }
@@ -1006,6 +1015,16 @@ fn dynConv(s: *Draft, x: u64, dyn_w: u64, base: u64, res: u64, out: u64, branch:
 /// of a full window through: `pos0 + m - window + 1 <= pos0` for every block row `m < window`.)
 fn attn(s: *Draft, st: *State, i: usize, b: *const Bufs, pos0: c_longlong, ctx_len: usize, rows: usize) !void {
     const c = s.c;
+    // The tiled kernel needs one warp per (row, head) in a KV group — 32 warps, 1024 threads — and a
+    // warp per (row, head) is exactly what a KV group holds.
+    const warps = rows * (c.heads / c.kv_heads);
+    if (!s.attn_legacy and warps == 32) {
+        return launch(s, s.fns.attn_tile, .{ @intCast(c.kv_heads), 1, 1 }, 1024, 2 * 64 * 128 * 2, .{
+            b.q,      b.kb,         b.vb,           s.ringK(st, i),   s.ringV(st, i),
+            ci(rows), ci(c.heads),  ci(c.kv_heads), ci(c.ringRows()), pos0,
+            pos0,     ci(c.window), ci(ctx_len),    b.att,
+        });
+    }
     try launch(s, s.fns.attn, .{ @intCast(rows), @intCast(c.heads), 1 }, 32, 0, .{
         b.q,      b.kb,         b.vb,           s.ringK(st, i),   s.ringV(st, i),
         ci(rows), ci(c.heads),  ci(c.kv_heads), ci(c.ringRows()), pos0,

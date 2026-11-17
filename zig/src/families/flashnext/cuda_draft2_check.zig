@@ -404,7 +404,7 @@ fn runFixture(
     m: Model,
     fx_dir: []const u8,
 ) !void {
-    return runFixtureAt(gpa, io, driver, stream, dir, m, fx_dir, stageDirFromEnv() orelse return error.DraftCheckNoStageDir);
+    return runFixtureAt(gpa, io, driver, stream, dir, m, fx_dir, stageDirFromEnv() orelse return error.DraftCheckNoStageDir, 0);
 }
 
 /// `runFixture` with the destination named by the caller rather than `TF_FLASHNEXT_DRAFT_STAGES`,
@@ -419,6 +419,7 @@ pub fn runFixtureAt(
     m: Model,
     fx_dir: []const u8,
     out_dir: []const u8,
+    warmup: usize,
 ) !void {
     if (!draft2.declared(gpa, io, dir)) return error.DraftCheckNotADrafter;
     try checkModel(m);
@@ -461,6 +462,20 @@ pub fn runFixtureAt(
 
     var st = try d.create();
     defer st.deinit();
+
+    // 3b. warm rounds: the same round again on the same state.
+    //
+    // NOTE (measured): on a static fixture this is a NO-OP — `fuseFrom` reuses only when `hi >
+    // fused_end`, and replaying the same position gives `hi == kv_end`, so every round here is the
+    // cold one. That is deliberate in the engine (a rewound prefix is re-fused), but it means a
+    // fixture with one captured position CANNOT measure the served steady state: 2 warm rounds on
+    // `fixture/window` still report 435.8 ms against 438.0 cold. A serving round advances the
+    // position by the accepted run, so `hi > kv_end` and only `accepted + 1` rows are fused and
+    // projected. Profiling the served round needs a fixture whose positions advance.
+    var warm_prop: [block - 1]u32 = @splat(0);
+    for (0..warmup) |_| {
+        try d.draft(&st, .{ .ctx = ctx.ptr, .ctx_len = ctx_len, .anchor = fx.ids[P], .position = P }, &warm_prop);
+    }
 
     // 4. one round, stage by stage. The collector synchronises at every boundary, so its numbers
     // are the work's and not the enqueue's.
