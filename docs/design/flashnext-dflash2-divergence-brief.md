@@ -242,3 +242,34 @@ compounding curve below `qkv_0`; a wrong `qkv_0` makes every later stage look wr
 One correction to what §4 implied: the fix is necessary but not sufficient. The earlier "the fault
 is inside the block body" was wrong for the mechanical reason in §6, and the block-body divergence
 is real — it is just *upstream* of where the isolation claimed it was.
+
+## 10. The residual is summation order, not a further defect (measured 2026-11-17)
+
+The remaining divergence below `conv_attn_in_0` was localised with two torch probes against the
+existing dumps, and it closes the numerics question:
+
+- **The reference path is bit-exact.** Recomputing `conv_attn_in_0` in torch
+  (`rmsnorm → kernel_projection → grouped_conv`, cuBLAS for the projections) matches the reference
+  dump 100% (rel_l2 0).
+- **`kernel_projection` is order-insensitive at bf16 output.** cuBLAS-bf16 and a plain
+  fp32-matmul-then-round give bit-identical results for this input (rel_l2 0), so the projection's
+  rounding is robust to reduction order — the residual is not that.
+- **The engine's hand-written dense matches cuBLAS to 99.8%.** Feeding the engine's *own* dumped
+  `conv_attn_in_0` through cuBLAS q/k/v projections reproduces the engine's `qkv_0` dump to
+  rel_l2 2.28e-4 / 99.8% exact. The engine's `tf_q35_dense_bf16_batch` is therefore numerically
+  equivalent to cuBLAS up to its fixed FMA reduction order; the last-ULP difference is the
+  deliberate, reproducible summation (`__fmaf_rn`, stride-256, warp-shuffle tree) — not a bug.
+
+So the ~1–3e-3 that survives at every projection is the fixed-order reduction's bf16 rounding
+noise, and it is the price of the determinism guarantee: the engine pins its summation order so a
+`token_sha256` is reproducible across builds/hardware, while cuBLAS's order is undocumented and
+moves between versions. It cannot and should not be "fixed" to match cuBLAS bit-for-bit; that would
+throw away reproducibility for nothing, because losslessness (the target verifies every token) never
+depended on bit-identity of the drafter's forward.
+
+**Do not keep chasing the stage-compounding curve.** The fix in §4 was the real defect; what
+remains is irreducible reduction noise, and the earlier "block body fault" was never there to
+begin with. The acceptance gap — the actual project goal — lives in the served cross-round context
+(§1 of `flashnext-dflash2-acceptance-log.md` and the two open §10 defects there: the `q.fed` note
+after window advance, and `st.st.end = 0` every round), which the single-round fixture cannot see.
+That is the next place to spend effort, not the bf16 stage diff.
