@@ -200,9 +200,9 @@ pub const State = struct {
     /// The proposals of the last round, `block - 1` of them.
     held: [depth]u32 = @splat(0),
     held_n: usize = 0,
-    /// The positions `ring` holds: [low(), written). `begin` is the oldest position written in this
-    /// stream's lifetime — a restored prompt writes from its restore point, so nothing behind it is in
-    /// the ring — and `written` the one past its newest.
+    /// The positions `ring` holds: [low(), written). `begin` is the oldest position the ring holds — a cold
+    /// prefill's 0, or the oldest row a prompt-cache state carried back with its ring (cuda_snap.zig) — and
+    /// `written` the one past its newest.
     begin: u64 = 0,
     written: u64 = 0,
     /// The end of the tokens the drafter was handed: an anchor at or past it has no token to start

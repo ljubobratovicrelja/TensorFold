@@ -155,6 +155,7 @@ test "disk identity: Flash Next CUDA resolved prompt rows, kernel forms and expe
     var c: flash.Cuda = undefined;
     c.engine = &e;
     c.head = null;
+    c.drafter = null; // --drafter off: the states carry no tap ring (its word in the key)
     c.set = null;
     c.glue.mixed = 0;
     c.depth = 6;

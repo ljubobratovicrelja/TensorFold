@@ -37,7 +37,35 @@ pub fn bytes(at: usize, head: bool, h: Heads, kv8: bool) usize {
     return own + if (head) attnBytes(at, head_heads, kv8) else 0;
 }
 
-/// One kept state; `head`: it holds the MTP head's cache over the same rows, which a drafting stream needs.
+/// The DFlash2 drafter's tap ring a state may carry (cuda_drafter2.zig's `State`): the rows a stream's
+/// ring holds, position `p` at slot `p % rows`, and the marks a round checks before it drafts.
+pub const Ring = struct {
+    /// The stream's ring on the device: `rows` slots of `row` bytes each.
+    ptr: u64,
+    rows: usize,
+    row: usize,
+    /// The oldest position the ring holds (its `low`), and the one past its newest.
+    lo: u64,
+    written: u64,
+    /// The end of the tokens the drafter was handed (`State.covered`).
+    covered: u64,
+};
+
+/// Where a restore puts a carried ring: the stream's ring (its slots and row width) and the state's three marks.
+pub const RingInto = struct { ptr: u64, rows: usize, row: usize, begin: *u64, written: *u64, covered: *u64 };
+
+/// A ring's shape without its rows: what a state prepared for a later mark has to reserve.
+pub const RingShape = struct { rows: usize, row: usize };
+
+/// The ring bytes a snapshot keeps a state at `at` in a ring of `rows` slots: the positions the ring
+/// can hold (`at`, or the whole ring once the prompt is longer than it).
+pub fn ringArea(at: usize, rows: usize, row: usize) usize {
+    if (rows == 0) return 0;
+    return @min(at, rows) * row;
+}
+
+/// One kept state; `head`: it holds the MTP head's cache over the same rows, which a drafting stream needs;
+/// `ring`: it also holds the DFlash2 drafter's tap ring in `buf`, after the caches.
 pub const Snap = struct {
     rank_id: u64 = 0,
     buf: cuda.DeviceBuffer,
@@ -48,6 +76,28 @@ pub const Snap = struct {
     heads: Heads = .full,
     /// The cache's precision its rows were laid out at (cuda_heads.zig): a sequence of the other precision cannot take it.
     kv8: bool = false,
+    /// The drafter's ring this state carries: rows [ring_lo, ring_written) of a ring of `ring_rows` slots
+    /// of `ring_row` bytes, at slot `p % ring_rows` in `buf` after the caches, and the marks a restore sets.
+    ring: bool = false,
+    ring_rows: usize = 0,
+    ring_row: usize = 0,
+    ring_lo: u64 = 0,
+    ring_written: u64 = 0,
+    ring_covered: u64 = 0,
+
+    /// Where this state's ring rows start in `buf`: every cache's bytes come first.
+    fn ringBase(s: *const Snap) u64 {
+        return @intCast(bytes(s.at, s.head, s.heads, s.kv8));
+    }
+
+    /// Whether this state's ring holds every row an image at `at` names (the last `min(at, ring_rows)`
+    /// positions) and the drafter was handed the whole prefix: a state restored mid-prompt holds only
+    /// [ring_lo, at) of them, and stays in RAM.
+    pub fn ringWhole(s: *const Snap, at: usize) bool {
+        if (!s.ring or s.at != at) return false;
+        const m = @min(at, s.ring_rows);
+        return s.ring_written == at and s.ring_lo == at - m and s.ring_covered >= @as(u64, @intCast(at));
+    }
 };
 
 /// Where a kept state's pieces sit in its buffer (move's order) for a pass's marks (Hooks.marks): whole heads only.
@@ -147,44 +197,139 @@ fn move(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, base: u64, at: usize,
     std.debug.assert(off == bytes(at, d != null, seq.heads, seq.kv8));
 }
 
+/// A ring's rows for positions [lo, end) into or out of `base + area`, `row` bytes a slot, position `p` at
+/// slot `p % rows`: one run when the span does not wrap the ring, two when it does (the second at slot 0).
+fn ringMove(stream: cuda.Stream, ptr: u64, rows: usize, row: usize, lo: u64, end: u64, base: u64, area: u64, way: Way) !void {
+    if (rows == 0 or row == 0) return error.SnapShape;
+    if (end <= lo) return;
+    const n: usize = @intCast(end - lo);
+    if (n > rows) return error.SnapShape;
+    const dr = stream.d;
+    var at: usize = @intCast(lo % @as(u64, @intCast(rows)));
+    var left = n;
+    while (left > 0) {
+        const run = @min(left, rows - at);
+        const dev = ptr + @as(u64, at) * @as(u64, row);
+        const buf = base + area + @as(u64, at) * @as(u64, row);
+        const dst, const src = if (way != .restore) .{ buf, dev } else .{ dev, buf };
+        try dr.check(dr.api.cuMemcpyDtoDAsync_v2(dst, src, run * row, stream.handle), "cuMemcpyDtoDAsync");
+        left -= run;
+        at = 0;
+    }
+}
+
 /// A copy of `seq` (and of the head's cache, with `d`) as it stands after `seq.fed` tokens.
 pub fn save(gpa: std.mem.Allocator, driver: *const cuda.Driver, stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft) !*Snap {
+    return saveWith(gpa, driver, stream, seq, d, null);
+}
+
+/// `save`, and the drafter's ring `ring` (its rows [lo, written) and marks) with the state, when a stream drafts.
+pub fn saveWith(gpa: std.mem.Allocator, driver: *const cuda.Driver, stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, ring: ?Ring) !*Snap {
     const at = seq.fed;
     if (d) |h| if (h.len != at or h.drafted != 0) return error.NotAtMark;
+    // the ring's rows past the mark are the prompt's own tokens again when a resume re-runs them: carry
+    // only rows through `at`, and the marks as far as `at` reaches
+    var r: ?Ring = ring;
+    if (r) |*x| {
+        x.written = @min(x.written, @as(u64, @intCast(at)));
+        x.covered = @min(x.covered, @as(u64, @intCast(at)));
+        // a ring nothing has tapped yet carries no rows: the state is a plain one
+        if (x.written <= x.lo) {
+            r = null;
+        } else if (x.written - x.lo > @as(u64, @intCast(@min(at, x.rows)))) return error.SnapShape;
+    }
+    const own = bytes(at, d != null, seq.heads, seq.kv8);
+    const area = if (r) |x| ringArea(at, x.rows, x.row) else 0;
     const snap = try gpa.create(Snap);
     errdefer gpa.destroy(snap);
-    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytes(at, d != null, seq.heads, seq.kv8)), .at = at, .history = seq.history, .head = d != null, .heads = seq.heads, .kv8 = seq.kv8 };
+    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, own + area), .at = at, .history = seq.history, .head = d != null, .heads = seq.heads, .kv8 = seq.kv8 };
     errdefer snap.buf.free();
     errdefer cuda.completion.drain(driver, stream, "a failed snapshot save did not drain");
     try move(stream, seq, d, snap.buf.ptr, at, .save);
+    if (r) |x| {
+        snap.ring = true;
+        snap.ring_rows = x.rows;
+        snap.ring_row = x.row;
+        snap.ring_lo = x.lo;
+        snap.ring_written = x.written;
+        snap.ring_covered = x.covered;
+        try ringMove(stream, x.ptr, x.rows, x.row, x.lo, x.written, snap.buf.ptr, own, .save);
+    }
     try stream.synchronize();
     return snap;
 }
 
 /// A kept state for position `at` that a pass running past it fills (Hooks.marks); `finish` adds the attention rows.
 pub fn prepare(gpa: std.mem.Allocator, driver: *const cuda.Driver, at: usize, history: [2]i64, head: bool, heads: Heads, kv8: bool) !*Snap {
+    return prepareWith(gpa, driver, at, history, head, heads, kv8, null);
+}
+
+/// `prepare`, with room for a ring of `ring`'s shape (a drafting stream's state): `finish` fills its rows.
+pub fn prepareWith(gpa: std.mem.Allocator, driver: *const cuda.Driver, at: usize, history: [2]i64, head: bool, heads: Heads, kv8: bool, ring: ?RingShape) !*Snap {
+    const area = if (ring) |x| ringArea(at, x.rows, x.row) else 0;
     const snap = try gpa.create(Snap);
     errdefer gpa.destroy(snap);
-    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytes(at, head, heads, kv8)), .at = at, .history = history, .head = head, .heads = heads, .kv8 = kv8 };
+    snap.* = .{ .buf = try cuda.DeviceBuffer.alloc(driver, bytes(at, head, heads, kv8) + area), .at = at, .history = history, .head = head, .heads = heads, .kv8 = kv8 };
+    if (ring) |x| {
+        snap.ring = true;
+        snap.ring_rows = x.rows;
+        snap.ring_row = x.row;
+    }
     return snap;
 }
 
 /// After the pass ran past `snap.at`: the attention caches' first rows (and the head's) into `snap`, queued.
 pub fn finish(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *Snap) !void {
+    return finishWith(stream, seq, d, snap, null);
+}
+
+/// `finish`, and the drafter's ring's rows [lo, at) with the attention rows when the state carries a ring.
+pub fn finishWith(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *Snap, ring: ?Ring) !void {
     if (seq.fed < snap.at) return error.NotAtMark;
     if (d) |h| if (!snap.head or h.len < snap.at) return error.NotAtMark;
     try move(stream, seq, d, snap.buf.ptr, snap.at, .rows);
+    if (!snap.ring) return;
+    // no ring to fill the rows it reserved: the state keeps them unwritten and stays in RAM (`ringWhole`)
+    const x = ring orelse {
+        snap.ring = false;
+        snap.ring_rows = 0;
+        snap.ring_row = 0;
+        return;
+    };
+    if (x.rows != snap.ring_rows or x.row != snap.ring_row) return error.SnapShape;
+    const at: u64 = @intCast(snap.at);
+    const written = @min(x.written, at);
+    if (x.lo > written) return error.SnapShape;
+    snap.ring_lo = x.lo;
+    snap.ring_written = written;
+    snap.ring_covered = @min(x.covered, at);
+    try ringMove(stream, x.ptr, x.rows, x.row, x.lo, written, snap.buf.ptr, snap.ringBase(), .save);
 }
 
 /// `seq` (and the head's cache, with `d`) becomes `snap`'s state; refused before any copy when it cannot hold it.
 pub fn restore(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *const Snap) !void {
+    return restoreWith(stream, seq, d, snap, null);
+}
+
+/// `restore`, and the ring a state carries into `into` (a drafting stream's own ring and marks).
+pub fn restoreWith(stream: cuda.Stream, seq: *prompt.Seq, d: ?*Draft, snap: *const Snap, into: ?RingInto) !void {
     if (snap.at > seq.cap) return error.SequenceTooShort;
     if (!snap.heads.eql(seq.heads)) return error.SnapShape;
     // a bf16-shaped state must not land in fp8 rows, or the reverse: every row after the first would stride wrong
     if (snap.kv8 != seq.kv8) return error.SnapShape;
     if (d) |h| if (!snap.head or snap.at > h.cap) return error.NoHeadState;
+    // another drafter's ring (another window, another row) cannot take these rows: refused before any copy
+    if (snap.ring and into != null and (into.?.rows != snap.ring_rows or into.?.row != snap.ring_row)) return error.SnapShape;
     // a state with the head's rows serves a stream without drafts too: those rows stay in the buffer
     try move(stream, seq, d, snap.buf.ptr, snap.at, .restore);
+    // its ring's rows go back to their own slots and its marks to the state: a round then finds the prefix
+    // covered exactly as the saving stream left it
+    if (snap.ring) if (into) |x| {
+        try ringMove(stream, x.ptr, x.rows, x.row, snap.ring_lo, snap.ring_written, snap.buf.ptr, snap.ringBase(), .restore);
+        x.begin.* = snap.ring_lo;
+        x.written.* = snap.ring_written;
+        x.covered.* = snap.ring_covered;
+    };
     try stream.synchronize();
     seq.history = snap.history;
     seq.fed = snap.at;

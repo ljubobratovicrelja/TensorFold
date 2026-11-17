@@ -430,7 +430,7 @@ pub fn Namespace(comptime Tri: type) type {
                 const kept: *snap.Snap = @ptrCast(@alignCast(saved));
                 if (kept.at != s.reuse.at or kept.at == 0 or kept.at >= ids.len) {
                     s.reuse_failed = true;
-                } else if (if (self.ranks) |r| r.restore(&l.seq, if (l.draft) |*d| d else null, kept) else snap.restore(self.stream, &l.seq, if (l.draft) |*d| d else null, kept)) |_| {
+                } else if (if (self.ranks) |r| r.restore(&l.seq, if (l.draft) |*d| d else null, kept) else snap.restoreWith(self.stream, &l.seq, if (l.draft) |*d| d else null, kept, if (kept.ring) @import("cuda_lanes_snap.zig").ringTarget(self, s) else null)) |_| {
                     l.filled = kept.at;
                     s.cached = @intCast(kept.at);
                 } else |err| switch (err) {
