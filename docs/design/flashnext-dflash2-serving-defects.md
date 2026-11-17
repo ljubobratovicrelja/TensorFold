@@ -133,3 +133,16 @@ Three fix directions, with cost:
 
 Recommendation: **B now** (restores losslessness on warm immediately; small, no format change), then
 **A** if warm-prompt draft throughput turns out to matter. Neither touches the drafter's arithmetic.
+
+## 7. Resolution so far (measured 2026-11-17)
+
+- **Defect B fixed** (`478164fd6`): `cuda_window_costs.zig` times the verify forward at widths
+  1..32 at load (36.55 ms @ 1 row → 98.94 ms @ 32), `facts()` reports `window_costs`/`lane_costs`,
+  and `Draft2.measure()` now synchronizes so `draft_ms` is the real round cost. Cold, greedy,
+  same count prompt: **2.97 → 5.19 drafts/round, 52 → 79.5 tok/s**, 100% acceptance (643/643).
+  The rule now prices each draft and settles where it should; it is no longer hard-capped at 3.
+- **Defect A partially fixed** (`ec2b09453`): a tap-coverage miss on a warm prompt now degrades to a
+  plain round instead of a 500. Warm is lossless (`token_sha256` identical to nodrafts) but slow
+  (~23 tok/s ≈ nodrafts), because the ring still is not carried through prompt-cache restore.
+- **Still open:** the ring-carry (fix A above) for warm-prompt draft throughput — the memory/disk
+  budget decision.
