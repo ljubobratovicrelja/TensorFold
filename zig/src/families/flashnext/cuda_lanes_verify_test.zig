@@ -18,6 +18,9 @@ const Log = struct {
     }
 };
 
+/// A note the drafter was handed: the rows a pass says its stream's ring holds.
+const Note = struct { stream: *lanes.Stream, from: u64, to: u64 };
+
 const Owner = struct {
     const Lane = struct { seq: prompt.Seq = undefined, draft: ?mtp.Draft = @as(mtp.Draft, undefined) }; // a set optional: windows() unwraps it
     const Ranks = struct {
@@ -33,8 +36,10 @@ const Owner = struct {
         };
         log: *Log,
         e: struct { stream: *S = undefined } = .{},
-        pub fn verify(o: Ops, _: *prompt.Seq, _: *mtp.Draft, _: []const u32) !void {
+        /// A lone window: one pass over the stream's own rows, which is what moves the stream's fed.
+        pub fn verify(o: Ops, seq: *prompt.Seq, _: *mtp.Draft, ids: []const u32) !void {
             o.log.add(0);
+            seq.fed += ids.len;
         }
         pub fn verifyMany(o: Ops, seqs: []const *prompt.Seq, _: []const *mtp.Draft, _: []const []const u32, _: u64) !void {
             o.log.add(seqs.len);
@@ -44,10 +49,17 @@ const Owner = struct {
         }
         pub fn draws(_: Ops, _: *mtp.Draft, _: anytype, _: []const u32, _: []u32) !void {}
     };
+    /// The drafter `windows()` notes through, recording each span it is handed.
+    const Drafter = struct {
+        notes: *[8]Note,
+        n: *usize,
+        pub fn note(d: Drafter, s: *lanes.Stream, from: u64, to: u64) void {
+            d.notes[d.n.*] = .{ .stream = s, .from = from, .to = to };
+            d.n.* += 1;
+        }
+    };
     log: Log = .{},
-    drafter: ?struct {
-        pub fn note(_: *const @This(), _: *lanes.Stream, _: u64, _: u64) void {}
-    } = null,
+    drafter: ?Drafter = null,
     lanes_: [4]Lane = .{ .{}, .{}, .{}, .{} },
     streams: [4]lanes.Stream = undefined,
     ranks: ?*Ranks = null,
@@ -69,7 +81,7 @@ const Owner = struct {
     }
 };
 
-fn run(o: *Owner, rows: []const usize, cap: usize) !void {
+fn run(o: *Owner, rows: []const usize, cap: usize, fed: usize) !void {
     var wins: [4]be.Window = undefined;
     var out: [4]be.Verified = undefined;
     var sampled: [4][mtp.max_rows]u32 = undefined;
@@ -77,6 +89,8 @@ fn run(o: *Owner, rows: []const usize, cap: usize) !void {
     var row_ids: [4][mtp.max_rows]u32 = undefined;
     for (rows, 0..) |r, i| {
         o.streams[i].sampling = null;
+        // the stream stands at `fed`: a window's rows are the ones its pass writes from there
+        o.lanes_[i].seq.fed = fed;
         wins[i] = .{ .stream = &o.streams[i], .pending = 0, .held = @intCast(r - 1), .tokens = &.{}, .parents = null, .positions = &.{} };
         out[i] = .{ .sampled = &sampled[i], .drafts = &.{} };
         drafted[i] = i;
@@ -91,22 +105,46 @@ test "shared verify dispatch: at TP=2 a group goes to the ranks, a lone window a
     var ranks: Owner.Ranks = .{ .log = &log };
     var o: Owner = .{};
     o.ranks = &ranks;
-    try run(&o, &.{ 2, 3, 2 }, 64);
+    try run(&o, &.{ 2, 3, 2 }, 64, 0);
     try t.expectEqual(@as(usize, 1), log.n);
     try t.expectEqual(@as(usize, 103), log.calls[0]);
     try t.expectEqual(@as(usize, 0), o.log.n);
     try t.expectEqual(@as(usize, 0), o.log.draw_groups);
     log = .{};
-    try run(&o, &.{4}, 64);
+    try run(&o, &.{4}, 64, 0);
     try t.expectEqual(@as(usize, 0), log.n);
     try t.expectEqualSlices(usize, &.{0}, o.log.calls[0..o.log.n]);
     // a cap of 4 rows splits two 3-row windows into two lone verifies
-    try run(&o, &.{ 3, 3 }, 4);
+    try run(&o, &.{ 3, 3 }, 4, 0);
     try t.expectEqual(@as(usize, 0), log.n);
     try t.expectEqualSlices(usize, &.{ 0, 0 }, o.log.calls[0..o.log.n]);
     // one rank: the shared pass stays on this engine
     o.ranks = null;
-    try run(&o, &.{ 2, 3, 2 }, 64);
+    try run(&o, &.{ 2, 3, 2 }, 64, 0);
     try t.expectEqualSlices(usize, &.{3}, o.log.calls[0..o.log.n]);
     try t.expectEqual(@as(usize, 1), o.log.draw_groups);
+}
+
+test "a drafted window notes the rows its pass wrote, not the window after it" {
+    var notes: [8]Note = undefined;
+    var note_n: usize = 0;
+    var o: Owner = .{};
+    o.drafter = .{ .notes = &notes, .n = &note_n };
+    // A lone 4-row window at fed 2048 writes ring slots [2048, 2052): the window's own rows, which
+    // the position check names `fed + 1 + r` (one-based) and the pass writes zero-based from the fed
+    // it starts at. Reading the fed after the pass had moved it would note [2052, 2056) — the next
+    // window's slots, which this pass never wrote, and the inflated `written` that hides a tap gap.
+    try run(&o, &.{4}, 1, 2048);
+    try t.expectEqual(@as(usize, 1), note_n);
+    try t.expectEqual(@as(u64, 2048), notes[0].from);
+    try t.expectEqual(@as(u64, 2052), notes[0].to);
+    try t.expectEqual(@as(usize, 2052), o.lanes_[0].seq.fed); // the pass moved the fed itself
+    // the next window starts exactly where this one ended: the two spans tile the ring, no hole
+    try run(&o, &.{1}, 1, 2052);
+    try t.expectEqual(@as(u64, 2052), notes[1].from);
+    try t.expectEqual(@as(u64, 2053), notes[1].to);
+    // a shared pass writes no tap ring, so it notes nothing at all
+    note_n = 0;
+    try run(&o, &.{ 4, 4 }, 64, 0);
+    try t.expectEqual(@as(usize, 0), note_n);
 }

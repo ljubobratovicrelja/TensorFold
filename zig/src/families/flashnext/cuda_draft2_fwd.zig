@@ -176,6 +176,18 @@ pub const State = struct {
         s.kv_lo = 0;
         s.kv_end = 0;
     }
+
+    /// A caller's position drop: the stream's positions moved, so nothing this state holds at a
+    /// position may be trusted — the fused span, the projected span and the block-end watermark all
+    /// go. `draft`'s `DraftContextGap` guard is exactly this watermark, and it must move with the
+    /// spans it guards: clearing `end` alone would leave rows fused for a stream's *other* tokens
+    /// trusted at the same positions, and clearing the spans alone would refuse every round after a
+    /// genuine skip with a gap the ring no longer has (`cuda_drafter2.zig`'s `round` calls this where
+    /// it sees one).
+    pub fn invalidate(s: *Self) void {
+        s.end = 0;
+        s.fusedReset();
+    }
 };
 
 /// Where a round's rows are in `State.scratch`; every offset is 256-byte aligned.
@@ -533,12 +545,13 @@ pub const Draft = struct {
     /// grew, a rewind — so what is left is the case the span cannot see: a stream whose *same*
     /// positions now mean different tokens (a pooled state handed to another stream, a restored
     /// prompt, an anchor resampled under a block the last round fused). The rule is: wherever a
-    /// caller drops a stream's positions — `cuda_drafter2.zig`'s `State.reset`, and its open path
-    /// before a first round — it drops the fusion here too. Clearing `st.end` a round is *not* that
-    /// signal, or the ring would never carry anything.
+    /// caller drops a stream's positions — `cuda_drafter2.zig`'s `State.reset` and its open path
+    /// before a first round, and its `round` when a round stands past the last block's end, i.e. the
+    /// stream skipped positions the drafter never fused — it drops the fusion here too, and the
+    /// block-end watermark with it (`State.invalidate`), or the ring would never carry anything.
     pub fn invalidate(s: *Self, st: *State) void {
         _ = s;
-        st.fusedReset();
+        st.invalidate();
     }
 
     /// One layer's keys and values: the keys' `ringRows * kvWidth` rows, then the values'.
@@ -1383,6 +1396,23 @@ test "fusedReset drops the k/v span with the fusion" {
     try std.testing.expectEqual(@as(u64, 0), st.kv_end);
     try std.testing.expectEqual(@as(u64, 0), st.fused_lo);
     try std.testing.expectEqual(@as(u64, 0), st.fused_end);
+}
+
+test "a position drop takes the block-end watermark with the spans" {
+    // `Draft.invalidate` is a caller's position drop, and it is `State.invalidate`'s: the spans go
+    // and the watermark `draft`'s `DraftContextGap` guard reads goes with them, or a genuine skip
+    // would re-fuse its whole prefix and still be refused by a stale end.
+    var st: State = .{ .ring = undefined, .fused = undefined, .scratch = undefined,
+        .end = 1032, .kv_lo = 7, .kv_end = 99, .fused_lo = 3, .fused_end = 77 };
+    st.invalidate();
+    try std.testing.expectEqual(@as(u64, 0), st.end);
+    try std.testing.expectEqual(@as(u64, 0), st.kv_lo);
+    try std.testing.expectEqual(@as(u64, 0), st.kv_end);
+    try std.testing.expectEqual(@as(u64, 0), st.fused_lo);
+    try std.testing.expectEqual(@as(u64, 0), st.fused_end);
+    // and the next round fuses and projects from its own first position, not from a span it kept
+    try std.testing.expectEqual(@as(u64, 900), fuseFrom(900, 1100, st.fused_lo, st.fused_end));
+    try std.testing.expectEqual(@as(u64, 900), reuseFrom(900, 1100, st.kv_lo, st.kv_end));
 }
 
 test "the tap source is one constant, read once" {

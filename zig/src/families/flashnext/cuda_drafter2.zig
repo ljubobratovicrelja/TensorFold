@@ -22,9 +22,14 @@
 //!   are copied into the stream's prefix buffer, `52.4 MB` a round at the served window (about 20 µs
 //!   of device copy against a round's milliseconds).
 //!
-//! * **Every round rewrites the drafter's own k/v ring.** `cuda_draft2_fwd.zig`'s `prefix` folds,
-//!   projects, rotates and stores the whole prefix every round, so a round depends on nothing but the
-//!   tap rows its span names — that is what makes a skipped or a rolled-back round harmless here.
+//! * **A round carries the drafter's own k/v ring across rounds, and drops it at a skip.**
+//!   `cuda_draft2_fwd.zig`'s `prefix` reuses the positions the round before it projected and
+//!   projects only the rest, and `fusePrefix` reuses the fused rows the same way, so a round depends
+//!   on nothing but the tap rows its span names — while rounds stay adjacent. A round that stands
+//!   past the last block's end (a copy round, a plain round, a rollback the caller did not draft
+//!   from) is the position drop `Draft.invalidate` names: `round` calls it, the round fuses and
+//!   projects its whole prefix, and the forward's own `DraftContextGap` guard never sees a hole to
+//!   refuse. That is what keeps a skipped or a rolled-back round harmless here.
 //!
 //! A stream's ring is 50.4 MiB at the served window and is declared in `facts.stream_bytes`, so
 //! admission prices it before a request is admitted, exactly as it prices the target's caches.
@@ -114,6 +119,16 @@ pub fn acceptance(proposed: []const u32, posterior: []const u32) usize {
 /// never read below 1.
 pub fn advance(proposed: []const u32, posterior: []const u32) u32 {
     return 1 + @as(u32, @intCast(acceptance(proposed, posterior)));
+}
+
+/// Whether a round whose block sits at `position` skipped the positions the last block's end covers:
+/// the fused and projected spans stop at `end`, and nothing between it and this round's prefix was
+/// ever fused or projected, so a round that stands past it has to drop both spans (`fwd.State.invalidate`)
+/// rather than read the hole as context. A drafted round never does — the target accepts at most the
+/// block's own rows, so the next anchor lands at or inside `end` — which is why this is the skip's
+/// signal and not a round's. `end == 0` is a state that has drafted nothing yet.
+pub fn skipped(end: u64, position: u64) bool {
+    return end != 0 and position > end;
 }
 
 // -----------------------------------------------------------------------------------------------
@@ -220,10 +235,11 @@ pub const State = struct {
         s.begin = 0;
         s.written = 0;
         s.covered = 0;
-        s.st.end = 0;
         // a pooled state handed to another stream must not answer with the previous request's fused
-        // rows at the same positions: the fusion is cached across a stream's rounds, not across streams
-        s.st.fusedReset();
+        // rows at the same positions: the fusion is cached across a stream's rounds, not across
+        // streams. The invalidation drops the block-end watermark with the spans, so the first round
+        // of the next request may stand anywhere.
+        s.st.invalidate();
     }
 
     /// The oldest position the ring still holds: `rows` writes back from its newest, or the stream's
@@ -517,11 +533,17 @@ pub const Draft2 = struct {
         const ctx = try self.gather(st, ctx_span);
         var t1 = t0;
         if (t0 != 0) t1 = nowNs();
-        // A round rewrites its whole prefix into the drafter's k/v ring (`cuda_draft2_fwd.zig`'s
-        // `prefix`), so the ring is contiguous by construction and the drafter's own "no gap" guard —
-        // which is about a ring carried between rounds — must not see the rounds this stream skipped
-        // (a copy round, a plain round, a rollback): `roundRefusal` above is the check that matters.
-        st.st.end = 0;
+        // A round projects only the positions its k/v ring does not already hold (`cuda_draft2_fwd.zig`'s
+        // `prefix`/`reuseFrom`), and reuses the fused rows it already has, so the ring carries across
+        // rounds — but only while the rounds stay adjacent: a round whose anchor stands past the last
+        // block's end is a round this stream skipped (a copy round, a plain round, a rollback the
+        // caller did not draft from), and the spans stop at that end, so everything between is a hole.
+        // That is a position drop, and it is what `invalidate` names: drop the fusion, the projection
+        // and the block-end watermark together, and this round fuses and projects its whole prefix
+        // again. A round that did not jump keeps both, which is the reuse. `roundRefusal` above is
+        // still the check that matters for the tap ring: a skip whose rows the ring never wrote never
+        // reaches this line.
+        if (skipped(st.st.end, anchor)) self.fwd.invalidate(&st.st);
         var out: [depth]u32 = @splat(0);
         try self.fwd.draft(&st.st, .{ .ctx = ctx, .ctx_len = ctx_span.len, .anchor = it.pending, .position = anchor }, out[0..depth]);
         if (t0 != 0) {
@@ -744,6 +766,32 @@ test "a round is refused when its prefix is not in its own ring" {
     try std.testing.expectEqual(@as(?anyerror, error.DraftWindowPastRing), roundRefusal(.{ .lo = 0, .len = rows + 1 }, 0, 1 << 20, 1 << 20, 1 << 20, rows));
     // an empty span (a round at position 0) has no context to draft from
     try std.testing.expectEqual(@as(?anyerror, error.DraftNoContext), roundRefusal(.{ .lo = 0, .len = 0 }, 0, 1 << 20, 1 << 20, 0, rows));
+}
+
+test "only a round the stream skipped stands past the last block's end" {
+    // A drafted round at anchor `a` vouches for the block [a, a + block), and the target keeps at
+    // most every row that block offered: the next round's anchor lands at or inside that end, so a
+    // drafted round never drops the spans and the reuse carries from round to round.
+    const a: u64 = 1000;
+    const end = a + block;
+    var accepted: usize = 0;
+    while (accepted <= depth) : (accepted += 1) {
+        var proposed: [depth]u32 = @splat(7);
+        var posterior: [depth]u32 = @splat(7);
+        if (accepted < depth) posterior[accepted] = 9; // the first proposal past the match missed
+        const adv = advance(&proposed, &posterior);
+        try std.testing.expectEqual(@as(u32, @intCast(1 + accepted)), adv);
+        try std.testing.expect(!skipped(end, a + @as(u64, adv)));
+    }
+    // a round of more tokens than the block (a copy round) jumps the end: the ring has a hole there
+    try std.testing.expect(skipped(end, end + 1));
+    try std.testing.expect(skipped(end, end + 40));
+    // a round that stands on the end replays the same block, and a rollback rewinds into it: an
+    // overlap is the fused span's own case (`fuseFrom`/`reuseFrom` re-fuse it), not a drop
+    try std.testing.expect(!skipped(end, end));
+    try std.testing.expect(!skipped(end, a - 40));
+    // a state that has drafted nothing has no end to stand past
+    try std.testing.expect(!skipped(0, 1 << 20));
 }
 
 test "a shared round's lanes must read the same span, and a tree is not grown here" {

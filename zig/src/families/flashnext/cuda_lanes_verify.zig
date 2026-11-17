@@ -42,13 +42,20 @@ pub fn windows(self: anytype, wins: []const be.Window, out: []be.Verified, draft
                 // drafter finds them here (a batched pass writes no ring at all, which is why
                 // cuda_lanes.zig gives a drafting round `cap = 1`)
                 const o = self.opsTapped(wins[wi].stream);
+                // The slots this pass writes are `fed0 .. fed0 + n`: the window's own rows, which the
+                // position check in cuda_lanes.zig names `seq.fed + 1 + r` (one-based token positions),
+                // written to the ring zero-based from the fed the pass starts at (`Pass.tapRingWrite`'s
+                // `pos0`) — the same coordinate a prompt chunk notes as `[at, cut.stop)` and a plain
+                // round as `[fed - 1, fed)`. Read before the pass, because `verify` moves `seq.fed` by
+                // `ids.len`: after it, `q.fed` is one window further on and names slots nothing wrote.
+                const fed0 = q.fed;
                 try o.verify(q, d, ids);
                 if (std.c.getenv("TF_TAP_TIME") != null) {
                     try o.e.stream.*.synchronize();
                     const t1 = nowNs();
                     std.log.info("verify window: {d} rows, {d:.1} ms", .{ ids.len, @as(f64, @floatFromInt(t1 - t0)) / 1e6 });
                 }
-                if (self.drafter) |draft2| draft2.note(wins[wi].stream, q.fed, q.fed + @as(u64, @intCast(ids.len)));
+                if (self.drafter) |draft2| draft2.note(wins[wi].stream, fed0, fed0 + @as(u64, @intCast(ids.len)));
             }
         } else if (self.ranks) |r| {
             try r.verifyMany(@TypeOf(self.tri()), self.tri(), seqs[0..n], ds[0..n], idss[0..n], self.logits.ptr);
