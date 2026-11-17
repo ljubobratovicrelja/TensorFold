@@ -87,3 +87,29 @@ The vendor bar for context (not yet re-measured on this box at width 7 vs width 
 length ~2.8–3.3 at width 4, throughput ~1.7–1.8× at concurrency 1, on GB300/FP8. Our MTP cold row
 (8.93 tokens/round, 4.2× over no-drafts) is already in that band, which is the control that says
 the target and the box are healthy and DFlash2's deficit is Defect B, not physics.
+
+## 6. Fix scope for Defect A (tap ring through prompt-cache restore)
+
+The ring is per-stream DFlash2 state (`cuda_drafter2.zig`'s `State`), held in `Draft2.states`, and
+it is **not** threaded through `cuda_lanes_snap.zig` → `cuda_snap.zig`'s `Snap` at all — that path
+only carries `prompt.Seq` and the MTP head's `Draft` (`d: ?*Draft`). On a cache resume the prefill
+only re-runs the tail, so the ring is written for `[resumed, end)` only and `begin=resumed`, where
+`low = max(begin, written - rows) = resumed` and the round's `span [0, anchor)` is refused
+(`sp.lo 0 < low resumed`).
+
+Three fix directions, with cost:
+
+- **A — carry the ring through the snapshot.** Add a ring piece to `Snap` (gated like the existing
+  `head` flag), save/restore the ring rows plus `begin`/`written`/`covered`. Correct and complete,
+  but the ring is 52.8 MiB a stream (2064 rows × 5 taps × 2560 × 2 B), which roughly doubles a
+  drafting state's prompt-cache footprint (RAM and the NVMe `.st`/`.blk` image, whose on-disk format
+  the change also touches) — a memory/disk budget decision, not just a code change.
+- **B — degrade to MTP on a covered-span miss.** When the DFlash2 round cannot be drafted (ring not
+  covered after a restore), fall through to the MTP head's ordinary verify instead of a 500. Cheap,
+  lossless (the MTP fallback reproduces the no-draft text), and correct for warm prompts, at the cost
+  of losing the draft speedup on exactly the warm case. Worth doing first regardless.
+- **C — rebuild taps on restore.** Re-run the tapped target layers over the restored prefix. This
+  defeats the whole point of the prompt cache (the target forward is what the cache skips); rejected.
+
+Recommendation: **B now** (restores losslessness on warm immediately; small, no format change), then
+**A** if warm-prompt draft throughput turns out to matter. Neither touches the drafter's arithmetic.
