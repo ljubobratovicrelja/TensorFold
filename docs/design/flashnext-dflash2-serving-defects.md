@@ -155,3 +155,70 @@ Recommendation: **B now** (restores losslessness on warm immediately; small, no 
   grows by `min(at, ringRows) × rowBytes` — up to 52.8 MiB a stream at the served window, only the
   short-prompt rows otherwise. The disk image stores only the last `min(at, 2064)` positions, shared
   per 256-position block like the KV rows.
+
+## 8. The real bug is still open: DFlash2 loses to MTP on the canonical benchmark
+
+**Measured 2026-11-17** on the canonical z-lab/dflash suite (16 real GSM8K prompts, sampled: temp 1.0,
+top-p 0.95, top-k 20, thinking on, `max_tokens=1024`, same build):
+
+| | tok/s | accept length (tok/round) | drafts offered/round | draft acceptance |
+|---|---|---|---|---|
+| MTP | 57.8 | 3.79 | ~4.28 | 71.0% |
+| DFlash2 | 46.2 | 3.46 | ~3.47 | 62.7% |
+
+The vendor's card (incoai README, z-lab/dflash suite, GB300/SGLang, block 4) shows DFlash2 winning
+acceptance (3.26 vs 3.08) and throughput on *every* task. Ours is inverted, and on real prompts — so
+this is not a count-prompt artifact. The earlier framing ("MTP wins only on trivially-draftable text")
+is disproven.
+
+Two hypotheses were floated and both were WRONG, so do not re-open them:
+
+- **(a) 4-bit drafter quantization.** DISPROVEN. The incoai DFlash2 checkpoint is all-bf16 on disk
+  (81/81 tensors `BF16`, 1.2 GiB; read the safetensors header to confirm). `loadWeights` in
+  `cuda_draft2_fwd.zig` reads them straight in with no quant step, and the module header says "no
+  4-bit backbone". `--drafter-bits 4` is a vestigial gate: `openDrafter` hands `bits` only to
+  `refusal()` (demands `== 4`, then discards it), and `Draft2.init` never receives it. The vendor's
+  `unquant` and our "4-bit" serve the identical bf16 drafter. There is no bf16 path to port.
+- **(b) "just a fixed-forward tax".** Only explains a throughput gap at *equal-or-better* acceptance.
+  DFlash2 accepts *fewer* drafts (62.7% vs 71.0%) than a shallow MTP head — a 5-layer transformer
+  drafter reading target hidden states should accept *more*. That points at the drafter's own seam.
+
+The reference implementation is on disk and was not being diffed against: `~/Projects/refimpls/dflash`
+(z-lab's `model.py`, the authoritative drafter math — runnable torch) and `~/Projects/refimpls/
+sglang-flashnext` (the serving glue, incl. `qwen38-dflash2-capture.patch`). Ground-truth facts
+confirmed against them:
+
+- **Capture contract is correct** in our fork. The patch captures completed zero-based layer outputs
+  at `[5,15,25,35,45]`, hc-mean over the 4 hyper-connection streams (features = 5×2560 = 12800), then
+  `fc` + `hidden_norm` on the drafter side. `model.py`'s `extract_context_feature` matches (offset +1,
+  cat over `[5,15,25,35,45]`). Not the bug.
+- **The drafter is plain runnable torch**: `DFlash2DraftModel` — 5 layers, `Qwen3DFlashAttention`
+  (k/v from context+noise, q from noise, q/k RMSNorm, rope), two-tap `GroupedDynamicCausalConv`
+  (kernel=2, group=16) around attention and MLP, selector rank=256/top-k=16, `block_size=8`.
+  `config.json` pins it: `dflash_config.block_size=8`, `conv_kernel_size=2`, `conv_group_size=16`,
+  `selector_rank=256`, `selector_top_k=16`, `target_layer_ids=[5,15,25,35,45]`, `mask_token_id=248077`.
+- **Two real discrepancies from the vendor**: (1) the checkpoint's native block is **8** (7 drafts)
+  but the vendor served **4** (3 drafts, "limited by QSA") — our 3.46 accept-length at block 8 is
+  barely above their 3.26 at block 4, i.e. our later slots 4–7 accept almost nothing; (2) in the
+  reference loop the context is cropped `[:, :produced, :]` and positioned
+  `start - ctx_len : start + verify_size` — the cross-round context seam the single-round fixtures
+  can never exercise.
+
+### The debugging path (differential, against the reference — not hypothesis-driven)
+
+1. **Drafter-math diff — ALREADY DONE, closed.** The dtype-matched CUDA-vs-reference stage diff exists
+   (`tools/dflash2/align_bf16/`, `compare.py` joins 52 stages over a frozen fixture with `SHA256SUMS`).
+   Result (see `flashnext-dflash2-divergence-brief.md` §9–10): the tap-fusion rounding defect was real
+   and is **fixed** (`3a173079b` — `tf_fxd2_rmsnorm`/`tf_fxd2_fuse` now round like the reference's
+   `nn.Linear`→RMSNorm, `fc_ctx_rows` 99.08% bit-exact). The residual below `qkv_0` is **deterministic
+   summation-order noise** (the engine pins its FMA order for a reproducible `token_sha256`; matches
+   cuBLAS to 99.8%), not a defect. Do not re-chase the stage-compounding curve.
+2. **Cross-round context — THE OPEN WORK.** The acceptance gap lives in the served cross-round
+   context, which the single-round fixture cannot see. Two named defects (acceptance-log §10, still
+   open): (a) `cuda_lanes_verify.zig:51` calls `draft2.note(stream, q.fed, q.fed + ids.len)` *after*
+   the window advanced `q.fed`, so `written` is inflated and `absorbOne`'s gap detector is blind to
+   gaps up to 8 positions; (b) `cuda_drafter2.zig:524` clears `st.st.end = 0` every round on the stale
+   "a round rewrites its whole prefix" rationale — false since the incremental K/V reuse landed — so
+   the forward's cross-round `DraftContextGap` guard is dead code.
+3. **Block width** — vendor 4 vs our 8; only matters once 2 pins the drafter's served context.
+
