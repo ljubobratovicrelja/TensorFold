@@ -47,22 +47,42 @@ prompt tokens + target weights, so it can ride the same content-addressed blocks
 writes; the open question is whether to store the bf16 ring rows as a new block class or rebuild the
 covered prefix's taps on restore.
 
-## 3. Defect B — `draft_ms` priced 0.00, so the depth rule throttles to ~3 drafts
-
-The startup line says it outright:
-
-```
-info: flashnext: --drafter …/Qwen3.8-Flash-Next-DFlash2 …: DFlash2, taps {5,15,25,35,45}, 7 drafts a round, 0.00 ms a round, 50.4 MiB a stream
-```
+## 3. Defect B — the depth rule has no cost table, so it caps DFlash2 at ~3 drafts
 
 Cold round arithmetic: 193 rounds / 768 tokens = 3.97 tokens/round, and 574 accepted over 193
-rounds = **2.97 drafts offered per round** — the rule, pricing a round at `0.00 ms`, settles on a
-~3-row verify window rather than the 7 the block computes. `decode` 14.6 s / 193 rounds = **~76 ms
-a round**, which is *faster* per round than MTP's 85.6 ms, yet DFlash2 nets half MTP's tok/s purely
-because it throws away four proposals it already computed. Fixing `measure()`/`draft_ms` so a
-fixed-forward round is priced at its real ~76 ms (the enqueue-vs-completion timing trap) should make
-the rule offer the full 7; at the observed 100% per-draft acceptance on this prompt that is ~8
-tokens/round, i.e. MTP-parity.
+rounds = **2.97 drafts offered per round**. `decode` 14.6 s / 193 rounds = **~76 ms a round** —
+*faster* per round than MTP's 85.6 ms, yet DFlash2 nets half MTP's tok/s purely because it throws
+away four proposals it already computed.
+
+**Corrected mechanism (the earlier `draft_ms=0` reading was a symptom, not the cause).** The depth
+rule's `depth()` in `core/lanes/depth.zig` short-circuits before it ever reads `draft_ms`:
+
+```zig
+if (r.family_costs.empty()) {
+    const want = if (p[0] < 0.8) 1 else if (p[0] < 0.9) 2 else 3;
+    return @max(1, @min(most, want));   // hard 3-draft cap while no cost table exists
+}
+```
+
+`family_costs` is built (`config.zig`) from the target's `window_costs` — "forward ms by width,
+timed at load" — and flashnext CUDA's `facts()` (`cuda_lanes.zig:323`) reports **no** `window_costs`,
+`lane_costs` or `shared_costs`. So `family_costs` is empty and DFlash2 is pinned to 3 offers/round
+no matter how high its acceptance.
+
+- **Why MTP is unaffected:** MTP's `facts()` sets `draft_probabilities = true`, which routes a greedy
+  stream's `headDepth()` straight to `return most_drafts` (no cost table consulted). DFlash2's
+  `facts()` leaves `draft_probabilities = false`, so it falls into `depth()` and the cap.
+- **Why the sibling qwen3_5 CUDA drafter works at full width:** it measures window costs at load
+  (`cuda_window_costs.zig`, `cuda_cost_adapter.zig`, `cuda_warm.zig`) and publishes them via
+  `.window_costs = d.costs[0..d.n_costs]` in its drafter `facts()`. flashnext CUDA has none of that
+  wiring (its only `window_costs` mention is the Metal backend's `batch_costs.zig`, which does not
+  serve on CUDA).
+
+The fix is a port, not the one-line `measure()` synchronize that was originally guessed: give
+flashnext CUDA a load-time window-cost sweep and publish `window_costs` so `family_costs` fills.
+Separately, `Draft2.measure()` (`cuda_drafter2.zig:601`) does still time the enqueue (no
+`synchronize` in its bracket), so `draft_ms` reports 0.00 and must be fixed too — but that is moot
+until `family_costs` is non-empty, since the capped branch returns before reading it.
 
 ## 4. Harness gap (separate from the engine)
 
