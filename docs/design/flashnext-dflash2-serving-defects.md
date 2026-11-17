@@ -222,3 +222,33 @@ confirmed against them:
    the forward's cross-round `DraftContextGap` guard is dead code.
 3. **Block width** — vendor 4 vs our 8; only matters once 2 pins the drafter's served context.
 
+## 9. Cross-round fix landed — and it was a null on cold acceptance (measured 2026-11-17)
+
+Both defects from §8.2 were fixed (`ecf44db6b`): (a) `cuda_lanes_verify.zig` now captures `fed0 = q.fed`
+*before* `verify()` advances it and notes `[fed0, fed0+n)` — the zero-based slot range the pass
+actually wrote (verified against `tapRingWrite`'s `pos % rows` and the plain-round reference
+`[fed-1, fed)`, not the one-based `[F+1, F+n+1)` my brief had guessed); (b) `st.st.end = 0` is gone,
+replaced by `State.invalidate()` (drops the block-end watermark *with* the fused/projected spans) at
+the two position-drop sites — `State.reset` and a round that `skipped(end, anchor)`. Build green;
++3 host tests pass (321→324 in the flashnext binary; the 1-fail/13-crash in `test-cuda-host` are
+pre-existing at HEAD, confirmed by stash-and-rerun).
+
+**Measured result: the acceptance gap did NOT move.** Same 16 GSM8K prompts, same sampling, same
+binary, cold DFlash2: **3.21 accept-length, 59.0% draft acceptance, 42.5 tok/s** (pre-fix 3.46 /
+62.7% / 46.2). No `DraftContextGap`/`DraftTapNotCovered` refusals in the log on either run.
+
+**Why it was a null — and what it teaches.** The two defects are *latent* on a cold single-stream
+run. A cold stream's rounds are always adjacent: advance `= 1 + accepted ≤ block`, so the anchor
+never lands past `st.end`, `skipped()` never fires, and the ring genuinely covers its span every
+round. The inflated `written` and the dead gap guard only bite on a *skipped* round — a copy round, a
+plain round, a rollback, a warm restore. The cold path never skips, so the fix changed nothing there.
+
+So the cross-round fix is correct and worth keeping (it closes a real serving-path bug that would
+fire on warm/rollback), but **the cold acceptance deficit is not cross-round context.** The real gap
+is still open: DFlash2 accepts ~59% of drafts vs MTP's ~71% on the same prompts, and the vendor's
+DFlash2-beats-MTP is at **block width 4** while we serve width 8. Block width (§8.3) is now the
+live hypothesis — the drafter's per-slot capacity decays hard (the handoff's ~0.20 slot-1 → ~0.05
+slot-7), so a width-8 block dilutes acceptance in a way a width-4 block does not, and the vendor
+never published a width-8 number to contradict that.
+
+
