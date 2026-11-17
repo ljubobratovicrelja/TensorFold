@@ -144,5 +144,14 @@ Recommendation: **B now** (restores losslessness on warm immediately; small, no 
 - **Defect A partially fixed** (`ec2b09453`): a tap-coverage miss on a warm prompt now degrades to a
   plain round instead of a 500. Warm is lossless (`token_sha256` identical to nodrafts) but slow
   (~23 tok/s ≈ nodrafts), because the ring still is not carried through prompt-cache restore.
-- **Still open:** the ring-carry (fix A above) for warm-prompt draft throughput — the memory/disk
-  budget decision.
+- **Defect A fully fixed** (`1a3d23f5b`): the tap ring now rides the snapshot (RAM and the disk image).
+  `cuda_snap.zig` carries the ring rows at their own slots plus `begin`/`written`/`covered` (wrappers
+  `saveWith`/`finishWith`/`restoreWith` keep old callers); `cuda_disk.zig` stores it as a windowed,
+  content-addressed row part (Words 32→80 B, facts [2]→[3], policy [13]→[14] under
+  `flash-cuda-policy-v2`). In-pass keeps are disabled when a drafter is attached, since a mid-pass
+  state can never hold a whole ring. Warm, greedy, same prompt: **~23 → 79.7 tok/s**, now equal to
+  cold (79.5), lossless (`sha` identical). `roundRefusal` no longer fires on cache hits.
+- **Memory/disk cost** (the budget decision, now taken): a drafting state's prompt-cache footprint
+  grows by `min(at, ringRows) × rowBytes` — up to 52.8 MiB a stream at the served window, only the
+  short-prompt rows otherwise. The disk image stores only the last `min(at, 2064)` positions, shared
+  per 256-position block like the KV rows.
