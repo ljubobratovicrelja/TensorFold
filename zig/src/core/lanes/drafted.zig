@@ -326,7 +326,52 @@ pub const Drafted = struct {
             try x.holds.append(x.gpa, .{ .stream = r.stream, .pending = pending, .position = r.position, .depth = r.depth, .plan = r.plan, .lanes = r.lanes, .tokens = r.stream.context.items, .sampling = r.stream.sampling });
         }
         if (x.absorbs.items.len > 0) try x.drafter.absorb(x.absorbs.items);
-        if (x.holds.items.len > 0) try x.drafter.hold(x.holds.items);
+        try x.draftHolds();
+    }
+
+    /// The round's holds. A drafter that cannot reach the rows a round asks for, out of its own state,
+    /// drafts nothing for that stream this round instead of failing the request: DFlash2's tap ring is
+    /// per-stream state the prompt cache does not carry, so a restored prompt re-runs only its tail,
+    /// the ring holds `[resumed, end)`, and the round's span `[0, anchor)` is refused
+    /// (`cuda_drafter2.zig`'s `roundRefusal` -> `DraftTapNotCovered`) — which used to end the request
+    /// after one token. The stream degrades to a plain round through `Lane.filler`, exactly as one
+    /// that has no row to draft from yet does: lossless, one token a round, and it drafts again by
+    /// itself once the round's span slides past the restore point. Only the tap-coverage refusals
+    /// degrade; every other error (an allocation, a kernel, a token outside the vocabulary) still
+    /// fails the request by name.
+    fn draftHolds(x: *Drafted) anyerror!void {
+        if (x.holds.items.len == 0) return;
+        if (x.holds.items.len == 1) return x.holdOne(x.holds.items[0]); // the common round: no retry, one refusal logged
+        x.drafter.hold(x.holds.items) catch |e| {
+            if (!tapMiss(e)) return e;
+            // a batch that refused names no lane: one at a time, so a stream whose ring does cover
+            // its span still drafts this round
+            for (x.holds.items) |h| try x.holdOne(h);
+        };
+    }
+
+    /// One stream's hold: a tap-coverage miss makes it a filler round, anything else fails the request.
+    fn holdOne(x: *Drafted, h: dr.Hold) anyerror!void {
+        x.drafter.hold(&.{h}) catch |e| {
+            if (!tapMiss(e)) return e;
+            // The stream offers no drafts this round. `verify` swaps its held slot for the pending
+            // token and keeps it out of the set `drafter.held` is called over, and `held` itself
+            // answers for a filler without the drafter — so nothing ever reads the drafts this hold
+            // did not compute.
+            const lane = x.lanes.getPtr(h.stream) orelse return e;
+            lane.filler = h.depth;
+        };
+    }
+
+    /// The drafter's "the rows this round wants are not in my state" refusals, as opposed to a fault.
+    fn tapMiss(e: anyerror) bool {
+        return switch (e) {
+            error.DraftTapNotCovered, // a restored prompt: the ring starts past the span's first position
+            error.DraftTapNotWritten, // the span's last row never went through a tapped pass
+            error.DraftAbsorbMissing, // the ring holds the rows but the drafter was handed no anchor
+            => true,
+            else => false,
+        };
     }
 
     /// A drafter-grown tree's node chances (false: none, so the rule's per-depth rates price it).
