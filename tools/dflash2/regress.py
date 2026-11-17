@@ -14,10 +14,15 @@ it also prints the baseline's own run-to-run spread and refuses to trust a speed
 that spread is wider than the tolerance.
 
 Usage:
-    regress.py capture base --repeat 3      # runs/<label>/rep0..repN-1
+    regress.py capture base --repeat 3      # runs/<label>/rep0..repN-1, ~4 s per rep
     regress.py capture cand --repeat 3
     regress.py check base cand              # both gates; exit 1 on any failure
     regress.py list base                    # median per-stage ms, slowest first
+
+`capture` defaults to `--via standalone`, which runs `tensorfold draft-check`: one process, only
+the drafter and the two target tensors a round reads (~8 GiB, ~4 s per rep). It is bit-identical
+to `--via server`, the serving harness that boots all 48 target layers (79 GiB, ~60 s per rep) —
+that path stays for when the engine's own load is what is under test.
 
 Notes that cost a debugging session already:
   * The fixture is only usable when `pos_end >= block + 2`; `fixture/block8` ships with 9 and is
@@ -37,8 +42,13 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+WT = HERE.parent.parent
 ALIGN = HERE / "align_bf16"
 RUNNER = ALIGN / "run_engine_dflash2.sh"
+BIN = WT / "zig-out" / "native" / "bin" / "tensorfold-native"
+HF = Path.home() / ".cache" / "huggingface" / "hub"
+TARGET = next(iter(sorted((HF / "models--nvidia--Qwen3.8-Flash-Next-FP4-Local" / "snapshots").glob("*"))), None)
+DRAFTER = next(iter(sorted((HF / "models--incoai--Qwen3.8-Flash-Next-DFlash2" / "snapshots").glob("*"))), None)
 DEFAULT_FIXTURE = ALIGN / "fixture" / "window"
 RUNS = HERE / "runs"
 
@@ -62,11 +72,13 @@ def fixture_problem(path: Path) -> str | None:
     return None
 
 
-def capture(label: str, fixture: Path, repeat: int) -> Path:
+def capture(label: str, fixture: Path, repeat: int, via: str = "standalone") -> Path:
     problem = fixture_problem(fixture)
     if problem:
         sys.exit(f"refusing: {problem}")
     root = RUNS / label
+    if via == "standalone":
+        return capture_standalone(label, fixture, repeat, root)
     for i in range(repeat):
         out = root / f"rep{i}"
         out.mkdir(parents=True, exist_ok=True)
@@ -76,6 +88,24 @@ def capture(label: str, fixture: Path, repeat: int) -> Path:
         if r.returncode != 0 or not (out / "stages.json").exists():
             sys.stderr.write(r.stderr[-2000:])
             sys.exit(f"capture failed (exit {r.returncode}); see {out}/logs/server.log")
+    return root
+
+
+def capture_standalone(label: str, fixture: Path, repeat: int, root: Path) -> Path:
+    """One process, all reps, only the drafter and the two target tensors resident.
+
+    ~11 s and ~8 GiB for two rounds, against ~4 min and 79 GiB per round through the serving
+    harness — and bit-identical to it, stage for stage. The serving path stays available with
+    `--via server` for the rare case where what is being tested is the engine's own load.
+    """
+    root.mkdir(parents=True, exist_ok=True)
+    cmd = [str(BIN), "draft-check", "--drafter", str(DRAFTER), "--target", str(TARGET),
+           "--fixture", str(fixture), "--out", str(root), "--repeat", str(repeat)]
+    print(f"capture {label} via draft-check ({repeat} rep(s))")
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    if r.returncode != 0 or not (root / "rep0" / "stages.json").exists():
+        sys.stderr.write(r.stderr[-2000:])
+        sys.exit(f"capture failed (exit {r.returncode})")
     return root
 
 
@@ -138,6 +168,8 @@ def check(base: Path, cand: Path, func_tol: float, ms_tol: float, min_ms: float 
     for d in cdirs:
         _, _, carrs = load(d)
         for name, a in barrs0.items():
+            if name in MIRRORS:
+                continue  # a host copy of another stage's bytes; the standalone runner omits it
             c = carrs.get(name)
             if c is None:
                 fails.append(f"{name}: missing in {d.name}")
@@ -213,6 +245,9 @@ def main(argv=None) -> int:
     c.add_argument("label")
     c.add_argument("--fixture", type=Path, default=DEFAULT_FIXTURE)
     c.add_argument("--repeat", type=int, default=3, help="rounds to capture (default 3)")
+    c.add_argument("--via", choices=["standalone", "server"], default="standalone",
+                   help="standalone = `tensorfold draft-check` (~8 GiB, seconds); "
+                        "server = the serving harness (~79 GiB, ~60 s per rep) (default standalone)")
 
     k = sub.add_parser("check", help="compare two captures; exit 1 on regression")
     k.add_argument("base")
@@ -229,7 +264,10 @@ def main(argv=None) -> int:
 
     a = ap.parse_args(argv)
     if a.cmd == "capture":
-        capture(a.label, a.fixture, a.repeat)
+        if a.via == "standalone" and (TARGET is None or DRAFTER is None or not BIN.exists()):
+            sys.exit("standalone capture needs the built binary and both HF checkpoints; "
+                     "use --via server")
+        capture(a.label, a.fixture, a.repeat, a.via)
         return 0
     if a.cmd == "check":
         return check(RUNS / a.base, RUNS / a.cand, a.func_tol, a.ms_tol, a.min_ms)

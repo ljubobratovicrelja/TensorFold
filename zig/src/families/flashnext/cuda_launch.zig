@@ -579,3 +579,5 @@ test {
     _ = @import("cuda_draft2_fwd_test.zig");
     _ = draft2_drafter; // its spans, its refusal list and its advance rule, pinned without a device
 }
+
+pub const draft2_check = @import("cuda_draft2_check.zig");

@@ -15,6 +15,7 @@ const api = @import("engine_api");
 const recall_open = @import("recall_open.zig");
 const benchmark = @import("benchmark.zig");
 const checkpoint_cli = @import("checkpoint_cli");
+const draft_check_cli = @import("draft_check_cli");
 const pdf_worker = @import("pdf_worker.zig");
 const web_cli = @import("web_cli.zig");
 
@@ -78,6 +79,7 @@ pub fn main(init: std.process.Init) !u8 {
     }
     // the checkpoint commands need no model, GPU or driver either
     if (argv.len >= 2 and checkpoint_cli.wants(@ptrCast(argv[1..]))) return checkpoint_cli.main(init, argv[1..]);
+    if (argv.len >= 2 and draft_check_cli.wants(@ptrCast(argv[1..]))) return draft_check_cli.main(init, @ptrCast(argv[1..]));
     if (argv.len >= 2 and std.mem.eql(u8, argv[1], "slide")) return slide_cli.main(init, argv[2..]);
     log.init(io, false);
     if (argv.len == 3 and std.mem.eql(u8, argv[1], "capabilities") and std.mem.eql(u8, argv[2], "--json")) {

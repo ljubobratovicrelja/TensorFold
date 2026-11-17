@@ -404,7 +404,22 @@ fn runFixture(
     m: Model,
     fx_dir: []const u8,
 ) !void {
-    const out_dir = stageDirFromEnv() orelse return error.DraftCheckNoStageDir;
+    return runFixtureAt(gpa, io, driver, stream, dir, m, fx_dir, stageDirFromEnv() orelse return error.DraftCheckNoStageDir);
+}
+
+/// `runFixture` with the destination named by the caller rather than `TF_FLASHNEXT_DRAFT_STAGES`,
+/// so a standalone runner (`draft_check.zig`) can write several reps without touching the process
+/// environment the serving engine reads.
+pub fn runFixtureAt(
+    gpa: std.mem.Allocator,
+    io: std.Io,
+    driver: *cuda.Driver,
+    stream: cuda.Stream,
+    dir: []const u8,
+    m: Model,
+    fx_dir: []const u8,
+    out_dir: []const u8,
+) !void {
     if (!draft2.declared(gpa, io, dir)) return error.DraftCheckNotADrafter;
     try checkModel(m);
 
