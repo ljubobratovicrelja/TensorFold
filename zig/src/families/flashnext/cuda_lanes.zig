@@ -191,6 +191,12 @@ pub fn Namespace(comptime Tri: type) type {
             /// The layers the drafter taps, in its own order (its config's `target_layer_ids`).
             taps: [8]u32 = @splat(0),
             n_taps: usize = 0,
+            /// One verify forward's ms by width, 1..window_rows rows on a lone stream, timed at load
+            /// (cuda_window_costs.zig): what `facts` reports as `window_costs`, the table the depth rule
+            /// prices a drafted round by. Empty until the sweep runs, and then the rule keeps its
+            /// unmeasured cap of three offers a round.
+            costs: [kvl.window_rows]lanes.config.Cost = @splat(lanes.config.Cost{ .width = 0, .ms = 0 }),
+            n_costs: usize = 0,
 
             pub fn tri(self: *Cuda) Tri {
                 return .{ .set = if (self.set) |*x| x else null, .own = &self.glue, .s = self.stream };
@@ -335,6 +341,13 @@ pub fn Namespace(comptime Tri: type) type {
                     .max_streams = round_streams,
                     // a shared round's streams draft in one head pass a step (lanes_draft.batched)
                     .draft_streams = drafting and lanes_draft.batchHeads(),
+                    // the load-time sweep's table prices one stream's own verify pass, which is how a
+                    // drafted window runs here (cuda_lanes_verify.zig holds a drafter's round to one
+                    // window a pass), so it is reported as a lone stream's cost: no shared round's
+                    // forward was measured and none is claimed
+                    .window_costs = self.costs[0..self.n_costs],
+                    .lane_costs = self.costs[0..self.n_costs],
+                    .window_costs_lone = true,
                 };
             }
 

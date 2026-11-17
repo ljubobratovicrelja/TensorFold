@@ -609,11 +609,16 @@ pub const Draft2 = struct {
         var quickest: f64 = std.math.inf(f64);
         for (0..8) |i| {
             st.st.end = 0;
+            try self.stream.synchronize();
             const t0 = std.Io.Clock.awake.now(self.io);
             // a full window of context needs a block at least that far into the sequence: the prefix is
             // [position - ctx_len, position), so a block at position `w` is the youngest one that can
             // carry the whole window
             try self.fwd.draft(&st.st, .{ .ctx = st.ctx.ptr, .ctx_len = w, .anchor = 0, .position = @intCast(w) }, out[0..depth]);
+            // a wall-clock read right after an async launch measures the enqueue, not the work: wait
+            // for the round's kernels, or draft_ms calibrates to ~0 and the depth rule misprices every
+            // drafted round for the server's lifetime.
+            try self.stream.synchronize();
             const ns: f64 = @floatFromInt(t0.durationTo(std.Io.Clock.awake.now(self.io)).toNanoseconds());
             // the first rounds pay the driver's stalls, which no later round does
             if (i >= 2) quickest = @min(quickest, ns / 1e6);

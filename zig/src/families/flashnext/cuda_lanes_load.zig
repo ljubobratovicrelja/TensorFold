@@ -128,6 +128,14 @@ pub fn open(comptime F: type, gpa: std.mem.Allocator, io: std.Io, ctx: *const cu
     if (own.ranks) |r| try load_cache.finishAfter(.{ r, std.math.maxInt(u64) }, ranks.Session.room) else load_cache.finish();
     // the weights are in: the n-gram table into the page cache behind them, so the first prompt finds its rows in RAM
     own.engine.ngram.warm();
+    // the verify forward's ms by width, once, before the first request: `facts` reports the table as
+    // window_costs, and without one the depth rule short-circuits at three offers a round whatever the
+    // drafter's acceptance (docs/design/flashnext-dflash2-serving-defects.md §3). Only a head that
+    // drafts consults it at all; a sweep that fails leaves the table empty and says why, rather than
+    // refusing a load that serves capped without it.
+    if (own.head != null and @import("cuda_window_costs.zig").wanted()) {
+        if (@import("cuda_window_costs.zig").measure(own)) |_| {} else |err| std.log.warn("flashnext: window costs unmeasured ({s}); the depth rule keeps its three-offer cap", .{@errorName(err)});
+    }
     return .{
         .layout = own.kv.layout,
         .vision = own.vision,
