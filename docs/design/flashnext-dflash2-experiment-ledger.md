@@ -213,19 +213,41 @@ variant that could be served without new kernels. Same calibration, same fp8 bas
 Coarser groups win: one signed scale *and* a bias per 64 weights beats 16 symmetric blocks on output
 error, which is why affine4 is the format to chase.
 
-**Teacher-forced accept length** (7 slots, anchored on the true token, 133 real positions):
-bf16 **1.098**, affine4 RTN **1.083** (−1.4%), affine4 fitted **1.068** (−2.7%), NVFP4 RTN **1.038**
-(−5.5%), NVFP4 fitted **1.060** (−3.4%), fp8 **1.098** (0.0%). The per-position sd is ~1.2 slots, so the
-standard error on 133 positions is ~0.10 slots (~9% relative) — every 4-bit arm sits inside one standard
-error of every other, and only fp8-versus-4-bit is resolvable. Separating them needs more chunks, not
-more arithmetic. Note also that the fitted affine4 arm has the better fidelity and the slightly worse
-acceptance, i.e. the acceptance metric is currently too noisy to rank these.
+**Teacher-forced accept length, and the number that replaced it.** A first pass on one chunk
+(133 positions) read bf16 **1.098**, affine4 RTN 1.083 (−1.4%), affine4 fitted 1.068 (−2.7%), NVFP4 RTN
+1.038 (−5.5%), NVFP4 fitted 1.060 (−3.4%), fp8 1.098 (0.0%) — and that table was wrong to quote, because
+each arm's mean was bootstrapped independently and chunk identity is worth far more than the quantization.
 
-Verdict: the per-group scale fit buys ~32% relative output error and cuts the acceptance loss from −5.5%
-to −3.4% — inside the ~10%-for-5%-round budget — but fp8 is still strictly better on every fidelity
-column while costing no measurable acceptance. 4-bit is only worth engineering work if the round win
-materialises, and the engine's 4-bit path is `core/affine4` (group 64, scale **and bias**), not NVFP4, so
-a serving test needs a refit in that format or a new loader.
+Re-run on **8 chunks** of real assistant text (28,888 tokens harvested at 2,049 tok/s, 7,040 calibration
+rows, 110 positions per chunk, **880 positions**, affine4 refit on all eight):
+
+| arm | accept | paired Δ vs bf16 (95% CI) | P(Δ≥0) |
+|---|---:|---|---:|
+| bf16 (teacher) | 0.752 | — | — |
+| affine4 RTN | 0.757 | +0.0045 [−0.0295, +0.0409] | 0.628 |
+| affine4 fitted | 0.749 | −0.0034 [−0.0318, +0.0261] | 0.423 |
+| fp8 | 0.750 | −0.0023 [−0.0182, +0.0159] | 0.422 |
+
+Every arm is within ±0.04 slots of the teacher and of every other arm. The **resampling noise floor of the
+metric itself is ±0.11 slots** (the teacher against itself) — this probe at 880 positions cannot resolve an
+effect below ~0.05 slots, and nothing here is that big. So: weight-only 4-bit on the body costs no
+measurable teacher-forced acceptance, and neither does fp8; the earlier −3.4%/−5.5% readings were
+chunk-specific noise, not fidelity.
+
+Two method rules this paid for:
+
+* **Compare arms paired, never as independent means.** Per-chunk acceptance in this corpus spans
+  **0.22 to 3.16**; unpaired CIs come out at ±14% and hide a zero effect behind corpus composition.
+  Resample *positions* and take the mean of (arm − teacher).
+* **The corpus is the experiment.** The same drafter scores 0.752 here and 1.098 on the earlier
+  GSM8K-flavoured single chunk, with P(≥1) 0.291 vs 0.541. Any acceptance number without its corpus and
+  its chunk spread is not comparable to anything — including to itself next week.
+
+Verdict: fidelity-wise affine4 fitted is the best 4-bit format (4.99–5.40% mean output rel-L2 against
+fp8's 2.1%), and acceptance-wise **all of it is free** at this resolution. That kills the "4-bit costs
+acceptance" objection and leaves exactly one open question, which this harness cannot answer: does the
+byte win show up as round time in the actual speculative loop? That needs the engine to load an affine4
+drafter, and `cuda_drafter2.zig` still has no q4 path.
 
 Method rule this campaign just paid for: **calibrate and evaluate on real activations only.** The same
 fit run on `analysis/align_bf16/fixture/window` (synthetic taps, `gen_inputs.py`, random token ids) read
