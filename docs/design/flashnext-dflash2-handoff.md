@@ -9,6 +9,16 @@ Read this before touching the code, then read
 `docs/design/flashnext-dflash2-drafter.md` for the plan and
 `docs/design/flashnext-dflash2-kernels.md` for the kernel geometry.
 
+> **Current state is not in this file.** §1–§14 below are the historical record, written while the
+> block proposed near-chance tokens and the round cost was unexplained. Both of those are settled:
+> acceptance measures **3.34 tokens a round at width 8** (vendor card 3.26), the port is at the card
+> on the vendor's own metric, and the served round is **23.80 ms** with its cost attributed.
+> The live scoreboard, the harness that produces it, the closed questions and the ranked next work
+> are in **`docs/design/flashnext-dflash2-gb10-optimisation-plan.md`**; the vendor card at source is
+> in `flashnext-dflash2-vendor-baseline.md`. §14's list is superseded in particular: its items 1 and
+> 2 (real full-depth acceptance, the `mean4` tap basis) are answered — acceptance is 3.34/round and
+> `mean4` is the training contract per the vendor capture patch.
+
 ---
 
 ## 1. Where things are

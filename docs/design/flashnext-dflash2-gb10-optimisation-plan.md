@@ -1,205 +1,169 @@
-# DFlash2 on GB10 — findings and optimisation plan
+# DFlash2 on GB10 — where the round goes, and what we have changed
 
-Status: **executing.** Stages below are run serially, one server on :8099 at a time, results
-recorded in §4 as they land. Every number in this file is measured on this box unless marked
-otherwise.
+Status: **executing.** Every number here is measured on this box (DGX Spark, GB10, 128 GB unified)
+unless it is explicitly attributed to the vendor card. Measurements are serial, one process at a
+time. Superseded numbers are kept in §7 with the reason they were wrong, not deleted — a stale
+number that quietly disappears is one somebody re-derives later.
 
-## 1. Why this file exists
+The one-line state of play: the port is at the vendor's card on acceptance (3.33 vs 3.26 accept
+length) and behind it on cost per round, because the drafter pays a large fixed per-round cost that
+this box's bus makes expensive. A served round is **23.8 ms** and its two biggest items are the
+target's `lm_head` (6.98 ms) and `fc_ctx` (5.07 ms).
 
-The vendor card's numbers were produced on one GB300 (HBM3e). We serve on one GB10 (LPDDR5X
-unified). Section 3 of `flashnext-dflash2-vendor-baseline.md` establishes that our port is at
-the card on the vendor's own metric — 1.72–1.76× vs 1.79× over autoregressive — and that the
-reason DFlash2 loses to our MTP here is **cost per round, not correctness**. This file is about
-that cost.
+## 1. The bar
 
-## 2. Findings
+`flashnext-dflash2-vendor-baseline.md` holds the card at source
+(`incoai/Qwen3.8-Flash-Next-DFlash2`, raw README, fetched 2026-11-17): one **GB300**, FP8 target,
+SGLang, 3 drafts per step, GSM8K conc 1 — **AR 205.4 · MTP 326.0 (1.59×) accept 3.08 ·
+DFlash2 368.2 (1.79×) accept 3.26**. Block width 4 there is a QSA serving cap, not the trained
+width (the checkpoint declares `block_size: 8`).
 
-### 2.1 The memory system, measured by others
+Measured here, same 16 GSM8K prompts, pinned seeds, single stream:
 
-- GB10 theoretical peak **273 GB/s** (LPDDR5X, 8533 MT/s); ~229–238 GB/s achieved on large
-  buffers on an idle node (84–87% of peak).
-- **Under active decode the bus collapses.** Measured copy bandwidth falls to **~87 GB/s**
-  (−55%) and triad to ~39 GB/s (−60%), with an ~80–90 GB/s contention floor for any active
-  decode workload regardless of model size (NVIDIA developer forums, UMA diagnostics on GB10).
-- Consequence for us: the drafter does not run on a 273 GB/s bus, it runs on whatever is left of
-  a ~87 GB/s bus while the target streams its own weights. Bytes are the currency.
+| arm | tok/s | accept len | round ms | extra tokens | ms per extra token |
+|---|---|---|---|---|---|
+| AR | 25.5 | — | 39.2 | — | — |
+| MTP | 59.6 | 3.89 | 65.3 | 2.89 | **9.0** |
+| DFlash2 w8 | 45.0 | 3.34 | 74.2 | 2.34 | **15.0** |
 
-### 2.2 Where our round spends them
+On the card's GB300 those last-column figures are ~2.2 ms (MTP) and ~1.8 ms (DFlash2) per extra
+token. So this box inflates MTP's overhead ~4× and DFlash2's ~8.5×, and the asymmetry is entirely
+the drafter's fixed per-round cost. That is the thing this file is about.
 
-Measured, same harness, 16 GSM8K prompts, single stream:
+## 2. How each number is obtained
 
-| arm | tok/s | accept len | round ms | overhead vs AR step | extra tokens | ms per extra token |
-|---|---|---|---|---|---|---|
-| AR | 25.5 | — | 39.2 | — | — | — |
-| MTP | 59.6 | 3.89 | 65.3 | 26.1 | 2.89 | **9.0** |
-| DFlash2 w8 | 45.0 | 3.34 | 74.2 | 35.0 | 2.34 | **15.0** |
+Anything below can be reproduced with these four pieces. They are the harness, and a claim that
+cannot be reproduced with them does not belong in this file.
 
-On the card's GB300 the same quantities are ~2.2 ms (MTP) and ~1.8 ms (DFlash2) per extra token.
-So this box inflates MTP's overhead ~4× and DFlash2's ~8.5×. The asymmetry is the whole problem:
-the drafter has a large **fixed** per-round cost that does not shrink with the target's weights.
+**`tensorfold draft-check`** (`zig/src/cli/draft_check.zig`) — one drafter round over a pre-collected
+fixture: fixture ring + drafter checkpoint + the target's embed table and head. **7.6 GB RSS, ~4 s a
+rep, ~3.8 GiB device**, against ~60 s and 79 GiB for booting the full 48-layer target. It is
+bit-identical to the serving path: 52 stages, proposals `{20, 1, 847, 471, 494, 348, 383}`, round
+437.74 ms standalone vs 439.47 ms through the engine.
 
-Byte budget of that fixed cost:
+**`tools/dflash2/align_bf16/gen_inputs.py`** writes three fixtures: `block8` (**stale** — `pos_end`
+9, the check requires `>= block + 2 = 10`, it refuses `FixtureIdsShape`), `window` (2048 rows, one
+position) and **`sequence`** (2048 rows, 44 rounds, positions advancing 1900 → 2047 by 3–4).
 
-- drafter weights: 1.2 GB bf16 (5 layers, hidden 2560)
-- **target lm_head applied to 8 draft rows: 248,320 × 2560 bf16 ≈ 1.27 GB**
-- candidate selector: two codebooks `[vocab, 256]` bf16 ≈ 254 MB, plus the `[rank, hidden]`
-  projection — and we measured the selector as **inert** (+0.05 accept length), so this traffic
-  buys nothing.
+**`fixture/sequence` is the one that matters.** A manifest may carry a `positions` list;
+`draft-check` runs them **in order on one `State`**, so every round after the first reuses the span
+the previous one projected. Rep 0 is the cold round, reps 1+ are the served ones. Without this,
+every measurement is of the wrong regime — see §7.
 
-The head is comparable to the entire drafter, and it is the single component the
-`candidate_selector` was designed to avoid.
+**`tools/dflash2/regress.py`** — the gate. `capture <label> [--repeat N] [--via standalone|server]`,
+`check <base> <cand>`, `list <run>`. Functional gate: every stage tensor must match the baseline
+(`--func-tol`, default 0 = bf16-exact). Speed gate: per-stage ms and the round total over the
+**median of `--repeat` reps** (default 3), because two captures of one binary measured 438 ms and
+689 ms — GPU clock state, every stage ~+70% uniformly. Stages below `--min-ms` (1.0) are reported
+but never gated; 43 of 53 are sub-millisecond with 20–150% spread.
 
-### 2.3 What practitioners do on GB10
+**Knobs, all env, all off by default:** `TF_FLASHNEXT_ATTN_LEGACY=1` (old attention launch),
+`TF_FLASHNEXT_HEAD_SPLIT=1` (time the head's three launches apart), `TF_FLASHNEXT_NO_SELECTOR=1`
+(per-slot argmax instead of the lattice walk), `TF_FLASHNEXT_STAGE_CTX_TENSOR=1` (mirror `fc_ctx`
+rows into the dump), `TF_FLASHNEXT_LG_DUMP=<dir>` (head input + fp32 logits, row 0).
 
-- **veloGB10** — a Rust+CUDA engine that runs *Qwen3.8-Flash-Next from NVFP4 packs with DFlash 2*
-  on GB10. Its stated design rule: *"Optimization here means fewer bytes (NVFP4, fused
-  projections, frequency-ranked draft vocabularies), not fewer launches."*
-- **TensorRT-Edge-LLM** — draft quantization in `fp8`, `int4_awq`, `nvfp4`, `int8_sq`. For
-  DFlash-family drafts it quantizes **only the decoder-layer linears**; `fc`, `lm_head`, the
-  low-rank candidate head and the draft KV cache stay FP16. It warns quantized drafts can lose
-  acceptance, so each arm must be measured.
-- **Swift-1.5 recipe, Qwen3.8-Flash-Next on DGX Spark** (our model, our box) — MTP with a
-  **65,536-token draft vocabulary**, ~43 tok/s single stream.
+## 3. The scoreboard — the served round
 
-### 2.4 The inversion is not a hardware law
+`fixture/sequence`, median of 11 served reps, after the changes in §4:
 
-On the same hardware, 27B DFlash2 beats MTP single-stream: 38.0 vs 28.6 tok/s (ALLSmartLLM,
-DGX Spark) and 41.2 vs 12.6 in the QAI vLLM-vs-SGLang race. MTP only wins from 4 concurrent
-requests up. So a DFlash2 that loses to MTP at concurrency 1 on GB10 is a cost problem we can
-attack, not a property of the machine.
+    cold  398.2 ms        served  23.80 ms        ~17x
 
-## 3. Plan
+| stage | ms | share | cold rep |
+|---|---|---|---|
+| `logits_top16_ids` — the target head, 7 rows over a 248,320 vocab | **6.98** | **26.2%** | 8.62 |
+| `fc_ctx` — taps → 12800 → `fc` → `hidden_norm`, accepted rows only | **5.07** | **19.1%** | 306.68 |
+| attention, 5 layers (`attn_0..4`) | 4.95 | 18.6% | 76.0 |
+| mlp, 5 layers | 2.76 | 10.4% | 2.77 |
+| `proposals` — the selector walk | 1.44 | 5.4% | 3.57 |
+| qkv, attn_proj, convs, norms | the rest | | |
 
-Each stage is a separate measurement arm, serial, box verified idle, one server on :8099,
-numbers from the server's own `done chatcmpl` line. Nothing is adopted unless it wins on
-measured tok/s **and** holds acceptance.
+`selector_scores` (3.08 ms) appears in the dump but is a **host recomputation the harness adds**,
+not part of the round — it is excluded from the share column.
 
-1. **Profile the round by stage.** Drafter layers / head+top-k / selector / verify, in ms.
-   Deliverable: a stage table, so stages 2–4 are aimed rather than guessed.
-2. **Draft-vocabulary reduction.** Score the draft with a frequent-token shortlist instead of the
-   full 248,320 head; verify against the full head so decoding stays lossless. Expected to be the
-   largest byte win; both GB10 engines do this.
-3. **Quantize the drafter's decoder layers (NVFP4/FP8), keep `fc`, head, candidate head and draft
-   KV in FP16.** The Edge-LLM recipe. Acceptance measured per arm — the vendor literature is
-   explicit that it can drop.
-4. **Fused projections** — only if the profile still shows byte or launch overhead worth removing.
+The byte model behind the top two rows: the head streams **1,271.4 MB** (`248320 × 2560 × 2`) every
+round for 7 rows; `fc_ctx` streams the 65 MB `fc` weight every round regardless of how few rows it
+fuses. Both are pure weight-read costs, which is why the served round barely shrinks with the
+context and why "fewer bytes" is the only lever that moves them.
 
-## 4. Results
+## 4. What we have changed
 
-### 4.1 Stage 1 — profile (DONE)
+**`tf_fxd2_attn_tile`** (commit `d42536604`). `tf_fxd2_attn` gave each `(row, head)` its own warp
+CTA, so the 32 queries sharing a KV head each streamed the whole context from global one position
+per iteration, with a `warp_sum` in the dependency chain at every position. The tiled kernel is one
+CTA per KV head, a warp per `(row, head)`, K/V staged per 64-position tile in shared. Per-`(row,
+head)` arithmetic is unchanged — same per-lane dot, same `warp_sum`, same position order — and the
+capture is bit-identical stage for stage.
 
-Harness: `tools/dflash2/align_bf16/run_engine_dflash2.sh` on the repo's `fixture/window`
-fixture (2048-row context, the full served window), engine's own stage collector,
-`stages.json` with 53 stages. The `fixture/block8` case is stale — `pos_end` 9 vs the check's
-required `>= block + 2 = 10` — it refuses with `FixtureIdsShape`; regenerate before use.
+Paired in one session on `fixture/sequence`, legacy vs tiled: **0.568 vs 0.823 ms a layer, round
+26.14 vs 28.58 ms (−8.5%)**. (Absolute per-layer cost moves with clock state between sessions —
+0.99 ms/layer appears in the §3 run; the ratio is the claim, not the absolute.)
 
-Round total **438.0 ms**; stage sum 441 ms (the `.npy` mirror of `fc_ctx` excluded).
+**`head_tile` 1024 → 8192** (commit `dc87eb516`). `TF_FLASHNEXT_HEAD_SPLIT=1` split the head, which
+had been assumed to be its GEMM:
 
-| stage | ms | share |
-|---|---|---|
-| `fc_ctx` (taps → 12800 → fc → hidden_norm, whole window) | **333.8** | **75.7%** |
-| attention, 5 layers (16.5–16.9 each) | **83.7** | **19.0%** |
-| head (8 rows over 248,320 vocab, `logits_top16_ids`) | 8.4 | 1.9% |
-| selector walk (`proposals` + `selector_scores`) | 8.9 | 2.0% |
-| qkv, mlp, attn_proj, convs, norms (all 5 layers) | 5.3 | 1.2% |
-
-Two findings that change the plan:
-
-1. **The head is 1.9%, not the bottleneck.** The 248,320 × 2560 lm_head over 8 rows — which the
-   byte model in §2.2 flagged as "comparable to the whole drafter" — measures at 8.4 ms. Stage 2
-   as written (draft-vocabulary reduction) can remove at most ~2% of a round. It is not worth the
-   engineering or the acceptance risk.
-2. **Attention is ~330× its bandwidth floor.** 8 query rows against ~2048 cached keys X 8 kv
-   heads X 128 dim is ~4.2 MB per layer — **0.05 ms at the ~87 GB/s decode bus**. It measures
-   **16.7 ms per layer**. That is implementation-bound (one warp serially sweeping the key ring),
-   not hardware-bound, and it is 19% of the round before `fc_ctx` is even considered.
-
-`fc_ctx` at 76% is the full-window recompute the fixture performs; serving runs the context path
-incrementally, so a serving round is 74 ms rather than 438 ms. Its share in serving is therefore
-smaller — but attention is paid **every round, at full window**, because block rows attend to the
-whole cached context, so the attention finding carries over to serving unchanged.
-
-**Revised order:** attention kernel first (19% of the round, 330× off floor), then `fc_ctx`
-incremental/recompute behaviour, then quantization of the drafter's decoder layers. Draft-vocab
-reduction is dropped — a 2% ceiling does not justify it.
-
-
-## Correction (2026-11-18): the stage profile above is the COLD round, not the served one
-
-The profile attributed 95% of the round to `fc_ctx` (75.7%) and attention (19.0%). Both numbers
-come from a **cold** round — a fresh `State`, so the fuse and every layer's prefix k/v projection
-run over the whole 2047-row window. A serving round is warm: `fuseFrom(lo, hi, kv_lo, kv_end)`
-returns `max(lo, kv_end)` once `hi > kv_end`, so a round advances the position by the accepted run
-and only re-fuses/re-projects those ~`accepted + 1` rows.
-
-Measured, not assumed: two warm rounds on the same state over `fixture/window` still report
-**435.8 ms against 438.0 cold**, because replaying one fixture position gives `hi == kv_end` and the
-engine deliberately re-fuses a rewound prefix. So **a single-position fixture cannot measure the
-served steady state**, and the 76%/19% split must not be used to rank optimisation work.
-
-Consistent with that: the served DFlash2 round is ~74 ms at ~1600 ctx, 6x below the fixture's 438 ms.
-
-Consequence for the plan:
-
-- Attention is **not** the first lever. A tiled rewrite (`tf_fxd2_attn_tile`: one CTA a KV head, a
-  warp a (row, head), K/V staged in shared instead of 32x from global) is bit-identical and only
-  marginal on the cold path — because the `attn_i` stage window covers the layer's **prefix k/v
-  projection** as well as the attention kernel (see `layer()`'s stage markers).
-- Profiling the served round needs a fixture whose **positions advance** across rounds, carrying
-  real taps for each. That is the next harness change, before any further kernel work.
-
-## The served round, measured (2026-11-18) — this is the scoreboard that counts
-
-`fixture/sequence` (new): 44 rounds on **one** `State`, positions advancing 1900 → 2047 by 3–4,
-the shape a decode has. Rep 0 is the cold round, reps 1+ are the served ones.
-
-    cold  400.1 ms      served  25.5 ms (median of 11)      16x
-
-Stage medians over the served reps, and the same stage in the cold rep:
-
-    logits_top16_ids     8.60 ms  30.5%    8.62      <- the head, 8 rows over a 248,320 vocab
-    fc_ctx               5.14 ms  18.2%  306.68      <- fuses only the accepted rows; the weight read dominates
-    attn_0..4            5.05 ms  17.9%   76.0       <- 1.01 ms/layer
-    mlp_0..4             2.76 ms   9.8%    2.77
-    proposals            1.32 ms   4.7%    3.57
-    (selector_scores is a HOST recomputation the harness adds, not part of the round: 3.01 ms)
-
-### What this reverses
-
-- **The head is the first lever, not the last.** It was 1.9% of the cold round and is 30.5% of the
-  served one, because the cold round's fuse swamps it. Draft-vocabulary reduction — the lever I
-  dropped on the cold profile — is back on top: the kernel streams the whole 1.27 GB matrix every
-  round for 8 rows, at a measured ~148 GB/s (so ~8.6 ms is already near the machine's rate; the win
-  has to come from reading fewer bytes, not from a faster kernel).
-- **`fc_ctx` is 5.14 ms for ~4 rows.** It streams the 65 MB `fc` weight per round at ~13 GB/s — 11x
-  below what the head kernel achieves on the same box. That is a real inefficiency, and it is 18%
-  of the served round.
-- **Attention is done.** `tf_fxd2_attn_tile` measured in the served regime: **0.568 vs 0.823 ms a
-  layer** (legacy via `TF_FLASHNEXT_ATTN_LEGACY=1`), round **26.14 vs 28.58 ms, −8.5%**, and the
-  capture is bit-identical stage for stage. Its earlier "no effect" reading was the cold fixture.
-
-### Ranked next work
-
-1. Draft vocabulary / head bytes (30.5%).
-2. `fc_ctx` weight-read efficiency (18.2%).
-3. Layer block projections (mlp 9.8%, qkv/attn_proj the rest).
-
-### The head, split (2026-11-18)
-
-`TF_FLASHNEXT_HEAD_SPLIT=1` times the head's three launches apart. Served rounds, 2048-row window:
-
-    GEMM (7 rows x 248,320 x 2,560)   5.43 ms   63% of the head   <- streams 1271.4 MB at ~234 GB/s
-    top-k (tf_fxd2_topf32)            2.97 ms   35%               <- head_tile 1024
+    GEMM (7 rows x 248,320 x 2,560)   5.43 ms   63%   <- 1271.4 MB at ~234 GB/s
+    top-k (tf_fxd2_topf32)            2.97 ms   35%   <- head_tile 1024
     merge (tf_fxd2_head_merge)        0.19 ms    2%
 
-So "the head is the GEMM" is false: a third of it was the top-k, which is oversubscribed by
-construction — `head_tile = 1024` with 256 threads means each thread inserts 4 values, then a
-warp leader merges 512 entries **serially**, then thread 0 merges 128, three barriers a row.
+The top-k was oversubscribed by construction: a 1024-wide tile against 256 threads leaves every
+thread inserting 4 values, then a warp leader merging 512 entries **serially**, then thread 0
+merging 128 — three barriers a row, 243 tiles × 7 rows. `head_tile = 8192` (31 tiles) cuts it to
+**1.39 ms** with the GEMM untouched. `regress.py check base headtile`: **PASS, functionally
+identical**; cold round 439.47 → 427.08 ms; served head 8.60 → 6.98 ms, served round 25.5 → 23.8 ms.
 
-`head_tile = 8192` (31 tiles instead of 243) removes most of that: **top-k 2.97 -> 1.39 ms**, GEMM
-unchanged, capture bit-identical, cold round 439.47 -> 427.08 ms. What is left is still the serial
-warp-leader merge; a shuffle-based top-16 merge is the next step, worth ~1 ms a round.
+## 5. Closed — do not re-run
 
-The GEMM's 5.43 ms is ~234 GB/s over 1271.4 MB — already near this box's rate, so the only way down
-is fewer bytes: an fp8 (or lower) head for the ranking pass, rescoring the top-N in bf16. That is
-an acceptance risk, not just a speed change, and it needs the tap-replay harness to clear it.
+Each of these cost real time. The reason is recorded so it is not re-derived.
+
+- **Block width 4.** Zero per-slot quality gain (0.720 / 0.667 / 0.542 vs 0.740 / 0.662 / 0.592),
+  loses 12.5% advance, saves ~8 ms of a ~76 ms round, nets ~3% slower. Also not a config knob:
+  `cuda_draft2_fwd.zig` has `pub const block = 8` and refuses any other value
+  (`DraftBlockUnsupported`).
+- **The candidate selector as the acceptance gap.** Engine +0.05 accept length on vs off, reference
+  +0.06. The vendor's +0.34/+0.47 ablation is a Qwen3.5-4B number and does not transfer.
+- **`mean4` vs a learned hyper-connection mix.** The vendor capture patch is authoritative: DFlash2
+  was trained on `hidden_states.unflatten(-1, (hc_count, hidden)).mean(dim=-2)`, `hc_mean=True`,
+  features 12800. Changing it moves the drafter off its training distribution.
+- **Cross-round context, context semantics, 10% tap noise, engine-vs-reference ceiling**
+  (1.317 vs 1.342 tokens/round) — all measured and closed in
+  `flashnext-dflash2-acceptance-log.md` §5.
+- **Draft-vocabulary reduction as a byte win over the full head** — see §6: the head is now the
+  largest single item, but the reduction that practitioners use needs a retrained or mapped draft
+  vocabulary; it is not a serving-side switch. What is live is the head's *precision*.
+- **The `attn_i` stage is not just attention.** `layer()` markers put norm+rope and `prefix()`
+  inside that window, so a kernel-only change can look like it did nothing.
+
+## 6. Open, ranked
+
+1. **The head's GEMM, 5.43 ms.** ~234 GB/s over 1,271.4 MB is already near this box's rate, so the
+   only way down is fewer bytes: a block-fp8 head (the `fp8.zig` 128×128 path exists) for the
+   ranking pass, with the top-N rescored in bf16 so the selector's unary values stay exact.
+   **This is an acceptance risk, not just a speed change** — top-16 membership then depends on fp8
+   ranking. Validate offline first: exact bf16 top-16 vs fp8-ranked top-16 over many rows, on
+   captured head inputs, before the engine path is touched.
+2. **The top-k's remaining 1.39 ms** — still the serial warp-leader merge. A shuffle-based top-16
+   merge should take it to a few tenths. Exact, no acceptance risk.
+3. **`fc_ctx`, 5.07 ms for ~4 rows**, streaming 65 MB at ~13 GB/s — 11× below what the head kernel
+   achieves on the same box, and 19% of the round. This is the clearest inefficiency we have not
+   explained yet.
+4. Layer block projections: mlp 2.76 ms, qkv/attn_proj the remainder of the round.
+
+## 7. Superseded measurements, and why they were wrong
+
+**The 438 ms profile (2026-11-17) was the cold round.** It reported `fc_ctx` 75.7%, attention 19.0%,
+head 1.9%, and drove a plan that put attention first and dropped the head as "a 2% ceiling". All of
+it described a fresh `State`: the fuse and every layer's prefix k/v projection run over the whole
+2047-row window, which happens once per stream, not once per round.
+
+The reuse rule is `fuseFrom(lo, hi, kv_lo, kv_end) = if (lo >= fused_lo and hi > fused_end)
+max(lo, fused_end) else lo`. Replaying one fixture position gives `hi == kv_end`, which the engine
+treats as a rewind and deliberately re-fuses in full — so **a single-position fixture cannot
+measure the served regime at all**. Measured, not assumed: two warm rounds on one state over
+`fixture/window` still read **435.8 ms against 438.0 cold**.
+
+Consequence: `fixture/sequence` was built, and on it the same stages read 30.5% (head) and 18.2%
+(`fc_ctx`) instead of 1.9% and 75.7%. Two of the three conclusions in the old §4.1 were inverted by
+the regime change, which is why the harness now comes before the kernel work rather than after it.
+
+**The 25.5 ms / 8.60 ms served figures** were measured before `head_tile = 8192`; §3 supersedes
+them with 23.80 / 6.98.
