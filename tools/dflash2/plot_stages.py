@@ -18,6 +18,16 @@ excluded from every total unless `--include-host` says otherwise.
 
   .venv-plot/bin/python tools/dflash2/plot_stages.py CAPTURE [--out PNG] [--cold-rep 0]
                                                        [--top 20] [--include-host] [--show]
+
+Two captures compare instead of profiling one — every panel then carries both arms and the delta:
+
+  A  categories, both arms         what the round is made of, before vs after
+  B  per stage, dumbbell           each stage's baseline dot against its candidate dot
+  C  the round, before and after   served and cold, with the delta in ms and %
+  D  cumulative delta in order     where along the round the delta is actually won
+
+  .venv-plot/bin/python tools/dflash2/plot_stages.py CAPTURE --baseline BASE
+                                                       [--label X] [--label-b Y] [--out PNG]
 """
 
 import argparse
@@ -223,15 +233,213 @@ def panel_reps(ax, all_reps, cold_rep):
     ax.grid(axis="y", alpha=0.25)
 
 
+AB_A = "#7f8c8d"     # baseline arm
+AB_B = "#16a085"     # candidate arm
+GAIN = "#1e8449"
+LOSS = "#c0392b"
+
+
+def _delta_text(b, c):
+    d = c - b
+    return f"{b:.2f} → {c:.2f}  {d:+.2f} ({100 * d / b:+.1f}%)" if b else f"{b:.2f} → {c:.2f}"
+
+
+def _bar_labels(ax, ys, vals, offset, fmt, colour=None, fontsize=7.2):
+    for y, v in zip(ys, vals):
+        ax.text(v + offset, y, fmt(v), va="center", fontsize=fontsize,
+                color=colour or "black")
+
+
+def panel_cat_ab(ax, base, cand, la, lb):
+    """Categories, both arms — the same roll-up panel B does, with the delta on each row."""
+    rb, rc = rollup(base), rollup(cand)
+    cats = sorted(rb, key=lambda c: -rb[c][0])
+    ys = range(len(cats))
+    vb = [rb[c][0] for c in cats]
+    vc = [rc.get(c, (0.0, ""))[0] for c in cats]
+    ax.barh([y + 0.19 for y in ys], vb, height=0.36, color=AB_A,
+            edgecolor="black", linewidth=0.4, label=la)
+    ax.barh([y - 0.19 for y in ys], vc, height=0.36, color=AB_B,
+            edgecolor="black", linewidth=0.4, label=lb)
+    for y, (b, c) in enumerate(zip(vb, vc)):
+        d = c - b
+        ax.text(max(b, c) * 1.06, y, _delta_text(b, c), va="center", fontsize=7.4,
+                color=GAIN if d < 0 else LOSS)
+    tb, tc = sum(vb), sum(vc)
+    ax.set_yticks(list(ys))
+    ax.set_yticklabels([f"{c}  ({100 * rb[c][0] / tb:.1f}% → {100 * rc.get(c, (0,))[0] / tc:.1f}%)"
+                        for c in cats], fontsize=8.5)
+    ax.set_xscale("log")
+    ax.set_xlabel("median ms over served reps (log scale)")
+    ax.set_title(f"A · categories — {la} vs {lb}", loc="left", fontsize=11)
+    ax.legend(fontsize=8, loc="lower right")
+    ax.set_xlim(0.009, max(vb + vc) * 40)      # the delta text is longer than the bars
+    ax.grid(axis="x", alpha=0.25, which="both")
+
+
+def panel_stage_ab(ax, base, cand, la, lb, top):
+    """Per-stage dumbbell: one row a stage, a line from its baseline ms to its candidate ms."""
+    tb, tc = totals(base), totals(cand)
+    names = sorted(tb, key=lambda n: -tb[n])[:top]
+    ys = list(range(len(names)))[::-1]
+    for y, n in zip(ys, names):
+        b = tb[n]
+        c = tc.get(n, b)
+        ax.plot([b, c], [y, y], color="#bdc3c7", linewidth=1.4, zorder=1)
+        ax.scatter([b], [y], s=26, color=AB_A, zorder=3)
+        ax.scatter([c], [y], s=26, color=AB_B, zorder=3)
+        ax.annotate(f"{c - b:+.3f}", (max(b, c), y), textcoords="offset points",
+                    xytext=(6, 0), va="center", fontsize=7.2,
+                    color=GAIN if c < b else LOSS)
+    ax.set_yticks(ys)
+    ax.set_yticklabels([short(n) for n in names], fontsize=8, family="monospace")
+    ax.set_xscale("log")
+    ax.set_xlim(max(0.004, min(tb[n] for n in names) * 0.5), max(tc.get(n, 0) for n in names) * 9)
+    ax.set_xlabel("median ms over served reps (log scale)")
+    ax.set_title(f"B · per stage, top {top} by {la} — dot is {la}, dot is {lb}", loc="left", fontsize=11)
+    ax.scatter([], [], s=26, color=AB_A, label=la)
+    ax.scatter([], [], s=26, color=AB_B, label=lb)
+    ax.legend(fontsize=8, loc="lower right")
+    ax.grid(axis="x", alpha=0.25, which="both")
+
+
+def panel_round_ab(ax, rb_warm, rb_cold, rc_warm, rc_cold, la, lb):
+    """The two data points he asked for, at round level: served and cold, both arms, with delta.
+
+    Log y: the cold round is ~15x the served one, so on a linear axis the served pair — the pair
+    that sets throughput — would be two invisible stubs next to it.
+    """
+    groups = []
+    if rb_cold is not None and rc_cold is not None:
+        groups.append(("cold round\n(first round of a stream)", rb_cold, rc_cold))
+    groups.append(("served round\n(median of reps 1+)", rb_warm, rc_warm))
+    x = list(range(len(groups)))
+    w = 0.30
+    for n, (x0, (name, b, c)) in enumerate(zip(x, groups)):
+        ax.bar(x0 - w / 2, b, width=w, color=AB_A, edgecolor="black", linewidth=0.4,
+               label=la if n == 0 else None)
+        ax.bar(x0 + w / 2, c, width=w, color=AB_B, edgecolor="black", linewidth=0.4,
+               label=lb if n == 0 else None)
+        ax.text(x0 - w / 2, b * 1.06, f"{b:.2f}", ha="center", va="bottom", fontsize=8.5)
+        ax.text(x0 + w / 2, c * 1.06, f"{c:.2f}", ha="center", va="bottom", fontsize=8.5)
+        ax.text(x0, max(b, c) * 1.9, f"{c - b:+.2f} ms\n{100 * (c - b) / b:+.1f}%",
+                ha="center", va="bottom", fontsize=9.5,
+                color=GAIN if c < b else LOSS,
+                bbox=dict(boxstyle="round,pad=0.28", fc="white", ec="#7f8c8d", lw=0.6, alpha=0.92))
+    lo = min(min(g[1], g[2]) for g in groups)
+    hi = max(max(g[1], g[2]) for g in groups)
+    ax.set_yscale("log")
+    ax.set_ylim(lo * 0.55, hi * 6)
+    ax.set_xticks(x)
+    ax.set_xticklabels([g[0] for g in groups], fontsize=9)
+    ax.set_xlim(-0.6, len(groups) - 0.4)
+    ax.set_ylabel("round ms (log scale)")
+    ax.set_title("C · the round — before and after", loc="left", fontsize=11)
+    ax.legend(fontsize=8, loc="upper left")
+    ax.grid(axis="y", alpha=0.25, which="both")
+
+
+def panel_delta_order(ax, base, cand, order, la, lb):
+    """Where the saving is won, walking the round: cumulative (candidate - baseline) ms."""
+    seq = [s for s in order if s in base and s not in HOST and s not in MIRRORS]
+    d = [cand.get(s, base[s]) - base[s] for s in seq]
+    cum = []
+    run = 0.0
+    for v in d:
+        run += v
+        cum.append(run)
+    ax.step(range(len(seq)), cum, where="mid", color="#2c3e50", linewidth=1.6)
+    ax.fill_between(range(len(seq)), 0, cum, step="mid", color=GAIN if cum[-1] < 0 else LOSS, alpha=0.10)
+    ax.axhline(0, color="black", linewidth=0.8)
+    # the four biggest single moves, labelled — they are the whole story of the delta
+    for i in sorted(range(len(d)), key=lambda i: -abs(d[i]))[:4]:
+        ax.annotate(f"{short(seq[i])} {d[i]:+.2f}", (i, cum[i]), textcoords="offset points",
+                    xytext=(4, 10 if d[i] > 0 else -14), fontsize=7.6, family="monospace",
+                    color=LOSS if d[i] > 0 else GAIN,
+                    arrowprops=dict(arrowstyle="-", color="#7f8c8d", linewidth=0.6,
+                                    shrinkA=0, shrinkB=2))
+    # +1, so the ticks do not land on the same stage of every layer: the round is periodic, and a
+    # step equal to the layer period labels the axis with five copies of block_hidden.
+    step = max(1, len(seq) // 5) + 1
+    ax.set_xticks(range(0, len(seq), step))
+    ax.set_xticklabels([short(seq[i]) for i in range(0, len(seq), step)],
+                       rotation=30, ha="right", fontsize=8, family="monospace")
+    ax.set_xlim(-1, len(seq))
+    ax.set_ylabel(f"cumulative {lb} − {la} (ms)")
+    ax.set_title(f"D · where the delta is won, in execution order — {cum[-1]:+.2f} ms", loc="left",
+                 fontsize=11)
+    ax.grid(alpha=0.25)
+
+
+def compare(a):
+    """Two captures, one figure: `--baseline` is BEFORE, `capture` is AFTER, delta = after − before."""
+    after, before = load(a.capture), load(a.baseline)
+    l_after = a.label or os.path.basename(os.path.normpath(a.capture))
+    l_before = a.label_b or os.path.basename(os.path.normpath(a.baseline))
+
+    def split(reps):
+        cr = a.cold_rep if any(i == a.cold_rep for i, _, _, _ in reps) else -1
+        warm = [r for r in reps if r[0] != cr] or reps
+        cold = [r for r in reps if r[0] == cr]
+        return warm, cold
+
+    bw, bc = split(before)
+    aw, ac = split(after)
+    sb, sa = medians(bw), medians(aw)
+    cb = medians(bc) if bc else None
+    ca = medians(ac) if ac else None
+    order = [s["stage"] for s in after[0][3]["stages"]]
+
+    tb, ta = sum(totals(sb).values()), sum(totals(sa).values())
+    mb = statistics.median([r["round_ms"] for _, r, _, _ in bw])
+    ma = statistics.median([r["round_ms"] for _, r, _, _ in aw])
+    print(f"{'before':>12s}  {l_before}   {a.baseline}  ({len(bw)} served reps)")
+    print(f"{'after':>12s}  {l_after}   {a.capture}  ({len(aw)} served reps)")
+    print(f"\n{'stage':26s}{l_before:>10s}{l_after:>10s}{'delta':>10s}{'pct':>9s}")
+    for n in sorted(totals(sb), key=lambda n: -sb[n]):
+        x, y = sb[n], sa.get(n, 0.0)
+        print(f"{n:26s}{x:10.3f}{y:10.3f}{y - x:+10.3f}{100 * (y - x) / x:+8.1f}%")
+    print(f"{'TOTAL':26s}{tb:10.3f}{ta:10.3f}{ta - tb:+10.3f}{100 * (ta - tb) / tb:+8.1f}%")
+    print(f"\n{'round':26s}{l_before:>10s}{l_after:>10s}{'delta':>10s}{'pct':>9s}")
+    print(f"{'served median':26s}{mb:10.3f}{ma:10.3f}{ma - mb:+10.3f}{100 * (ma - mb) / mb:+8.1f}%")
+    if bc and ac:
+        x, y = bc[0][1]["round_ms"], ac[0][1]["round_ms"]
+        print(f"{'cold (rep 0)':26s}{x:10.3f}{y:10.3f}{y - x:+10.3f}{100 * (y - x) / x:+8.1f}%")
+
+    fig, axes = plt.subplots(2, 2, figsize=(17, 10.5))
+    panel_cat_ab(axes[0][0], sb, sa, l_before, l_after)
+    panel_stage_ab(axes[0][1], sb, sa, l_before, l_after, a.top)
+    panel_round_ab(axes[1][0], mb, (bc[0][1]["round_ms"] if bc else None),
+                   ma, (ac[0][1]["round_ms"] if ac else None), l_before, l_after)
+    panel_delta_order(axes[1][1], sb, sa, order, l_before, l_after)
+    fig.suptitle(f"DFlash2 drafter — {l_before} → {l_after} on the served fixture"
+                 f"  ·  round {mb:.2f} → {ma:.2f} ms ({100 * (ma - mb) / mb:+.1f}%)"
+                 f"  ·  stage sum {tb:.2f} → {ta:.2f} ms", fontsize=13, x=0.01, ha="left")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    out = a.out or "compare.png"
+    fig.savefig(out, dpi=130)
+    print(f"\nwrote {out}")
+    if a.show:
+        plt.show()
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("capture", help="a capture root with rep*/stages.json, or one stages.json")
+    ap.add_argument("--baseline", default=None,
+                    help="a second capture to compare against; the figure then shows both arms "
+                         "and the delta instead of a single-arm profile")
+    ap.add_argument("--label", default=None, help="name for CAPTURE in the comparison")
+    ap.add_argument("--label-b", default=None, help="name for --baseline in the comparison")
     ap.add_argument("--out", default=None, help="PNG to write (default <capture>/stages.png)")
     ap.add_argument("--cold-rep", type=int, default=0, help="the rep to treat as cold (-1 = none)")
     ap.add_argument("--top", type=int, default=20, help="stages in panel A (default 20)")
     ap.add_argument("--include-host", action="store_true", help="count the host-only stages too")
     ap.add_argument("--show", action="store_true", help="also open an interactive window")
     a = ap.parse_args()
+
+    if a.baseline:
+        return compare(a)
 
     all_reps = load(a.capture)
     cold_rep = a.cold_rep if any(i == a.cold_rep for i, _, _, _ in all_reps) else -1
