@@ -155,9 +155,14 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, target: config.Config) !
     return c;
 }
 
-/// The weight-precision markers an export's `dflash_config.precision` may carry. Only the two the
+/// The weight-precision markers an export's `dflash_config.precision` may carry. Only the three the
 /// loader can honour are listed; an unreadable value is ignored (the tensors still decide).
-pub const DeclaredPrecision = enum { bf16, fp8 };
+///
+/// `affine4` is a claim like the other two and is checked the same way at load, but no tensor's
+/// dtype can confirm it: a 4-bit export keeps the drafter's bf16 rows beside its tiles, so the arm
+/// is named by `affine4/manifest.json` and this field can only disagree with that file
+/// (`DrafterPrecisionMismatch`), never stand in for it.
+pub const DeclaredPrecision = enum { bf16, fp8, affine4 };
 
 fn declaredPrecision(o: std.json.ObjectMap) ?DeclaredPrecision {
     const v = o.get("precision") orelse return null;
@@ -166,6 +171,9 @@ fn declaredPrecision(o: std.json.ObjectMap) ?DeclaredPrecision {
         .{ .tag = .fp8, .text = "fp8" },
         .{ .tag = .fp8, .text = "fp8_w8a16" },
         .{ .tag = .fp8, .text = "w8a16" },
+        .{ .tag = .affine4, .text = "affine4" },
+        .{ .tag = .affine4, .text = "w4a16" },
+        .{ .tag = .affine4, .text = "affine4_w4a16" },
         .{ .tag = .bf16, .text = "bf16" },
         .{ .tag = .bf16, .text = "bfloat16" },
     };

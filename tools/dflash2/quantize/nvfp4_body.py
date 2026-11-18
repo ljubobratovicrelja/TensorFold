@@ -135,6 +135,12 @@ def tensor_key(layer: int | None, name: str) -> str:
     return f"L{layer}_{name}" if layer is not None else name
 
 
+def bf16_bits(x: np.ndarray) -> np.ndarray:
+    """float32 -> bf16 bits (round to nearest even), the width the engine's affine4 params are stored at."""
+    a = np.ascontiguousarray(x, dtype=np.float32).view(np.uint32).astype(np.uint64)
+    return ((a + 0x7fff + ((a >> 16) & 1)) >> 16).astype(np.uint16)
+
+
 def output_rel_l2(W: np.ndarray, What: np.ndarray, X: np.ndarray, chunk: int = 512) -> float:
     """||X W^T - X What^T||_F / ||X W^T||_F over the calibration rows, accumulated chunk by chunk.
 
@@ -378,9 +384,9 @@ def pick_affine_params(Wg: np.ndarray, G: np.ndarray, mults=AFFINE_MULTS,
     return best_b, best_s
 
 
-def fit_affine4(W: np.ndarray, X: np.ndarray, group: int,
-                mults=AFFINE_MULTS, clips=AFFINE_CLIPS) -> tuple[np.ndarray, int]:
-    """Per-group bias/scale search in the format the engine loads; returns dequant, groups moved."""
+def _fit_affine4_params(W: np.ndarray, X: np.ndarray, group: int,
+                        mults=AFFINE_MULTS, clips=AFFINE_CLIPS):
+    """The per-group search itself: flat group-major (bias, scale) and how many groups left RTN's."""
     n, k = W.shape
     nb = k // group
     bias = np.empty(nb * n, dtype=np.float32)
@@ -394,7 +400,27 @@ def fit_affine4(W: np.ndarray, X: np.ndarray, group: int,
         bias[sl], scale[sl] = b, s
         rb, rs = NV.affine4_recipe(Wg.min(axis=1), Wg.max(axis=1))
         moved += int(np.count_nonzero((b != rb) | (s != rs)))
+    return bias, scale, moved
+
+
+def fit_affine4(W: np.ndarray, X: np.ndarray, group: int,
+                mults=AFFINE_MULTS, clips=AFFINE_CLIPS) -> tuple[np.ndarray, int]:
+    """Per-group bias/scale search in the format the engine loads; returns dequant, groups moved."""
+    bias, scale, moved = _fit_affine4_params(W, X, group, mults, clips)
     return NV.encode_affine4(W, bias, scale, group), moved
+
+
+def fit_affine4_packed(W: np.ndarray, X: np.ndarray, group: int,
+                       mults=AFFINE_MULTS, clips=AFFINE_CLIPS
+                       ) -> tuple[np.ndarray, int, np.ndarray, np.ndarray, np.ndarray]:
+    """The same fit, plus what an artifact needs: uint8 codes and the chosen flat (bias, scale).
+
+    The served blob is packed from codes. Recovering them from a dequantised matrix would mean
+    re-deriving the scales the fit just chose, which is exactly the information the fit exists to pick.
+    """
+    bias, scale, moved = _fit_affine4_params(W, X, group, mults, clips)
+    fit = NV.encode_affine4(W, bias, scale, group)
+    return fit, moved, NV.affine4_code_of(W, bias, scale, group), bias, scale
 
 
 def fit_scales(W: np.ndarray, X: np.ndarray, gs: float, group: int) -> tuple[np.ndarray, int]:
@@ -541,9 +567,22 @@ def fit(args) -> int:
         t0 = time.time()
         # 448*6/amax for NVFP4 (recorded so the number can be reproduced); affine4 has no global scale
         gs = NV.global_scale(W) if fmt == "nvfp4" else None
+        packed = None
         if fmt == "affine4":
             W_rtn, rel_rtn = NV.quantize_affine4_rtn(W, group)
-            W_fit, moved = (W_rtn, 0) if mode == "rtn" else fit_affine4(W, X_fit, group)
+            if mode == "rtn":
+                W_fit, moved = W_rtn, 0
+            else:
+                W_fit, moved = fit_affine4(W, X_fit, group)
+            if args.dump_codes and args.dump_codes != "-":
+                # the served artifact is packed from codes, so keep the ones this fit chose (and their
+                # per-group params) rather than letting a second quantizer re-derive its own
+                if mode == "rtn":
+                    code, bflat, sflat = NV.affine4_rtn_params(W, group)
+                else:
+                    _, _, code, bflat, sflat = fit_affine4_packed(W, X_fit, group)
+                nb = W.shape[1] // group
+                packed = (code, sflat.reshape(nb, W.shape[0]).T, bflat.reshape(nb, W.shape[0]).T)
         else:
             W_rtn, rel_rtn = NV.quantize_nvfp4_scaled(W, group, gs)
             if mode == "rtn":
@@ -573,6 +612,11 @@ def fit(args) -> int:
             "fp8": fp8,
             "time_s": round(fit_s, 3),
         })
+        if packed is not None:
+            short = tensor_key(layer, key)
+            store[f"{short}.code"] = np.ascontiguousarray(packed[0], dtype=np.uint8)
+            store[f"{short}.scale"] = np.ascontiguousarray(bf16_bits(packed[1]))
+            store[f"{short}.bias"] = np.ascontiguousarray(bf16_bits(packed[2]))
         per_tensor_s[name] = round(fit_s, 3)
         store[f"{name}_rtn"] = np.ascontiguousarray(W_rtn, dtype=np.float32)
         store[f"{name}_fitted"] = np.ascontiguousarray(W_fit, dtype=np.float32)
@@ -864,6 +908,9 @@ def main(argv: list[str] | None = None) -> int:
     f = sub.add_parser("fit", help="quantize the body weights off a calibration file (CPU, numpy)")
     f.add_argument("--calib", required=True, help="a .npz written by `collect`")
     f.add_argument("--out", required=True, help="the JSON report to write")
+    f.add_argument("--dump-codes", action="store_true",
+                   help="affine4 only: also write, per tensor, the uint8 codes and the bf16 per-group "
+                        "scale/bias into the *_beside_<mode>.npz, for quantize/export_affine4.py")
     f.add_argument("--mode", default="scale", choices=("rtn", "scale", "scale+comp"))
     f.add_argument("--format", default="nvfp4", choices=("nvfp4", "affine4"),
                    help="nvfp4 (group 16, e2m1 codes, e4m3 block scales) or affine4 (group 64, signed "

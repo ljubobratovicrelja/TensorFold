@@ -32,10 +32,11 @@
 //!    against the vocabulary on the device, and an index past it is `SelectorIndexOutOfVocab` on
 //!    this side rather than a read past a 127 MB codebook.
 //!
-//! What this module deliberately is not: it keeps one stream and one bf16 precision (no 4-bit
-//! backbone, no snapshots, no lanes, no trees), and its geometry is exactly the served
-//! checkpoint's — five taps, hidden 2560, vocab 248,320, block 8. Any other shape is refused at
-//! `open`, before a round can read the wrong rows.
+//! What this module deliberately is not: it keeps one stream and one weight precision at a time —
+//! the checkpoint as published, its weight-only fp8 build, or its 4-bit (`affine4`) build, chosen
+//! at load and fixed for the life of the drafter — and no snapshots, lanes or trees; its geometry
+//! is exactly the served checkpoint's — five taps, hidden 2560, vocab 248,320, block 8. Any other
+//! shape is refused at `open`, before a round can read the wrong rows.
 //!
 //! The caller owns the two things the drafter does not ship: the target's embedding table and its
 //! LM head (`Target`). It also owns collapsing flashnext's four hyper-connection streams into one
@@ -248,6 +249,11 @@ pub const Bufs = struct {
     /// The selector's one fault record (`Fault`), cleared before a round and written by the kernel
     /// only if a codebook index is at or past the vocabulary.
     err: u64,
+    /// The affine4 arm's group sums: `[rows, k / 64]` fp32, for the widest input width any of the
+    /// seven projections reads (`sumsWidth`) and a context chunk's rows at most. One buffer, reused
+    /// projection by projection: a projection's sums are consumed by the decode queued after them on
+    /// this stream, so nothing reads the previous projection's.
+    sums: u64,
     /// The head's first pass's candidates, `[tiles, block - 1, topk]` of `Fxd2Cand` (`{f32 logit,
     /// u32 id}`): tile `t` of row `r` at `(t * rows + r) * topk`, so a tile CTA writes one
     /// contiguous list and the merge pass reads its row strided. Written whole before the second
@@ -301,24 +307,30 @@ pub const Debug = struct {
     layers: u64 = 0,
 };
 
-/// The weight precision a round runs: the checkpoint as published, or a weight-only fp8 build whose
+/// The weight precision a round runs: the checkpoint as published, a weight-only fp8 build whose
 /// seven decoder-linear groups a projection at a time carry e4m3 codes and fp32 block scales
-/// (`cuda/fp8.zig`). Selected by the caller — `open`'s `want` — and resolved to the checkpoint's own
-/// contents when the caller says nothing (`null`), which is also where a disagreement is refused.
+/// (`cuda/fp8.zig`), or a 4-bit build whose same seven groups carry MLX affine-4 codes with a bf16
+/// scale and bias a 64-value group (`cuda/qlinear.zig`'s `Affine4`). Selected by the caller —
+/// `open`'s `want` — and resolved to the checkpoint's own contents when the caller says nothing
+/// (`null`), which is also where a disagreement is refused.
 pub const Precision = enum {
     bf16,
     fp8,
+    /// 4-bit MLX affine codes, four a weight over a 64-value group: the arm the `affine4/` manifest
+    /// names, and the only one whose tensors cannot say so themselves (the bf16 rows stay beside it).
+    affine4,
 
     pub fn name(p: Precision) []const u8 {
         return switch (p) {
             .bf16 => "bf16",
             .fp8 => "fp8",
+            .affine4 => "affine4",
         };
     }
 
     /// `--drafter-precision`'s spellings; null for anything else.
     pub fn parse(s: []const u8) ?Precision {
-        inline for (.{ Precision.bf16, Precision.fp8 }) |p| if (std.mem.eql(u8, s, p.name())) return p;
+        inline for (.{ Precision.bf16, Precision.fp8, Precision.affine4 }) |p| if (std.mem.eql(u8, s, p.name())) return p;
         return null;
     }
 };
@@ -337,10 +349,11 @@ pub const Q = struct {
     }
 };
 
-/// A projection the round multiplies by: bf16 rows as published, or its block-FP8 packing. The
-/// union is the dispatch — a bf16 checkpoint binds every `bf16` field and reaches the same kernels
-/// it always did, byte for byte.
-pub const Lin = union(Precision) { bf16: u64, fp8: Q };
+/// A projection the round multiplies by: bf16 rows as published, its block-FP8 packing, or its
+/// 4-bit tiles (`cuda/qlinear.zig`'s `Affine4`: words, scales and biases, output rows padded to
+/// 128). The union is the dispatch — a bf16 checkpoint binds every `bf16` field and reaches the
+/// same kernels it always did, byte for byte.
+pub const Lin = union(Precision) { bf16: u64, fp8: Q, affine4: cuda.qlinear.Affine4 };
 
 /// The drafter's weights, one arena, bound by `cuda_draft2_weights.zig`'s names and shapes.
 pub const Weights = struct {
@@ -533,6 +546,17 @@ pub const Draft = struct {
     /// The K-slice partials a reduce plans asks for (`Lane.partBytes`), sized once for the shapes a
     /// round's projections can take; null on the bf16 arm.
     qpart: ?cuda.DeviceBuffer = null,
+    /// The affine-4 arm's four module images — qmm_group, qmm_prefill, lane_gemv, affine4_pack —
+    /// owned here because `a4`'s functions are theirs: unloading one before the other is a dangling
+    /// entry point. Null on the two arms that never tile a weight.
+    a4mods: ?[4]cuda.Module = null,
+    /// `Affine4Kernels.resolve` over `a4mods`: the packing entry that tiles a projection at load,
+    /// and qmm_group's decode (the one entry a round's affine-4 projection takes).
+    a4: ?cuda.qlinear.Affine4Kernels = null,
+    /// `act_rows`' module, for `tf_group_sums_rows`: an affine-4 decode reads a row's 64-value group
+    /// sums instead of re-summing every product, so each projection is one sums launch and one
+    /// matmul. Null on the two arms whose kernels take the sums themselves.
+    act: ?cuda.act_rows.ActRows = null,
     /// The context fuse's dot: `glm_fuse_dot`, one CTA per 64 output columns with every row of the
     /// chunk inside it, so a chunk of the prefix streams the whole 65 MB `fc` once for all its rows
     /// instead of once per row — with the per-row kernel's scalar K-order arithmetic unchanged.
@@ -632,11 +656,50 @@ pub const Draft = struct {
         s.w.deinit(s.gpa);
         if (s.qpart) |*b| b.free();
         if (s.lane) |*l| l.unload();
+        // the kernels' own device state (a non-GB10 split's partials) first, then the modules their
+        // entry points live in: a module unloaded under a live kernel is a stale handle, not a leak
+        if (s.a4) |*a| a.deinit();
+        if (s.act) |*a| a.unload();
+        if (s.a4mods) |*mods| for (mods) |*m| m.unload();
         s.headw.free();
         s.rows.unload();
         s.mod.unload();
         s.mm.unload();
         s.gpa.destroy(s);
+    }
+
+    /// The affine-4 arm's kernels, loaded once at `loadWeights` when the checkpoint's weights are
+    /// 4-bit: the four images `Affine4Kernels.resolve` needs, the entries resolved from them, and
+    /// the activation rows a projection sums its input with. The other two arms load none of it,
+    /// exactly as they never load the lane matmul.
+    ///
+    /// GB10 is `capability == 121`, which is the flag that keeps the decode on its persistent
+    /// per-CTA form (`lane_gemv`) rather than the split-K one; every other SM the images cover takes
+    /// the split.
+    fn loadAffine4(s: *Self) !void {
+        // the same gate the families that serve affine4 put on their module list: a build without
+        // these images is refused by name, not by a driver failure on an empty blob
+        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        const images = [_][]const u8{ cuda.kernels.qmm_group, cuda.kernels.qmm_prefill, cuda.kernels.lane_gemv, cuda.kernels.affine4_pack };
+        var mods: [4]cuda.Module = undefined;
+        var loaded: usize = 0;
+        errdefer for (mods[0..loaded]) |*m| m.unload();
+        for (images, 0..) |img, i| {
+            mods[i] = try cuda.Module.load(s.d, img);
+            loaded += 1;
+        }
+        var dev: cuda.abi.Device = 0;
+        try s.d.check(s.d.api.cuCtxGetDevice(&dev), "cuCtxGetDevice");
+        var sms: c_int = 0;
+        try s.d.check(s.d.api.cuDeviceGetAttribute(&sms, .multiprocessor_count, dev), "cuDeviceGetAttribute");
+        const cap = try s.d.currentCapability();
+        var a4 = try cuda.qlinear.Affine4Kernels.resolve(s.d, mods[0], mods[1], mods[2], mods[3], @intCast(@max(sms, 1)), cap == 121);
+        errdefer a4.deinit();
+        var act = try cuda.act_rows.ActRows.load(s.d);
+        errdefer act.unload();
+        s.a4mods = mods;
+        s.a4 = a4;
+        s.act = act;
     }
 
     /// A new stream's state: its rings and scratch, the k/v ring and the scratch zeroed so a stray
@@ -878,9 +941,9 @@ pub const Draft = struct {
         try stageLayer(s, i, "conv_attn_in_{d}", &.{.{ .ptr = b.xin, .cols = H }}, B, H, .bf16);
         // the block's attention projections: one launch each for all B rows, so a weight row streams
         // once a layer instead of once a row (`denseBatch`'s bytes are `dense`'s, bit for bit)
-        try projBatch(s, b.xin, l.q, b.qraw, qw, H, B);
-        try projBatch(s, b.xin, l.k, b.kraw, kvw, H, B);
-        try projBatch(s, b.xin, l.v, b.vb, kvw, H, B);
+        try projBatch(s, b.xin, l.q, b.qraw, qw, H, B, b.sums);
+        try projBatch(s, b.xin, l.k, b.kraw, kvw, H, B, b.sums);
+        try projBatch(s, b.xin, l.v, b.vb, kvw, H, B, b.sums);
         // q, k and v side by side, before the per-head norm and the rotation: the projections the
         // block's attention is built out of
         try stageLayer(s, i, "qkv_{d}", &.{ .{ .ptr = b.qraw, .cols = qw }, .{ .ptr = b.kraw, .cols = kvw }, .{ .ptr = b.vb, .cols = kvw } }, B, qw + 2 * kvw, .bf16);
@@ -893,7 +956,7 @@ pub const Draft = struct {
         // engine projects the prefix once a layer, and the two cannot be separated without a second
         // copy of the ring. The tensor is the attention's own output.
         try stageLayer(s, i, "attn_{d}", &.{.{ .ptr = b.att, .cols = qw }}, B, qw, .bf16);
-        try projBatch(s, b.att, l.o, b.o, H, qw, B);
+        try projBatch(s, b.att, l.o, b.o, H, qw, B, b.sums);
         // the output projection's own rows: `attn_i` is the attention before `o_proj`
         try stageLayer(s, i, "attn_proj_{d}", &.{.{ .ptr = b.o, .cols = H }}, B, H, .bf16);
         try dynConv(s, b.o, b.dyn, l.attn_base, b.h, b.h2, 1);
@@ -903,10 +966,10 @@ pub const Draft = struct {
         try dense(s, b.x, l.mlp_conv, b.dyn, dyn, H, B);
         try dynConv(s, b.x, b.dyn, l.mlp_base, 0, b.xin, 0);
         try stageLayer(s, i, "conv_mlp_in_{d}", &.{.{ .ptr = b.xin, .cols = H }}, B, H, .bf16);
-        try projBatch(s, b.xin, l.gate, b.gate, c.intermediate, H, B);
-        try projBatch(s, b.xin, l.up, b.up, c.intermediate, H, B);
+        try projBatch(s, b.xin, l.gate, b.gate, c.intermediate, H, B, b.sums);
+        try projBatch(s, b.xin, l.up, b.up, c.intermediate, H, B, b.sums);
         try siluMul(s, b.gate, b.up, b.act, B * c.intermediate);
-        try projBatch(s, b.act, l.down, b.o, H, c.intermediate, B);
+        try projBatch(s, b.act, l.down, b.o, H, c.intermediate, B, b.sums);
         try stageLayer(s, i, "mlp_{d}", &.{.{ .ptr = b.o, .cols = H }}, B, H, .bf16);
         try dynConv(s, b.o, b.dyn, l.mlp_base, b.h2, b.h, 1);
         try stageLayer(s, i, "conv_mlp_out_{d}", &.{.{ .ptr = b.h, .cols = H }}, B, H, .bf16);
@@ -955,8 +1018,8 @@ pub const Draft = struct {
                 }
             }
             if (!stale) {
-                try projRows(s, b.ctx, l.k, b.kcr, kvw, H, n);
-                try projRows(s, b.ctx, l.v, b.vc, kvw, H, n);
+                try projRows(s, b.ctx, l.k, b.kcr, kvw, H, n, b.sums);
+                try projRows(s, b.ctx, l.v, b.vc, kvw, H, n, b.sums);
                 try normRope(s, b.kcr, l.k_norm, b.kc, kvw, c.kv_heads, @intCast(at), n);
                 try ringPut(s, b.kc, b.vc, s.ringK(st, i), s.ringV(st, i), kvw, @intCast(at), n);
             }
@@ -1200,20 +1263,50 @@ fn projQ(s: *Draft, x: u64, q: Q, out: u64, rows: usize) !void {
     try lane.matmul(s.stream, x, w.k, rows, w, out, part);
 }
 
+/// An affine-4 projection for `rows` rows: the input's 64-value group sums (`tf_group_sums_rows`)
+/// into the shared scratch, then qmm_group's tile over the packed words (`cuda.qlinear`'s
+/// `Linear.decode`), which is the same arithmetic gemma4's assistant runs its whole projection set
+/// through.
+///
+/// The decode's own kernels tile sixteen rows, so a prefix chunk of `ctx_chunk` (64) rows is
+/// projected sixteen at a time: the sums of the whole chunk are computed once (a row's groups are a
+/// function of that row), and each tile reads its own sixteen rows of them — the layout
+/// `tf_group_sums_rows` writes is `[row, k / 64]`, so tile `t`'s sums start at
+/// `t * 16 * (k / 64)` floats. Chunking is exact, as it is for `dense`: every row of the output is
+/// the row's own dot, rounded once to bf16.
+fn projA4(s: *Draft, x: u64, q: cuda.qlinear.Affine4, sums: u64, out: u64, rows: usize) !void {
+    if (rows == 0) return;
+    const a4 = if (s.a4) |*a| a else return error.DrafterPrecisionMismatch;
+    const act = s.act orelse return error.DrafterPrecisionMismatch;
+    try act.groupSums(s.stream, x, q.k, sums, rows, q.k);
+    const lin: cuda.qlinear.Linear = .{ .affine4 = a4 };
+    var at: usize = 0;
+    while (at < rows) : (at += cuda.qlinear.Affine4Kernels.max_rows) {
+        const n = @min(cuda.qlinear.Affine4Kernels.max_rows, rows - at);
+        try lin.decode(s.stream, cuda.qlinear.Weight{ .affine4 = q }, .{
+            .x = x + at * q.k * 2,
+            .sums = sums + at * (q.k / 64) * 4,
+        }, out + at * q.n * 2, n);
+    }
+}
+
 /// One of the seven quantized groups' projections, over the block's rows at once: bf16 takes the row
-/// batch kernel, unchanged; fp8 takes the lane matmul.
-fn projBatch(s: *Draft, x: u64, l: Lin, out: u64, n: usize, k: usize, rows: usize) !void {
+/// batch kernel, unchanged; fp8 takes the lane matmul; affine4 takes the group sums and qmm_group's
+/// tile. `sums` is the round's group-sums scratch, read only by the affine4 arm.
+fn projBatch(s: *Draft, x: u64, l: Lin, out: u64, n: usize, k: usize, rows: usize, sums: u64) !void {
     switch (l) {
         .bf16 => |w| try denseBatch(s, x, w, out, n, k, rows),
         .fp8 => |q| try projQ(s, x, q, out, rows),
+        .affine4 => |q| try projA4(s, x, q, sums, out, rows),
     }
 }
 
 /// The same for the prefix's chunked rows, whose bf16 kernel is the per-row `dense`.
-fn projRows(s: *Draft, x: u64, l: Lin, out: u64, n: usize, k: usize, rows: usize) !void {
+fn projRows(s: *Draft, x: u64, l: Lin, out: u64, n: usize, k: usize, rows: usize, sums: u64) !void {
     switch (l) {
         .bf16 => |w| try dense(s, x, w, out, n, k, rows),
         .fp8 => |q| try projQ(s, x, q, out, rows),
+        .affine4 => |q| try projA4(s, x, q, sums, out, rows),
     }
 }
 
@@ -1348,41 +1441,64 @@ fn loadWeights(gpa: std.mem.Allocator, io: std.Io, s: *Draft, dir: []const u8) !
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer core.checkpoint.cache.close(&ck);
     // The precision, resolved before a byte is booked: the caller's word if it gave one, else what
-    // the checkpoint's own tensors say — and a checkpoint whose two halves disagree is refused here
+    // the checkpoint's own contents say — and a checkpoint whose halves disagree is refused here
     // rather than half-read (`DrafterPrecisionMismatch`), because a bf16 GEMM over e4m3 codes is a
     // round of noise that looks like a weak drafter.
+    //
+    // The affine4 arm is named by `affine4/manifest.json` and by nothing else: a 4-bit export keeps
+    // the drafter's bf16 rows beside its tiles, so the tensors' own dtypes cannot tell it from the
+    // as-published arm, and inferring it from anything softer (a missing `*_scale_inv`, a file next
+    // to a tensor) is how a half-written export would be read as a whole one.
+    const manifest = try readManifest(gpa, io, dir);
+    defer if (manifest) |m| m.deinit();
     const scales_present = ck.has("layers.0.mlp.down_proj.weight_scale_inv") or
         ck.has("model.layers.0.mlp.down_proj.weight_scale_inv");
-    // What the tensors say, then what the config claims, then what the caller asked for: the
-    // caller wins, an unstated config defers to the tensors, and any two of them disagreeing is a
-    // refusal rather than a guess.
-    const actual: Precision = if (scales_present) .fp8 else .bf16;
+    if (manifest != null and scales_present) {
+        std.log.err("drafter {s}: affine4/manifest.json beside fp8 `weight_scale_inv` tensors — two quantizations, one checkpoint", .{dir});
+        return error.DrafterPrecisionMismatch;
+    }
+    // What the checkpoint holds, then what the config claims, then what the caller asked for: the
+    // caller wins, an unstated config defers to the checkpoint, and any two of them disagreeing is
+    // a refusal rather than a guess.
+    const actual: Precision = if (manifest != null) .affine4 else if (scales_present) .fp8 else .bf16;
     const declared: ?Precision = if (s.c.declared) |d| switch (d) {
         .bf16 => .bf16,
         .fp8 => .fp8,
+        .affine4 => .affine4,
     } else null;
     if (declared) |d| if (d != actual) {
-        std.log.err("drafter {s}: config.json declares {s} weights, but its tensors are {s}", .{ dir, d.name(), actual.name() });
+        std.log.err("drafter {s}: config.json declares {s} weights, but its contents are {s}", .{ dir, d.name(), actual.name() });
         return error.DrafterPrecisionMismatch;
     };
     const p = s.want orelse declared orelse actual;
     if (p != actual) {
-        std.log.err("drafter {s}: --drafter-precision {s}, but its tensors are {s}", .{ dir, p.name(), actual.name() });
+        std.log.err("drafter {s}: --drafter-precision {s}, but its contents are {s}", .{ dir, p.name(), actual.name() });
         return error.DrafterPrecisionMismatch;
     }
     s.precision = p;
-    if (p == .fp8) {
-        s.lane = try cuda.qmmf.Lane.load(s.d, (try s.d.currentCapability()) / 10);
-        if (s.lane) |*lane| {
-            const part = qpartBytes(c, lane);
-            if (part > 0) s.qpart = try cuda.DeviceBuffer.alloc(s.d, part);
-        }
+    switch (p) {
+        .bf16 => {},
+        .fp8 => {
+            s.lane = try cuda.qmmf.Lane.load(s.d, (try s.d.currentCapability()) / 10);
+            if (s.lane) |*lane| {
+                const part = qpartBytes(c, lane);
+                if (part > 0) s.qpart = try cuda.DeviceBuffer.alloc(s.d, part);
+            }
+        },
+        .affine4 => try s.loadAffine4(),
     }
     const arena_bytes = switch (p) {
         .bf16 => contract.bytes(c),
         // plus the 256-byte alignment of each of the extra scale/image bookings
         .fp8 => contract.fp8Bytes(c) + (64 << 10),
+        .affine4 => contract.affine4Bytes(c) + (64 << 10),
     };
+    // The manifest's tensor table, hoisted out of the layer loop: `readManifest` admitted nothing
+    // but an object, and the arm is only affine4 when there is one.
+    const doc: ?std.json.ObjectMap = if (manifest) |m| switch (m.value) {
+        .object => |o| o,
+        else => null,
+    } else null;
     var w: Weights = .{ .arena = try cuda.DeviceBuffer.alloc(s.d, arena_bytes), .fc = 0, .hidden_norm = 0, .norm = 0, .hidden_proj = 0, .pred = 0, .succ = 0, .layers = &.{} };
     errdefer w.arena.free();
     w.layers = try gpa.alloc(Layer, c.layers);
@@ -1410,6 +1526,7 @@ fn loadWeights(gpa: std.mem.Allocator, io: std.Io, s: *Draft, dir: []const u8) !
                 lin[quantizedAt(k).?] = switch (p) {
                     .bf16 => .{ .bf16 = try w.take(&ck, e.name, e.shape) },
                     .fp8 => .{ .fp8 = try w.takeFp8(gpa, &ck, e.name, e.shape[0], e.shape[1]) },
+                    .affine4 => .{ .affine4 = try takeAffine4(s, &w, &ck, dir, doc orelse return error.Affine4Manifest, e.name, e.shape) },
                 };
                 continue;
             }
@@ -1437,6 +1554,152 @@ fn loadWeights(gpa: std.mem.Allocator, io: std.Io, s: *Draft, dir: []const u8) !
     // does not understand, which is worse to half-read than to refuse.
     if (ck.unused() != 0) return error.UnexpectedTensor;
     return w;
+}
+
+/// `<dir>/affine4/manifest.json`, parsed, or null when the file is absent: the marker that makes a
+/// checkpoint's seven quantized groups affine-4, and the table that says which tensors it tiles and
+/// at what shape.
+///
+/// `format` and `group` are checked here rather than per tensor: a manifest of another format, or
+/// of a group this engine's kernels do not tile (64 values a scale), is refused once, by name,
+/// instead of tiling 35 tensors into a layout nothing reads.
+fn readManifest(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !?std.json.Parsed(std.json.Value) {
+    const path = try std.fs.path.join(gpa, &.{ dir, "affine4", "manifest.json" });
+    defer gpa.free(path);
+    const text = std.Io.Dir.cwd().readFileAlloc(io, path, gpa, .limited(1 << 20)) catch |e| {
+        if (e == error.FileNotFound) return null;
+        return e;
+    };
+    defer gpa.free(text);
+    const parsed = try std.json.parseFromSlice(std.json.Value, gpa, text, .{});
+    errdefer parsed.deinit();
+    const o = switch (parsed.value) {
+        .object => |o| o,
+        else => {
+            std.log.err("affine4 drafter: {s}: a manifest, not a JSON value", .{path});
+            return error.Affine4Manifest;
+        },
+    };
+    const format = o.get("format") orelse {
+        std.log.err("affine4 drafter: {s}: no `format`", .{path});
+        return error.Affine4Manifest;
+    };
+    if (format != .string or !std.mem.eql(u8, format.string, "affine4")) {
+        std.log.err("affine4 drafter: {s}: `format` is not \"affine4\"", .{path});
+        return error.Affine4Manifest;
+    }
+    const group = o.get("group") orelse {
+        std.log.err("affine4 drafter: {s}: no `group`", .{path});
+        return error.Affine4Manifest;
+    };
+    if (group != .integer or group.integer != 64) {
+        std.log.err("affine4 drafter: {s}: `group` is not 64", .{path});
+        return error.Affine4Manifest;
+    }
+    return parsed;
+}
+
+/// One tensor as the manifest states it: the shapes of its three raw arrays and the name they are
+/// written under (the checkpoint's own, or the same under the `model.` prefix an export adds).
+const Entry = struct { name: []const u8, n: usize, k: usize };
+
+/// `name`'s manifest entry, matched as the checkpoint names it or with the `model.` prefix an export
+/// writes it with (`expectNamed`'s rule for the fp8 arm); null when the manifest does not name it.
+fn manifestEntry(doc: std.json.ObjectMap, name: []const u8) ?Entry {
+    const list = doc.get("tensors") orelse return null;
+    if (list != .array) return null;
+    var buf: [128]u8 = undefined;
+    const prefixed: ?[]const u8 = std.fmt.bufPrint(&buf, "model.{s}", .{name}) catch null;
+    for (list.array.items) |item| {
+        if (item != .object) continue;
+        const nv = item.object.get("name") orelse continue;
+        if (nv != .string) continue;
+        if (!std.mem.eql(u8, nv.string, name) and !(prefixed != null and std.mem.eql(u8, nv.string, prefixed.?))) continue;
+        const n = item.object.get("n") orelse return null;
+        const k = item.object.get("k") orelse return null;
+        if (n != .integer or k != .integer or n.integer <= 0 or k.integer <= 0) return null;
+        return .{ .name = nv.string, .n = @intCast(n.integer), .k = @intCast(k.integer) };
+    }
+    return null;
+}
+
+/// `<dir>/affine4/<name><suffix>`, whole, refused unless it is exactly `len` bytes: a file of
+/// another length is an export this loader would read past the end of, or short of.
+fn readTensorFile(s: *Draft, dir: []const u8, name: []const u8, suffix: []const u8, len: usize) ![]u8 {
+    const path = try std.fmt.allocPrint(s.gpa, "{s}/affine4/{s}{s}", .{ dir, name, suffix });
+    defer s.gpa.free(path);
+    // `.limited(len)` refuses a file of exactly `len` bytes (the reader is asked for one more), so the
+    // cap is one past the expected size and the exact-length check below is the real guard: a file
+    // this loader would read short of ends here, and one it would read past the end comes back len+1.
+    const raw = std.Io.Dir.cwd().readFileAlloc(s.io, path, s.gpa, .limited(len + 1)) catch |e| {
+        std.log.err("affine4 drafter: {s}: {s} (want {d} bytes)", .{ path, @errorName(e), len });
+        return e;
+    };
+    if (raw.len != len) {
+        std.log.err("affine4 drafter: {s}: {d} bytes, want {d}", .{ path, raw.len, len });
+        s.gpa.free(raw);
+        return error.Affine4FileSize;
+    }
+    return raw;
+}
+
+/// One 4-bit projection: the three raw little-endian arrays the exporter writes beside the
+/// checkpoint (`<name>.words.u32` in MLX order — eight nibbles a word, the low nibble the lowest
+/// input — then `<name>.scale.bf16` and `<name>.bias.bf16`, `n x k/64` row-major each), staged on
+/// the device and tiled there into `qlinear.Affine4`'s layout by `Affine4Kernels.pack`.
+///
+/// Only the tiles are booked in the weights' arena: the raw arrays are dead the moment `pack` lands,
+/// so they are allocations of their own, freed after the stream synchronises on that launch. That
+/// synchronise is the load's, not a round's — the tensors a round launches read nothing of them.
+///
+/// The manifest is the only source of the shapes, and it is checked against the contract's: a
+/// manifest naming another `n` or `k` than the checkpoint's own tensor is refused, so a stale
+/// `affine4/` directory cannot tile a projection at a width the round will not read.
+///
+/// The checkpoint's own bf16 rows for this projection stay in the folder — a 4-bit export keeps them
+/// for its own re-quantization — so they are marked `skip`ped rather than read: `loadWeights`'
+/// leftovers check must keep meaning "a tensor this loader did not understand".
+fn takeAffine4(s: *Draft, w: *Weights, ck: *core.Checkpoint, dir: []const u8, doc: std.json.ObjectMap, name: []const u8, shape: []const usize) !cuda.qlinear.Affine4 {
+    if (shape.len != 2) return error.UnexpectedTensor;
+    try ck.skip(name);
+    const e = manifestEntry(doc, name) orelse {
+        std.log.err("affine4 drafter: {s}: affine4/manifest.json does not name it", .{name});
+        return error.Affine4Manifest;
+    };
+    if (e.n != shape[0] or e.k != shape[1]) {
+        std.log.err("affine4 drafter: {s}: manifest [{d}, {d}], the contract [{d}, {d}]", .{ name, e.n, e.k, shape[0], shape[1] });
+        return error.Affine4Manifest;
+    }
+    // the tiles' own arithmetic: four bits a weight is `k / 8` words a row, a scale the 64-value group
+    if (e.k % 64 != 0) {
+        std.log.err("affine4 drafter: {s}: k = {d} is not a whole number of 64-value groups", .{ name, e.k });
+        return error.Affine4Manifest;
+    }
+    const l = cuda.qlinear.Affine4.layout(e.n, e.k);
+    const words = try readTensorFile(s, dir, e.name, ".words.u32", e.n * e.k / 2);
+    defer s.gpa.free(words);
+    const scales = try readTensorFile(s, dir, e.name, ".scale.bf16", e.n * (e.k / 64) * 2);
+    defer s.gpa.free(scales);
+    const biases = try readTensorFile(s, dir, e.name, ".bias.bf16", e.n * (e.k / 64) * 2);
+    defer s.gpa.free(biases);
+    var raw_w = try cuda.DeviceBuffer.fromHost(s.d, words);
+    defer raw_w.free();
+    var raw_s = try cuda.DeviceBuffer.fromHost(s.d, scales);
+    defer raw_s.free();
+    var raw_b = try cuda.DeviceBuffer.fromHost(s.d, biases);
+    defer raw_b.free();
+    const q: cuda.qlinear.Affine4 = .{
+        .w = w.arena.ptr + try w.book(l.words),
+        .s = w.arena.ptr + try w.book(l.scales),
+        .b = w.arena.ptr + try w.book(l.scales),
+        .n = e.n,
+        .k = e.k,
+        .npad = l.npad,
+    };
+    if (s.a4) |*a| try a.pack(s.stream, raw_w.ptr, raw_s.ptr, raw_b.ptr, q) else return error.DrafterPrecisionMismatch;
+    // the raw arrays are freed on return: `pack` reads them on this stream, so the load waits for it
+    try s.stream.synchronize();
+    return q;
 }
 
 /// A quantized tensor's slot in the seven-layer `lin` array: q, k, v, o, gate, up, down.
@@ -1474,6 +1737,13 @@ fn bytes(factors: anytype) !usize {
     var value: usize = 1;
     inline for (factors) |factor| value = try std.math.mul(usize, value, factor);
     return value;
+}
+
+/// The widest input any of the seven quantized projections reads: q/k/v, gate and up are `hidden`
+/// wide, o is `qWidth`, down is `intermediate`. A projection's 64-group sums are `k / 64` fp32 a
+/// row, so this is what one sums buffer must hold a row of — whichever of the seven runs.
+fn sumsWidth(c: Config) usize {
+    return @max(c.hidden, @max(c.qWidth(), c.intermediate));
 }
 
 /// The block's scratch, byte for byte: every row the round writes, 256-byte aligned.
@@ -1517,6 +1787,9 @@ pub fn place(c: Config, base: u64, out: ?*Bufs) !usize {
         .{ "prop", try bytes(.{ R, 4 }) },
         // `Fault`: flag, kind, position, index
         .{ "err", try bytes(.{ 4, 4 }) },
+        // the affine4 arm's 64-value group sums, one row of `k / 64` fp32 a row of input, sized for
+        // the widest input any of the seven projections reads and reused a projection at a time
+        .{ "sums", try bytes(.{ S, sumsWidth(c) / 64, 4 }) },
         // the head's first pass: one `topk` list a tile a row, `{f32 logit, u32 id}` together, in
         // `tf_fxd2_headtile`'s tile-major order
         .{ "part", try bytes(.{ headTiles(c), R, c.topk, 8 }) },

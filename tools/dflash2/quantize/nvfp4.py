@@ -170,6 +170,50 @@ def affine4_dequant(codes: np.ndarray, bias: np.ndarray, scale: np.ndarray) -> n
     return (np.asarray(codes, dtype=np.float32) * scale[:, None] + bias[:, None]).astype(np.float32)
 
 
+def affine4_code_of(w: np.ndarray, bias: np.ndarray, scale: np.ndarray,
+                    group: int = AFFINE4_GROUP) -> np.ndarray:
+    """The codes `encode_affine4` would round to, kept as uint8: the packed form of a fitted weight.
+
+    `bias`/`scale` are in the packer's flat group-major order (group g's n rows at [g*n : g*n+n]), the
+    same order `encode_affine4` takes. This exists so an artifact can carry codes, not a dequantised
+    matrix that a second quantizer would have to guess its way back out of.
+    """
+    w = np.asarray(w, dtype=np.float32)
+    bias = np.asarray(bias, dtype=np.float32).ravel()
+    scale = np.asarray(scale, dtype=np.float32).ravel()
+    nb = w.shape[1] // group
+    if bias.size != w.shape[0] * nb:
+        raise ValueError(f"{w.shape}: expected {w.shape[0]*nb} groups, got {bias.size}")
+    code = np.empty(w.shape, dtype=np.uint8)
+    for gi, g0 in enumerate(range(0, w.shape[1], group)):
+        sl = slice(gi * w.shape[0], (gi + 1) * w.shape[0])
+        blk = w[:, g0:g0 + group]
+        code[:, g0:g0 + group] = affine4_codes(blk, bias[sl], scale[sl]).astype(np.uint8)
+    return code
+
+
+def affine4_rtn_params(w: np.ndarray, group: int = AFFINE4_GROUP
+                       ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Round-to-nearest in the engine's recipe: (codes uint8, bias, scale) per group, unchanged by fitting.
+
+    `bias`/`scale` come back group-major and flat, exactly as `encode_affine4` wants them; transpose to
+    [n][groups] for an artifact that stores one scalar pair per (row, group).
+    """
+    w = np.asarray(w, dtype=np.float32)
+    if w.shape[-1] % group:
+        raise ValueError(f"{w.shape}: last dim is not a multiple of group {group}")
+    n, k = w.shape
+    nb = k // group
+    bias = np.empty(nb * n, dtype=np.float32)
+    scale = np.empty(nb * n, dtype=np.float32)
+    for gi, g0 in enumerate(range(0, k, group)):
+        blk = w[:, g0:g0 + group]
+        b, s = affine4_recipe(blk.min(axis=1), blk.max(axis=1))
+        sl = slice(gi * n, (gi + 1) * n)
+        bias[sl], scale[sl] = b, s
+    return affine4_code_of(w, bias, scale, group), bias, scale
+
+
 def quantize_affine4_rtn(w: np.ndarray, group: int = AFFINE4_GROUP) -> tuple[np.ndarray, float]:
     """Round-to-nearest affine4 for a whole [n, k] weight, engine recipe per group."""
     w = np.asarray(w, dtype=np.float32)
@@ -203,26 +247,71 @@ def encode_affine4(w: np.ndarray, bias: np.ndarray, scale: np.ndarray,
     return out
 
 
-def affine4_pack(w: np.ndarray, bias: np.ndarray, scale: np.ndarray,
-                 group: int = AFFINE4_GROUP) -> dict:
-    """The bytes an affine4 loader reads: 8 low-bit-first words per group plus bf16 scale and bias.
+def affine4_bf16_bits(x: np.ndarray) -> np.ndarray:
+    """fp32 to bf16 bits, round to nearest, ties to even: core/bf16_round.zig's `bits()`.
 
-    Not used by the fitter (it scores dequantised weights); it exists so a checkpoint produced here
-    can be handed to a loader without anyone re-deriving the layout.
+    The engine writes a group's scale and bias through `bf16of` = `bf16_round.bits`
+    (affine4_host.zig:12, 57-58). A packer that truncated the low 16 bits instead would hand the
+    loader a scale one bf16 step low wherever the 17th bit was set, so the artifact would dequantise
+    to values nobody scored. NaN keeps NaN (payload bit 0x40 set, as the Zig does).
     """
-    import struct
-    w = np.asarray(w, dtype=np.float32)
-    n, k = w.shape
-    nb = k // group
-    codes = np.empty((n, k), dtype=np.uint8)
-    for gi, g0 in enumerate(range(0, k, group)):
-        sl = slice(gi * n, (gi + 1) * n)
-        codes[:, g0:g0 + group] = affine4_codes(w[:, g0:g0 + group], bias[sl], scale[sl]).astype(np.uint8)
-    words = np.zeros(nb * n * group // 8, dtype=np.uint32)
-    flat = codes.reshape(-1, 8)
+    u = np.ascontiguousarray(np.asarray(x, dtype=np.float32)).view(np.uint32)
+    nan = ((u & np.uint32(0x7F800000)) == np.uint32(0x7F800000)) & ((u & np.uint32(0x007FFFFF)) != 0)
+    with np.errstate(over="ignore"):
+        r = (u + np.uint32(0x7FFF) + ((u >> np.uint32(16)) & np.uint32(1))) >> np.uint32(16)
+    r = np.where(nan, (u >> np.uint32(16)) | np.uint32(0x40), r)
+    return r.astype(np.uint16).reshape(np.shape(x))
+
+
+def affine4_words(codes: np.ndarray) -> np.ndarray:
+    """MLX word order for a [n, k] uint8 code matrix: 8 codes a u32, lowest input index in the low nibble.
+
+    `dequantize` reads code i as `(words[i / 8] >> 4 * (i % 8)) & 0xf` (affine4_host.zig:17) and
+    `quantizeMlx` builds the same word as `words[i / 8] |= q << 4 * (i % 8)` (line 62), so a row's
+    first eight codes fill one word from the bottom up and every word belongs to exactly one row.
+    """
+    codes = np.asarray(codes)
+    if codes.dtype != np.uint8:
+        raise TypeError(f"codes must be uint8, got {codes.dtype}")
+    n, k = codes.shape
+    if k % 8:
+        raise ValueError(f"{codes.shape}: last dim is not a multiple of 8")
+    flat = np.ascontiguousarray(codes).reshape(-1, 8)
+    words = np.zeros(flat.shape[0], dtype=np.uint32)
     for i in range(8):
         words |= flat[:, i].astype(np.uint32) << np.uint32(4 * i)
-    def bf16(x: np.ndarray) -> np.ndarray:
-        return (np.asarray(x, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16)
-    return {"words": words.reshape(n, k // 8), "scales": bf16(scale).reshape(n, nb),
-            "biases": bf16(bias).reshape(n, nb), "group": group}
+    return words.reshape(n, k // 8)
+
+
+def affine4_pack(codes_or_w, bias: np.ndarray, scale: np.ndarray, group: int = AFFINE4_GROUP) -> dict:
+    """The arrays an affine4 loader reads: `words` [n][k/8] u32, `scales`/`biases` [n][k/group] bf16 bits.
+
+    `codes_or_w` is either the fitted uint8 code matrix (the served artifact: no rounding happens a
+    second time) or the fp32 weight, in which case the codes are the ones `encode_affine4` would use.
+
+    `bias`/`scale` may arrive in either of the two orders this file already uses: flat group-major
+    (group g's n rows at [g*n : g*n+n], what `encode_affine4` takes) or 2-D. They come back row-major
+    [n][k/group], which is the order `dequantize` indexes: value (row, col) uses
+    `scales[(row*k + col) / group]` (affine4_host.zig:18).
+    """
+    a = np.asarray(codes_or_w)
+    if a.dtype == np.uint8:
+        codes = a
+    else:
+        w = np.asarray(a, dtype=np.float32)
+        codes = affine4_code_of(w, bias, scale, group)
+    n, k = codes.shape
+    nb = k // group
+    if k % group:
+        raise ValueError(f"{codes.shape}: last dim is not a multiple of group {group}")
+    def row_major(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x, dtype=np.float32)
+        if x.size != n * nb:
+            raise ValueError(f"{x.shape}: expected {n * nb} groups for {codes.shape} at group {group}")
+        if x.ndim == 2 and x.shape == (n, nb):
+            return x
+        if x.ndim == 2 and x.shape == (nb, n):
+            return x.T
+        return x.reshape(nb, n).T
+    return {"words": affine4_words(codes), "scales": affine4_bf16_bits(row_major(scale)).reshape(n, nb),
+            "biases": affine4_bf16_bits(row_major(bias)).reshape(n, nb), "group": group}

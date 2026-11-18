@@ -117,6 +117,30 @@ pub fn fp8Bytes(d: Draft) usize {
     return total;
 }
 
+/// The tiles an affine-4 projection `[n, k]` takes on the device: MLX words padded to 128 output
+/// rows at four bits a weight, then a bf16 scale and bias the 64-value group (`Affine4.layout`).
+pub fn affine4LinearBytes(n: usize, k: usize) usize {
+    const npad = (n + 127) / 128 * 128;
+    return npad * k / 2 + 2 * (k / 64 * npad * 2);
+}
+
+/// The weight bytes an affine4 checkpoint's contract accounts for: `bytes` with each quantized
+/// projection's bf16 rows replaced by its words, scales and biases. The raw MLX arrays the loader
+/// reads to tile them are not booked here — they are dead the moment `Affine4Kernels.pack` lands.
+pub fn affine4Bytes(d: Draft) usize {
+    var total: usize = bytes(d);
+    var buf: [64]u8 = undefined;
+    var shape: [4]usize = undefined;
+    for (0..d.layers) |i| for (0..per_layer) |k| {
+        if (!quantized(k)) continue;
+        const t = layerTensor(d, i, k, &buf, &shape) catch continue;
+        const n = t.shape[0];
+        const cols = t.shape[1];
+        total = total - n * cols * 2 + affine4LinearBytes(n, cols);
+    };
+    return total;
+}
+
 /// The `k`-th tensor of layer `i` (`0 .. per_layer`), built into `buf` for its name and `shape` for its extents.
 pub fn layerTensor(d: Draft, i: usize, k: usize, buf: []u8, shape: *[4]usize) !Tensor {
     const heads, const hd, const hidden = .{ d.heads, d.head_dim, d.hidden };

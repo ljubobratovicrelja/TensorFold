@@ -23,12 +23,13 @@ const tile_rows: usize = 64;
 
 const usage =
     \\usage: tensorfold draft-check --drafter DIR --target DIR --fixture DIR --out DIR [--repeat N]
-    \\                              [--drafter-precision bf16|fp8]
+    \\                              [--drafter-precision bf16|fp8|affine4]
     \\
     \\  --drafter DIR   the DFlash2 drafter checkpoint
     \\  --drafter-precision P
-    \\                  the drafter's weight precision: bf16 (as published) or fp8 (weight-only, W8A16).
-    \\                  Omitted, the checkpoint's own tensors decide, and a checkpoint whose declared
+    \\                  the drafter's weight precision: bf16 (as published), fp8 (weight-only, W8A16),
+    \\                  or affine4 (4-bit MLX codes, the arm `affine4/manifest.json` names).
+    \\                  Omitted, the checkpoint's own contents decide, and a checkpoint whose declared
     \\                  precision and contents disagree is refused.
     \\  --target DIR    the target checkpoint; only its embed table and head are read
     \\  --fixture DIR   a pre-collected ring (manifest.json, ids.bin, ring.bin)
