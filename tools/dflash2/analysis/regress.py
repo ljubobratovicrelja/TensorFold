@@ -45,7 +45,10 @@ HERE = Path(__file__).resolve().parent
 WT = HERE.parents[2]
 ALIGN = HERE / "align_bf16"
 RUNNER = ALIGN / "run_engine_dflash2.sh"
-BIN = WT / "zig-out" / "native" / "bin" / "tensorfold-native"
+sys.path.insert(0, str(HERE.parent))  # tools/dflash2, for engine.py
+import engine  # noqa: E402
+
+BIN = engine.BIN
 HF = Path.home() / ".cache" / "huggingface" / "hub"
 TARGET = next(iter(sorted((HF / "models--nvidia--Qwen3.8-Flash-Next-FP4-Local" / "snapshots").glob("*"))), None)
 DRAFTER = next(iter(sorted((HF / "models--incoai--Qwen3.8-Flash-Next-DFlash2" / "snapshots").glob("*"))), None)

@@ -32,11 +32,14 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import forward as F  # noqa: E402
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))  # tools/dflash2, for engine.py
+import engine  # noqa: E402
+
 HOME = Path(os.path.expanduser("~"))
 HF = HOME / ".cache/huggingface/hub"
 DEFAULT_DRAFTER = HF / "models--incoai--Qwen3.8-Flash-Next-DFlash2/snapshots/a22a1744e85c17364dcc54a6a420af7135d4c7f6"
 DEFAULT_TARGET = HF / "models--nvidia--Qwen3.8-Flash-Next-FP4-Local/snapshots/b9ce18a6887e18c089fdea8509a33e63429a3300"
-DEFAULT_BINARY = Path(__file__).resolve().parents[3] / "zig-out/native/bin/tensorfold-native"
+DEFAULT_BINARY = engine.BIN
 HARVEST = Path("/tmp/harv/out")
 
 STAGE_NAMES = (

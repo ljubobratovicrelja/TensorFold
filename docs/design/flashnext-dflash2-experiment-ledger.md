@@ -177,5 +177,9 @@ rescore recovers it. FP8, by contrast, is effectively complete at K=64.
   change.** The fp8 arm moves 64 of 112 slots and is fine; the tensor-core fuse moved 7 of 16 and was refused.
 - **Quote the width** with any per-draft rate (`Y/rounds`), and the acceptance length with any per-slot rate.
 - The **cold round is not the served round**; a single-position fixture measures the wrong regime.
+- **The measurement is only as good as the binary.** `tools/dflash2/engine.py` replays a contract round
+  (fixture `analysis/align_bf16/fixture/window` → proposals `{20, 11, 18, 15, 1, 314, 437}`, position
+  2047, anchor 77491) and warns when `zig/` is newer than the binary. If the contract moves on purpose,
+  update `CONTRACT` here in the same commit as the number it changes.
 - Vendor ablations are properties of the vendor's target and suite — ablate a component in *both* the
   engine and the reference before spending kernel time on it.

@@ -10,7 +10,19 @@
 | `train/` | the training-side forward and parity check. |
 | `run/`, `runs/` | data: benchmark output and captured stage runs. |
 
-Nothing at this level is code: the directory holds this README and the five subdirectories.
+Two exceptions at this level, both about the boundary rather than about a measurement:
+
+- `engine.py` — the **only** place that runs `tensorfold-native`. It resolves the binary and the
+  checkpoints, replays a contract round on the in-repo fixture (`analysis/align_bf16/fixture/window`,
+  expected proposals `{20, 11, 18, 15, 1, 314, 437}` at position 2047, anchor 77491) and warns when
+  any `zig/` source is newer than the binary, i.e. when the tree you are measuring is not the binary
+  you built. `python3 tools/dflash2/engine.py --verify` prints the whole state.
+- `check_boundary.py` — static guard: code only in the subpackages, no Python file outside
+  `engine.py` names the binary, nothing imports the Zig side. Run it before committing tool changes;
+  it takes 0.2 s and exits non-zero on a violation.
+
+`harness/` and `analysis/` scripts reach the engine with
+`sys.path.insert(0, str(Path(__file__).resolve().parents[...])); import engine`.
 
 ## Reference port
 
