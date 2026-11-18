@@ -183,3 +183,23 @@ Stage medians over the served reps, and the same stage in the cold rep:
 1. Draft vocabulary / head bytes (30.5%).
 2. `fc_ctx` weight-read efficiency (18.2%).
 3. Layer block projections (mlp 9.8%, qkv/attn_proj the rest).
+
+### The head, split (2026-11-18)
+
+`TF_FLASHNEXT_HEAD_SPLIT=1` times the head's three launches apart. Served rounds, 2048-row window:
+
+    GEMM (7 rows x 248,320 x 2,560)   5.43 ms   63% of the head   <- streams 1271.4 MB at ~234 GB/s
+    top-k (tf_fxd2_topf32)            2.97 ms   35%               <- head_tile 1024
+    merge (tf_fxd2_head_merge)        0.19 ms    2%
+
+So "the head is the GEMM" is false: a third of it was the top-k, which is oversubscribed by
+construction — `head_tile = 1024` with 256 threads means each thread inserts 4 values, then a
+warp leader merges 512 entries **serially**, then thread 0 merges 128, three barriers a row.
+
+`head_tile = 8192` (31 tiles instead of 243) removes most of that: **top-k 2.97 -> 1.39 ms**, GEMM
+unchanged, capture bit-identical, cold round 439.47 -> 427.08 ms. What is left is still the serial
+warp-leader merge; a shuffle-based top-16 merge is the next step, worth ~1 ms a round.
+
+The GEMM's 5.43 ms is ~234 GB/s over 1271.4 MB — already near this box's rate, so the only way down
+is fewer bytes: an fp8 (or lower) head for the ranking pass, rescoring the top-N in bf16. That is
+an acceptance risk, not just a speed change, and it needs the tap-replay harness to clear it.

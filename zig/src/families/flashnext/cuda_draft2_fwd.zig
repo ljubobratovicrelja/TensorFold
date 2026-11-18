@@ -91,7 +91,7 @@ pub const ctx_chunk = 64;
 /// twenty SMs can keep in flight (93 ms, against 5-15 ms of the bytes at a full grid). Tiling the
 /// vocabulary turns the scan into `tiles * rows` CTAs (1,701 at the served shape, 5 MiB of `lm_head`
 /// each) and costs one partial top-k a tile that the second pass merges.
-pub const head_tile = 1024;
+pub const head_tile = 8192;
 
 /// The head's first pass's CTAs a row: the tiles that cover the vocabulary, the last one fewer
 /// entries.
@@ -1087,11 +1087,24 @@ fn headTopk(s: *Draft, x: u64, rows: usize, part: u64, ids: u64, val: u64, lg: u
     // the dot on glm_mm's tensor cores: [rows, H] x [V, H]^T into fp32 logits — one BM=16 block
     // (rows <= 7 fit it) streaming the tiled head once — then the slice top-k over those logits
     // and the merge, which is exactly the two thirds the old fused tile pass split into
+    // TF_FLASHNEXT_HEAD_SPLIT=1: the head's three launches timed apart, because the whole stage is
+    // 30% of a served round and "the head is the GEMM" has to be a measurement, not a reading.
+    const split = std.c.getenv("TF_FLASHNEXT_HEAD_SPLIT") != null;
+    var t_gemm: i128 = 0;
+    var t_topk: i128 = 0;
+    if (split) try s.stream.synchronize();
+    var t0: i128 = if (split) nowNs(s.io) else 0;
     try launch(s, s.m16, .{ @intCast((c.vocab + 63) / 64), 1, 1 }, 128, m16Shared(), .{
         x,                      @as(c_longlong, @intCast(c.hidden)), s.headw.ptr, @as(u64, 0), lg, @as(u64, 0),
         @as(c_int, 1),          @as(c_int, @intCast(rows)),          @as(c_int, @intCast(c.vocab)),
         @as(c_int, @intCast(c.hidden)), @as(c_int, 1),
     });
+    if (split) {
+        try s.stream.synchronize();
+        const t1 = nowNs(s.io);
+        t_gemm = t1 - t0;
+        t0 = t1;
+    }
     // one candidate list a thread plus one a warp: `tf_fxd2_topf32` publishes every thread's list
     const slice_shared: usize = (threads + threads / 32) * c.topk * 8;
     // TF_FLASHNEXT_LG_DUMP=<dir>: the head's input rows and its fp32 logits for row 0, so the GEMM
@@ -1110,13 +1123,33 @@ fn headTopk(s: *Draft, x: u64, rows: usize, part: u64, ids: u64, val: u64, lg: u
         try cuda.memory.download(s.d, lg, lb);
         try std.Io.Dir.cwd().writeFile(s.io, .{ .sub_path = try std.fmt.bufPrint(&nb2, "{s}/logits_r0.f32", .{dir}), .data = lb });
     }
+    if (split) {
+        try s.stream.synchronize();
+        t0 = nowNs(s.io);
+    }
     try launch(s, s.fns.topf32, .{ @intCast(tiles), 1, 1 }, threads, @intCast(slice_shared), .{
         lg, part, ci(c.vocab), ci(c.topk), ci(rows), ci(head_tile),
     });
+    if (split) {
+        try s.stream.synchronize();
+        const t1 = nowNs(s.io);
+        t_topk = t1 - t0;
+        t0 = t1;
+    }
     const merge_shared = @as(usize, threads) * c.topk * 8;
     try launch(s, s.fns.head_merge, .{ @intCast(rows), 1, 1 }, threads, @intCast(merge_shared), .{
         part, ids, val, ci(tiles), ci(rows), ci(c.topk),
     });
+    if (split) {
+        try s.stream.synchronize();
+        const t1 = nowNs(s.io);
+        std.log.info("headsplit: gemm {d:.3} ms, topk {d:.3} ms, merge {d:.3} ms, bytes {d:.1} MB", .{
+            @as(f64, @floatFromInt(t_gemm)) / 1e6,
+            @as(f64, @floatFromInt(t_topk)) / 1e6,
+            @as(f64, @floatFromInt(t1 - t0)) / 1e6,
+            @as(f64, @floatFromInt(c.vocab * c.hidden * 2)) / 1e6,
+        });
+    }
 }
 
 /// tf_fxd2_select(X, WPROJ, PRED, SUCC, CAND, UNARY, OUT, ERR, H, rank, topk, rows, vocab, anchor):
