@@ -60,6 +60,18 @@ def category(stage):
     return "other", "#bdc3c7"
 
 
+def short(stage):
+    """A tick label that fits: the waterfall's x axis has ~50 stages and no room for full names."""
+    for prefix, abbrev in (("conv_attn_in_", "cai"), ("conv_attn_out_", "cao"),
+                           ("conv_mlp_in_", "cmi"), ("conv_mlp_out_", "cmo"),
+                           ("attn_proj_", "ap"), ("block_hidden_", "bh"),
+                           ("logits_top16_ids", "head"), ("final_norm_block", "fnorm"),
+                           ("block_residual", "resid"), ("context_fuse", "fuse")):
+        if stage.startswith(prefix):
+            return abbrev + stage[len(prefix):]
+    return stage
+
+
 def load(capture):
     """[(rep_index, round_dict, {stage: ms})], in rep order, from a root or a single stages.json."""
     if os.path.isfile(capture):
@@ -124,6 +136,7 @@ def panel_categories(ax, served, cold):
     ax.barh([y + 0.20 for y in ys], sv, height=0.38,
             color=[served_r[c][1] for c in cats], edgecolor="black", linewidth=0.4,
             label="served round")
+    cv = []
     if cold:
         cv = [cold_r.get(c, (0.0, ""))[0] for c in cats]
         ax.barh([y - 0.20 for y in ys], cv, height=0.38, color="none",
@@ -139,7 +152,10 @@ def panel_categories(ax, served, cold):
     ax.set_yticks(list(ys))
     ax.set_yticklabels([f"{c}  ({100 * served_r[c][0] / total:.1f}%)" for c in cats], fontsize=9)
     ax.set_xscale("log")
-    ax.set_xlabel("median ms (log scale — the cold round is up to 60x the served one)")
+    # the multiplier in the label is measured, not asserted: it moved 60x -> 268x when the context
+    # fuse stopped re-reading its weight per row, and a stale "up to 60x" would be a lie in a figure
+    mult = max((c / s for s, c in zip(sv, cv) if s > 0.01), default=1.0) if cold else 1.0
+    ax.set_xlabel(f"median ms (log scale — the cold round is up to {mult:.0f}x the served one)")
     ax.set_title("B · what the round is made of", loc="left", fontsize=11)
     ax.legend(fontsize=8, loc="lower right")
     ax.grid(axis="x", alpha=0.25, which="both")
@@ -167,10 +183,10 @@ def panel_waterfall(ax, served, order):
                     color="#7b241c", ha="right" if i > len(seq) * 0.6 else "left",
                     arrowprops=dict(arrowstyle="-", color="#c0392b", linewidth=0.6,
                                     shrinkA=0, shrinkB=2))
-    step = max(1, len(seq) // 9)
+    step = max(1, len(seq) // 6)
     ax.set_xticks(range(0, len(seq), step))
-    ax.set_xticklabels([seq[i] for i in range(0, len(seq), step)],
-                       rotation=45, ha="right", fontsize=6.8, family="monospace")
+    ax.set_xticklabels([short(seq[i]) for i in range(0, len(seq), step)],
+                       rotation=38, ha="right", fontsize=7.2, family="monospace")
     ax.set_ylim(0, cum[-1] * 1.18)
     ax.set_ylabel("cumulative ms")
     ax.set_title(f"C · the round in execution order — {cum[-1]:.2f} ms total", loc="left", fontsize=11)
