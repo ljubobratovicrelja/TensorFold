@@ -79,73 +79,34 @@ def fp8_module():
     return module
 
 
-# -- NVFP4 arithmetic (ModelOpt layout: e2m1 codes, group-16 e4m3 block scales, fp32 global) ----
+# -- NVFP4 arithmetic: shared with quantize/nvfp4.py, not reimplemented here -----------------
 
 
-E2M1_MAX = 6.0  # the largest magnitude e2m1 represents
-E2M1_GRID = np.array([0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0], dtype=np.float32)
-FP4_GROUP = 16
+def nvfp4_module():
+    """`quantize/nvfp4.py`, loaded by path: the one copy of the NVFP4 rounders, the FP8 module's sibling.
 
-
-def e4m3_round(x: np.ndarray) -> np.ndarray:
-    """Round non-negative float32 values to the e4m3 grid (3-bit mantissa, max 448), ties to even.
-
-    The block scale of an NVFP4 tensor is itself e4m3, so the dequantised weight carries that
-    rounding on top of the 4-bit code; ignoring it would overstate fidelity.
+    The arithmetic used to live in this file; it moved so the body fitter cannot drift from the head
+    measurement. Names and signatures are the ones this tool has always used.
     """
-    a = np.maximum(np.asarray(x, dtype=np.float32), 0.0)
-    a = np.ascontiguousarray(np.minimum(a, E4M3_MAX))
-    u = a.view(np.uint32)
-    exp = ((u >> 23) & 0xFF).astype(np.int32)
-    mant = (u & 0x7FFFFF).astype(np.int32)
-    m3 = mant >> 20
-    rem = mant & 0xFFFFF
-    half = 0x80000
-    up = (rem > half) | ((rem == half) & ((m3 & 1) == 1))
-    m3 = m3 + up.astype(np.int32)
-    carry = m3 >> 3
-    m3 = m3 & 7
-    exp_out = exp + carry - 127 + 7
-    val = (1.0 + m3.astype(np.float32) / 8.0) * np.exp2((exp_out - 7).astype(np.float32))
-    # below 2^-6 e4m3 is subnormal with a 2^-9 step; above the max finite it saturates
-    tiny = np.round(a / 2.0**-9) * 2.0**-9
-    val = np.where(exp_out < 1, tiny, val)
-    val = np.where((exp_out > 15) | ((exp_out == 15) & (m3 > 6)), E4M3_MAX, val)
-    return np.minimum(np.maximum(val, 0.0), E4M3_MAX).astype(np.float32)
+    path = Path(__file__).resolve().parent.parent / "quantize" / "nvfp4.py"
+    if not path.is_file():
+        raise SystemExit(f"missing {path}: the NVFP4 arithmetic lives there and this tool imports it")
+    spec = importlib.util.spec_from_file_location("nvfp4_primitives", path)
+    if spec is None or spec.loader is None:
+        raise SystemExit(f"{path}: not importable")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
-def e2m1_round(t: np.ndarray) -> np.ndarray:
-    """Round float32 values onto the e2m1 grid {0, .5, 1, 1.5, 2, 3, 4, 6} signed, ties to even.
-
-    A tie is resolved to the candidate with the even index on the magnitude grid, which is the
-    round-half-to-even convention of the hardware convert; it moves a vanishing fraction of codes.
-    """
-    a = np.abs(np.asarray(t, dtype=np.float32))
-    idx = np.clip(np.searchsorted(E2M1_GRID, a, side="left"), 1, E2M1_GRID.size - 1)
-    lo = E2M1_GRID[idx - 1]
-    hi = E2M1_GRID[idx]
-    mid = (lo + hi) * 0.5
-    take_hi = (a > mid) | ((a == mid) & ((idx % 2) == 0))
-    mag = np.where(take_hi, hi, lo)
-    return np.copysign(mag, np.asarray(t, dtype=np.float32)).astype(np.float32)
-
-
-def quantize_nvfp4(w: np.ndarray, gs: np.ndarray | float, group: int = FP4_GROUP) -> tuple[np.ndarray, float]:
-    """Weight-only NVFP4 for one block of head rows: returns the dequantised weights and rel-L2.
-
-    `gs` is the per-tensor multiplier, 448 * 6 / amax(head), computed once over the whole tensor the
-    way ModelOpt does -- a per-chunk global would flatter the chunk that happens to be largest.
-    """
-    ws = np.asarray(w, dtype=np.float32) * np.float32(gs)
-    blocks = ws.reshape(-1, group)
-    bamax = np.max(np.abs(blocks), axis=1)
-    scale = e4m3_round(np.maximum(bamax / E2M1_MAX, 1e-12))
-    scale = np.where(scale <= 0.0, 1e-12, scale)
-    code = e2m1_round(blocks / scale[:, None])
-    deq = (code * scale[:, None] / np.float32(gs)).reshape(ws.shape)
-    err = float(np.sum((deq.astype(np.float64) - w.astype(np.float64)) ** 2))
-    ref = float(np.sum(w.astype(np.float64) ** 2))
-    return deq.astype(np.float32), float(np.sqrt(err / ref)) if ref > 0 else 0.0
+NV = nvfp4_module()
+E4M3_MAX = NV.E4M3_MAX
+E2M1_MAX = NV.E2M1_MAX
+E2M1_GRID = NV.E2M1_GRID
+FP4_GROUP = NV.FP4_GROUP
+e4m3_round = NV.e4m3_round
+e2m1_round = NV.e2m1_round
+quantize_nvfp4 = NV.quantize_nvfp4
 
 
 # -- checkpoint, header-only ----------------------------------------------------------------

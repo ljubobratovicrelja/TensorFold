@@ -183,3 +183,34 @@ rescore recovers it. FP8, by contrast, is effectively complete at K=64.
   update `CONTRACT` here in the same commit as the number it changes.
 - Vendor ablations are properties of the vendor's target and suite — ablate a component in *both* the
   engine and the reference before spending kernel time on it.
+
+## 9. Weight-only 4-bit body: the closed-form fit, measured (2026-11-18)
+
+Tools: `tools/dflash2/quantize/nvfp4.py` (format primitives, shared with `analysis/head_fidelity.py`) and
+`tools/dflash2/quantize/nvfp4_body.py` (`collect` → `fit` → `eval`). Fit is numpy on CPU; no gradients,
+no corpus.
+
+**Calibration is a handfull of real positions, not a corpus.** 140 positions × 8 block rows = 1,120 rows
+taken from one harvested 4,240-token chunk. Harvest cost: 2.2 s at 1,965 tok/s, 12.2 KB/token of ring.
+Error is flat from ~32 rows, so this is not a data-limited fit.
+
+| stage | mean output rel-L2 | recall@16 | set-exact | top-1 | mean rank | foreign | identical proposals |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| bf16 body | — | 1.000 | 1.000 | 1.000 | — | 0 | 140/140 |
+| NVFP4 RTN | 7.54% | 0.8774 | 0.051 | 0.895 | 9.55 | 1.96 | 58/140 |
+| NVFP4 fitted group scales | **5.13%** | **0.9022** | **0.115** | 0.916 | 9.26 | 1.57 | 77/140 |
+| fp8 (block 128×128, the served format) | 2.10% | 0.9610 | 0.467 | 0.961 | 8.62 | 0.62 | 101/140 |
+
+**Teacher-forced accept length** (7 slots, anchored on the true token, 133 real positions):
+bf16 **1.098**, NVFP4 RTN **1.038** (−5.5%), NVFP4 fitted **1.060** (−3.4%), fp8 **1.098** (0.0%).
+
+Verdict: the per-group scale fit buys ~32% relative output error and cuts the acceptance loss from −5.5%
+to −3.4% — inside the ~10%-for-5%-round budget — but fp8 is still strictly better on every fidelity
+column while costing no measurable acceptance. 4-bit is only worth engineering work if the round win
+materialises, and the engine's 4-bit path is `core/affine4` (group 64, scale **and bias**), not NVFP4, so
+a serving test needs a refit in that format or a new loader.
+
+Method rule this campaign just paid for: **calibrate and evaluate on real activations only.** The same
+fit run on `analysis/align_bf16/fixture/window` (synthetic taps, `gen_inputs.py`, random token ids) read
+recall@16 0.498 for the fitted NVFP4 body versus 0.902 on a real chunk, and no acceptance at all can be
+measured there — bf16 itself scores 0.0 because the ids are random.
