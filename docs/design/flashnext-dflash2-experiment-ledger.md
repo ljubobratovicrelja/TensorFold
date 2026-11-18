@@ -201,8 +201,25 @@ Error is flat from ~32 rows, so this is not a data-limited fit.
 | NVFP4 fitted group scales | **5.13%** | **0.9022** | **0.115** | 0.916 | 9.26 | 1.57 | 77/140 |
 | fp8 (block 128×128, the served format) | 2.10% | 0.9610 | 0.467 | 0.961 | 8.62 | 0.62 | 101/140 |
 
+**affine4** — the group-64 signed-scale+ bias layout `core/affine4.zig` already loads, so this is the
+variant that could be served without new kernels. Same calibration, same fp8 baseline:
+
+| format | out rel-L2 RTN -> fitted | recall@16 | set-exact | identical proposals |
+|---|---|---:|---:|---:|
+| NVFP4 (group 16) | 7.54% -> 5.13% | 0.8711 -> 0.9022 | 0.049 -> 0.115 | 58 -> 77 / 140 |
+| affine4 (group 64) | 7.41% -> **4.99%** | 0.8711 -> **0.9036** | 0.049 -> 0.109 | 52 -> 67 / 140 |
+| fp8 (block 128×128) | 2.10% | 0.9610 | 0.467 | 101 / 140 |
+
+Coarser groups win: one signed scale *and* a bias per 64 weights beats 16 symmetric blocks on output
+error, which is why affine4 is the format to chase.
+
 **Teacher-forced accept length** (7 slots, anchored on the true token, 133 real positions):
-bf16 **1.098**, NVFP4 RTN **1.038** (−5.5%), NVFP4 fitted **1.060** (−3.4%), fp8 **1.098** (0.0%).
+bf16 **1.098**, affine4 RTN **1.083** (−1.4%), affine4 fitted **1.068** (−2.7%), NVFP4 RTN **1.038**
+(−5.5%), NVFP4 fitted **1.060** (−3.4%), fp8 **1.098** (0.0%). The per-position sd is ~1.2 slots, so the
+standard error on 133 positions is ~0.10 slots (~9% relative) — every 4-bit arm sits inside one standard
+error of every other, and only fp8-versus-4-bit is resolvable. Separating them needs more chunks, not
+more arithmetic. Note also that the fitted affine4 arm has the better fidelity and the slightly worse
+acceptance, i.e. the acceptance metric is currently too noisy to rank these.
 
 Verdict: the per-group scale fit buys ~32% relative output error and cuts the acceptance loss from −5.5%
 to −3.4% — inside the ~10%-for-5%-round budget — but fp8 is still strictly better on every fidelity
