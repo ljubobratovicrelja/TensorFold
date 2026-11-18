@@ -32,6 +32,49 @@
 //!    against the vocabulary on the device, and an index past it is `SelectorIndexOutOfVocab` on
 //!    this side rather than a read past a 127 MB codebook.
 //!
+//! ## `TF_FLASHNEXT_ATTN_SPLIT`: the attention split over its context, on tensor cores
+//!
+//! Set to `1`, and *only* `1` — unset, empty or any other text is today's code path, byte for byte —
+//! the round launches `tf_fxd2_attn_split` + `tf_fxd2_attn_split_merge`
+//! (`kernels/cuda/draft2_attn_split.cu`, its own image) instead of `tf_fxd2_attn_tile`. Unsetting the
+//! variable is the whole revert: no branch, buffer or launch of the new path survives it.
+//!
+//! Why: the attention is the round's one stage that is *not* at the DRAM wall. Measured on this box,
+//! 14 reps, medians: the five blocks cost 3.737 ms of a 15.3 ms round (~0.675 ms a layer) against a
+//! 0.221 ms floor (5 x 8.00 MiB of K/V = 41.9 MB at 190 GB/s) — 11 GB/s, 16.9x above the floor, while
+//! mlp runs at 197 GB/s, the head GEMM at 234 and qkv at 151. `tf_fxd2_attn_tile` launches one CTA a
+//! KV head — 8 CTAs of 1024 threads on a 48-SM part, so at most 8 SMs and one CTA each — and walks the
+//! 2048 positions serially with a scalar `LDG.E.U16` dot and a `warp_sum` in the dependency chain at
+//! every one (SASS: 30 scalar loads, no vector load, no tensor-core instruction). Its bytes are
+//! already minimal (each CTA reads its KV head once), so the loss is parallelism plus that chain; the
+//! `TF_FLASHNEXT_ATTN_LEGACY` variant, a warp-per-(row, head) CTA, is 19x slower for exactly that
+//! reason — more CTAs without splitting positions multiplies redundant reads.
+//!
+//! The new pair is the repo's own answer to the same shape, ported from the Qwen3.5 decode attention
+//! (`tf_q35_attn_partial8` + `attn_rows8` + `tf_q35_attn_merge`, `qwen35_kv8.cu` / `qwen35.cu`), and
+//! it is also `tf_block_attention`'s `Fold` (`block_attention.cu`) — DFlash's block attention over a
+//! 128-wide head, one warp a query head, the block's rows in the m16 tile. The logical key space
+//! `[0, ctx_len + block)` — the context's ring rows, then the block's own keys — is cut into chunks,
+//! one CTA a (chunk, KV head), and each CTA leaves a chunk's running (max, sum) and unnormalised fp32
+//! output that the merge rescales and sums. `attnSplitPlan` cuts 416 logical keys a split: 5 chunks x
+//! 8 KV heads = 40 CTAs at the served shape, one wave of the 48 SMs, which is the 5 splits FA3's
+//! `num_splits_heuristic` picks for this geometry. Expected 3.74 -> 0.35-0.70 ms, 3.0-3.4 ms of the
+//! round; the parent's A/B is the measurement. Read that A/B through `TF_DRAFT2_TIME`'s stage medians
+//! and this doc's own warning (§5): the `attn_i` window also holds the prefix's k/v projection — the
+//! engine projects the prefix once a layer — so the stage moves by less than the attention's own cost,
+//! and `draft-check --repeat 15`'s medians, not one round's, are what to compare.
+//!
+//! **Not bit-identical to `tf_fxd2_attn_tile`, and not meant to be.** The chunked merge reassociates a
+//! row's softmax sum and output sum (a running max a chunk instead of one for the whole context) and
+//! the products are tensor-core fp32 accumulates rather than the per-lane scalar `fmaf` chain, so the
+//! bf16 output rows differ in their low bits — and this drafter's selector amplifies sub-bf16 noise.
+//! Compare *acceptance length per slot over many prompts*, not proposal identity: the repo's own record
+//! (`docs/design/flashnext-dflash2-gb10-optimisation-plan.md` §5) is that a 1.7e-7 relative-L2 shift in
+//! one fused row moved proposals on 7 of 16 reps while acceptance held, and that acceptance length is
+//! the only honest gate for a precision change — proposal identity is the gate for a refactor, which
+//! this is not. `tf_fxd2_attn_tile` and `tf_fxd2_attn` remain bit-identical to each other and to
+//! themselves, and `TF_FLASHNEXT_ATTN_LEGACY` still selects between them.
+//!
 //! What this module deliberately is not: it keeps one stream and one weight precision at a time —
 //! the checkpoint as published, its weight-only fp8 build, or its 4-bit (`affine4`) build, chosen
 //! at load and fixed for the life of the drafter — and no snapshots, lanes or trees; its geometry
@@ -99,6 +142,38 @@ pub const head_tile = 8192;
 /// entries.
 pub fn headTiles(c: Config) usize {
     return (c.vocab + head_tile - 1) / head_tile;
+}
+
+/// The chunks the split attention cuts a row's context into at most — the stride of its `PM`, `PL` and
+/// `PO` partials, and `NCH` in `kernels/cuda/draft2_attn_split.cu`, which a test pins against this
+/// number and that one's text. Eight is past what a 48-SM part wants anyway: 8 chunks x 8 KV heads is
+/// 64 CTAs, more than one wave.
+pub const attn_split_max: usize = 8;
+
+/// The logical keys one split streams — the context's ring rows plus the block's own `block` keys. 416
+/// is the measured shape of a wave on this box rather than a round number: at the served geometry
+/// (2,048-row window, 8 KV heads) it cuts 2,056 keys into 5 chunks, i.e. 40 CTAs of ~208 KB of K/V
+/// each, which is one wave of the 48 SMs and the 5 splits FA3's `num_splits_heuristic` also picks.
+/// Smaller chunks buy no more parallelism (the CTAs are already one a SM) and pay more partials; larger
+/// ones leave SMs idle.
+pub const attn_split_keys: usize = 416;
+
+/// `tf_fxd2_attn_split`'s dynamic shared: two double-buffered tiles of 32 keys x 128 dims bf16, keys
+/// then values (2 stages x 2 arrays x 32 x 16 uint4).
+pub const attn_split_smem: u32 = 4 * 32 * 16 * 16;
+
+/// One context's split: `nch` chunks of `ck` logical keys, `nch * ck >= keys`.
+pub const Split = struct { nch: usize, ck: usize };
+
+/// How a context of `keys` logical keys is cut: ceil(keys / attn_split_keys) chunks, clamped to
+/// `attn_split_max`, with the chunk rounded up to a whole 32-key tile so a split is never a partial
+/// tile — and the chunk count recomputed from it, which can only come out lower (a 2,056-key context
+/// asks for 5 chunks of 412, gets 416, and stays 5).
+pub fn attnSplitPlan(keys: usize) Split {
+    if (keys == 0) return .{ .nch = 1, .ck = 32 };
+    const want = @min(attn_split_max, @max(@as(usize, 1), (keys + attn_split_keys - 1) / attn_split_keys));
+    const ck = (((keys + want - 1) / want) + 31) / 32 * 32;
+    return .{ .nch = @min(attn_split_max, (keys + ck - 1) / ck), .ck = ck };
 }
 
 /// glm_mm16_16's dynamic shared: three stages of 16 rows of x and a 64-column weight tile.
@@ -259,6 +334,13 @@ pub const Bufs = struct {
     /// contiguous list and the merge pass reads its row strided. Written whole before the second
     /// pass reads a slot, so it needs no clearing between rounds.
     part: u64,
+    /// The split attention's per-chunk partials (`TF_FLASHNEXT_ATTN_SPLIT`): a running max and sum a
+    /// (block row, head, chunk) and the chunk's unnormalised fp32 output, `[NCH, block * heads]` and
+    /// `[NCH, block * heads, head_dim]` floats. `attn_split_max * block * heads * (8 + 512)` bytes at
+    /// the served shape — 1,064,960 B, 1.02 MiB — and a round that never sets the flag reads none of it.
+    attn_pm: u64,
+    attn_pl: u64,
+    attn_po: u64,
 };
 
 /// The proposal `tf_fxd2_select` writes instead of a token when it refuses a codebook index: no
@@ -502,6 +584,27 @@ const Fns = struct {
     ring_put: cuda.Function,
 };
 
+/// The split attention's two entries and the image they live in (`kernels/cuda/draft2_attn_split.cu`),
+/// loaded only when `TF_FLASHNEXT_ATTN_SPLIT=1`: a round that does not set the variable never loads the
+/// module, so the shipped path costs nothing for the flag existing.
+const AttnSplit = struct {
+    mod: cuda.Module,
+    /// `tf_fxd2_attn_split`: one chunk of one KV head over tensor cores, into the (max, sum, output)
+    /// partials.
+    partial: cuda.Function,
+    /// `tf_fxd2_attn_split_merge`: a line's chunks rescaled by their maxima, summed, divided once.
+    merge: cuda.Function,
+
+    fn load(d: *const cuda.Driver) !AttnSplit {
+        var mod = try cuda.Module.load(d, cuda.kernels.draft2_attn_split);
+        errdefer mod.unload();
+        const partial = try mod.function("tf_fxd2_attn_split");
+        const merge = try mod.function("tf_fxd2_attn_split_merge");
+        try partial.allowDynamicShared(attn_split_smem);
+        return .{ .mod = mod, .partial = partial, .merge = merge };
+    }
+};
+
 /// The drafter, loaded: its config, its weights, and its kernels.
 pub const Draft = struct {
     /// Per-stage nanoseconds, kept only when `TF_DRAFT2_TIME` is set: a round that is five times the
@@ -515,6 +618,9 @@ pub const Draft = struct {
     /// Keep `tf_fxd2_attn` (one warp CTA a (row, head), 32x the ring's bytes) instead of the tiled
     /// kernel. `TF_FLASHNEXT_ATTN_LEGACY=1`; the two are bit-identical, so this is only for A/B.
     attn_legacy: bool = false,
+    /// The split-KV tensor-core attention, or null: `TF_FLASHNEXT_ATTN_SPLIT=1` loads it (see this
+    /// file's header). Null is today's path — `attn` does not even branch on the module.
+    attn_split: ?AttnSplit = null,
     gpa: std.mem.Allocator,
     io: std.Io,
     d: *const cuda.Driver,
@@ -649,6 +755,11 @@ pub const Draft = struct {
             const v = std.mem.span(p);
             s.attn_legacy = v.len != 0 and !std.mem.eql(u8, v, "0");
         }
+        // The split attention is opt-in by exact text: "1" and nothing else, so a typo, an empty
+        // variable or a stale "true" takes the shipped path rather than an experiment's.
+        if (std.c.getenv("TF_FLASHNEXT_ATTN_SPLIT")) |p| {
+            if (std.mem.eql(u8, std.mem.span(p), "1")) s.attn_split = try AttnSplit.load(d);
+        }
         return s;
     }
 
@@ -661,6 +772,7 @@ pub const Draft = struct {
         if (s.a4) |*a| a.deinit();
         if (s.act) |*a| a.unload();
         if (s.a4mods) |*mods| for (mods) |*m| m.unload();
+        if (s.attn_split) |*a| a.mod.unload();
         s.headw.free();
         s.rows.unload();
         s.mod.unload();
@@ -1212,11 +1324,20 @@ fn dynConv(s: *Draft, x: u64, dyn_w: u64, base: u64, res: u64, out: u64, branch:
 /// `m`, so a round hands it `pos0 = begin = ` the context's first position and `ctx = ctx_len`: the
 /// kernel then reads the prefix's ring rows and nothing else. (Its per-row window still lets a context
 /// of a full window through: `pos0 + m - window + 1 <= pos0` for every block row `m < window`.)
+///
+/// Three kernels answer for one shape: `TF_FLASHNEXT_ATTN_SPLIT=1` takes the split-KV tensor-core
+/// pair (`attnSplit`), else the tiled kernel below, else — under `TF_FLASHNEXT_ATTN_LEGACY` — the
+/// one-warp-a-(row, head) entry. The first is not bit-identical to the other two by construction (this
+/// file's header); the other two are bit-identical to each other.
 fn attn(s: *Draft, st: *State, i: usize, b: *const Bufs, pos0: c_longlong, ctx_len: usize, rows: usize) !void {
     const c = s.c;
     // The tiled kernel needs one warp per (row, head) in a KV group — 32 warps, 1024 threads — and a
-    // warp per (row, head) is exactly what a KV group holds.
+    // warp per (row, head) is exactly what a KV group holds. The split pair makes the same assumption
+    // from the other side: a warp a query head, the block's rows in its m16 tile.
     const warps = rows * (c.heads / c.kv_heads);
+    if (s.attn_split) |*sp| {
+        if (warps == 32) return attnSplit(s, sp, st, i, b, pos0, ctx_len, rows);
+    }
     if (!s.attn_legacy and warps == 32) {
         return launch(s, s.fns.attn_tile, .{ @intCast(c.kv_heads), 1, 1 }, 1024, 2 * 64 * 128 * 2, .{
             b.q,      b.kb,         b.vb,           s.ringK(st, i),   s.ringV(st, i),
@@ -1228,6 +1349,28 @@ fn attn(s: *Draft, st: *State, i: usize, b: *const Bufs, pos0: c_longlong, ctx_l
         b.q,      b.kb,         b.vb,           s.ringK(st, i),   s.ringV(st, i),
         ci(rows), ci(c.heads),  ci(c.kv_heads), ci(c.ringRows()), pos0,
         pos0,     ci(c.window), ci(ctx_len),    b.att,
+    });
+}
+
+/// The split-KV tensor-core attention: `tf_fxd2_attn_split` over the context's chunks into the round's
+/// partials, then `tf_fxd2_attn_split_merge` into the same bf16 row block `tf_fxd2_attn_tile` writes.
+///
+/// The key space is the logical one — the context's `ctx_len` ring rows, then the block's own `rows`
+/// keys — so a chunk may straddle the two, which is why the kernel takes both rings and both block
+/// buffers. `attnSplitPlan` picks the chunk count; the first launch is grid (chunks, kv_heads) with one
+/// warp a query head, the second is one warp a (row, head) line.
+fn attnSplit(s: *Draft, sp: *const AttnSplit, st: *State, i: usize, b: *const Bufs, pos0: c_longlong, ctx_len: usize, rows: usize) !void {
+    const c = s.c;
+    const plan = attnSplitPlan(ctx_len + rows);
+    try launch(s, sp.partial, .{ @intCast(plan.nch), @intCast(c.kv_heads), 1 }, @intCast(32 * (c.heads / c.kv_heads)), attn_split_smem, .{
+        b.q,      b.kb,          b.vb,           s.ringK(st, i),   s.ringV(st, i),
+        ci(rows), ci(c.heads),   ci(c.kv_heads), ci(c.ringRows()), pos0,
+        pos0,     ci(c.window),  ci(ctx_len),    ci(plan.ck),      b.attn_pm,
+        b.attn_pl, b.attn_po,
+    });
+    const lines = rows * c.heads;
+    try launch(s, sp.merge, .{ @intCast((lines + 3) / 4), 1, 1 }, 128, 0, .{
+        b.attn_pm, b.attn_pl, b.attn_po, b.att, ci(rows), ci(c.heads), ci(plan.nch),
     });
 }
 
@@ -1746,6 +1889,14 @@ fn sumsWidth(c: Config) usize {
     return @max(c.hidden, @max(c.qWidth(), c.intermediate));
 }
 
+/// The split attention's partials, byte for byte: `attn_split_max` slots a line, a running max and a
+/// running sum, and an `head_dim`-wide fp32 output a slot. Every one is 256-byte aligned already (a
+/// line of 256 slots is 8 and 512 floats), so `place` pads nothing around them.
+fn attentionPartials(c: Config) usize {
+    const lines = c.block * c.heads;
+    return 2 * attn_split_max * lines * 4 + attn_split_max * lines * c.head_dim * 4;
+}
+
 /// The block's scratch, byte for byte: every row the round writes, 256-byte aligned.
 fn scratchBytes(c: Config) !usize {
     return place(c, 0, null);
@@ -1796,6 +1947,11 @@ pub fn place(c: Config, base: u64, out: ?*Bufs) !usize {
         // the tensor-core head's logits, `[R, vocab]` fp32, read by the slice top-k; the tiled path
         // splits the dot and the slice into two kernels, so the whole-vocabulary output needs a home
         .{ "lg", try bytes(.{ R, c.vocab, 4 }) },
+        // the split attention's partials, a (line, chunk) slot each; `attn_split_max` is the kernel's
+        // own NCH, so the padding between a line's slots is the same on both sides
+        .{ "attn_pm", try bytes(.{ attn_split_max, c.block, c.heads, 4 }) },
+        .{ "attn_pl", try bytes(.{ attn_split_max, c.block, c.heads, 4 }) },
+        .{ "attn_po", try bytes(.{ attn_split_max, c.block, c.heads, c.head_dim, 4 }) },
     };
     var total: usize = 0;
     inline for (sizes) |s| {
@@ -1914,8 +2070,15 @@ test "a round's scratch is one block plus one context chunk, 256-byte aligned, a
     // at the served shape, 213 KiB — and the second pass reads exactly that and nothing else. It is
     // the round's only table sized by the tile count, so its bytes move with `head_tile` alone.
     try std.testing.expectEqual(@as(u64, 256), b.part - b.err);
-    try std.testing.expectEqual(headTiles(c) * (c.block - 1) * c.topk * 8 + (c.block - 1) * c.vocab * 4, total - @as(usize, @intCast(b.part - 4096)));
+    try std.testing.expectEqual(headTiles(c) * (c.block - 1) * c.topk * 8 + (c.block - 1) * c.vocab * 4 + attentionPartials(c), total - @as(usize, @intCast(b.part - 4096)));
     try std.testing.expectEqual(@as(usize, 243), headTiles(c));
+    // The split attention's partials trail the head's: a max and a sum a (line, chunk) — `[NCH, line]`
+    // fp32 each — and the chunk's unnormalised output, `[NCH, line, head_dim]` fp32. At the served
+    // shape 8 chunks x 256 lines: 8 KiB each of PM and PL, 1 MiB of PO.
+    try std.testing.expectEqual(@as(u64, 0), b.attn_pm - b.lg - (c.block - 1) * c.vocab * 4);
+    try std.testing.expectEqual(@as(u64, 8192), b.attn_pl - b.attn_pm);
+    try std.testing.expectEqual(@as(u64, 8 * 256 * 128 * 4), b.attn_po - b.attn_pl);
+    try std.testing.expectEqual(@as(usize, 8 * 256 * 128 * 4), total - @as(usize, @intCast(b.attn_po - 4096)));
     // the head's shared plane is inside the default 48 KiB a dynamic launch may ask for
     try std.testing.expect(c.hidden * 2 + 256 * c.topk * 8 <= 48 * 1024);
     // the ring is what a stream costs besides: the window, a block, a tile of slack
@@ -1993,6 +2156,53 @@ test "the tap source is one constant, read once" {
     try std.testing.expectEqual(@as(?u64, 0x1000), src.ptr(.readout).?);
     try std.testing.expectEqual(@as(?u64, 0x2000), src.ptr(.normed).?);
     try std.testing.expect(tapsFrom(.{}) == null);
+}
+
+test "the split attention's plan is one wave at the served shape and never a partial tile" {
+    // 2,056 logical keys — a full 2,048-row window plus the block's own 8 — cut 416 a chunk: 5, which
+    // is 40 CTAs at 8 KV heads, one wave of the 48-SM part, and the count FA3's splits heuristic gives
+    // for this geometry. The chunk is a whole number of 32-key tiles, so no CTA folds a partial one.
+    const served = attnSplitPlan(2048 + block);
+    try std.testing.expectEqual(@as(usize, 5), served.nch);
+    try std.testing.expectEqual(@as(usize, 416), served.ck);
+    try std.testing.expectEqual(@as(usize, 0), served.ck % 32);
+    try std.testing.expect(served.nch * served.ck >= 2048 + block);
+    // a shorter context still gets a whole tile, and a short one is a single chunk: the split must not
+    // invent CTAs that read nothing
+    const short = attnSplitPlan(300);
+    try std.testing.expectEqual(@as(usize, 1), short.nch);
+    try std.testing.expectEqual(@as(usize, 320), short.ck);
+    // an empty prefix (a block at position 0) is the block's own keys alone
+    const bare = attnSplitPlan(0 + block);
+    try std.testing.expectEqual(@as(usize, 1), bare.nch);
+    try std.testing.expectEqual(@as(usize, 32), bare.ck);
+    try std.testing.expectEqual(@as(usize, 1), attnSplitPlan(0).nch);
+    // and no context can ask for more chunks than the partials hold: the clamp is part of the plan,
+    // not an assumption the launcher makes
+    const huge = attnSplitPlan(64 * 1024);
+    try std.testing.expectEqual(attn_split_max, huge.nch);
+    try std.testing.expect(huge.nch * huge.ck >= 64 * 1024);
+    // a chunk never shrinks below a tile, so `ck % 32 == 0` holds for every plan
+    var k: usize = 1;
+    while (k <= 40_000) : (k += 977) {
+        const p = attnSplitPlan(k);
+        try std.testing.expectEqual(@as(usize, 0), p.ck % 32);
+        try std.testing.expect(p.nch >= 1 and p.nch <= attn_split_max);
+        try std.testing.expect(p.nch * p.ck >= k);
+    }
+}
+
+test "the split attention's partial stride is the kernel's own NCH" {
+    // `PM`/`PL`/`PO` are indexed `line * NCH + chunk` on both sides of the launch, and NCH is written
+    // into the kernel source: this is the one place the two can disagree, and a disagreement reads
+    // one line's partials as another's. Cheap to check here rather than in a proposal diff.
+    const src = @embedFile("../../../kernels/cuda/draft2_attn_split.cu");
+    var buf: [48]u8 = undefined;
+    const want = try std.fmt.bufPrint(&buf, "constexpr int NCH = {d};", .{attn_split_max});
+    try std.testing.expect(std.mem.indexOf(u8, src, want) != null);
+    // and the two entries the launcher resolves are the ones the file defines
+    try std.testing.expect(std.mem.indexOf(u8, src, "tf_fxd2_attn_split(") != null);
+    try std.testing.expect(std.mem.indexOf(u8, src, "tf_fxd2_attn_split_merge(") != null);
 }
 
 test {

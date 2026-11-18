@@ -106,6 +106,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "train", .flags = &.{"-O3"} }, // ours: Sliding Weights' learning step (train.metal's kernels)
     .{ .name = "qwen35", .flags = &.{"-O3"} }, // ours: the Qwen3.5 hybrids' glue, the Metal kernels' rounding points
     .{ .name = "qwen35_draft", .flags = &.{"-O3"} }, // ours: the DFlash2 drafter's glue (draft_ops.metal's rounding)
+    .{ .name = "draft2_attn_split", .flags = &.{"-O3"} }, // ours: the DFlash2 drafter's attention split over its context (TF_FLASHNEXT_ATTN_SPLIT)
     .{ .name = "qwen35_keep", .flags = &.{"-O3"} }, // ours: a verified window's kept path applied to its stream's state
     .{ .name = "qwen_vision", .flags = &.{ "-O3", "--fmad=false" } }, // ours: the Qwen3.5 vision tower's glue and attention
     .{ .name = "gdn_prefill", .flags = &.{ "-O3", "--fmad=false" } }, // ours: a prompt chunk's gated delta rule (v0.6.6's chain)

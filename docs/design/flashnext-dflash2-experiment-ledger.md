@@ -312,3 +312,74 @@ Method rule this campaign just paid for: **calibrate and evaluate on real activa
 fit run on `analysis/align_bf16/fixture/window` (synthetic taps, `gen_inputs.py`, random token ids) read
 recall@16 0.498 for the fitted NVFP4 body versus 0.902 on a real chunk, and no acceptance at all can be
 measured there — bf16 itself scores 0.0 because the ids are random.
+
+## 11. The drafter's two remaining hot spots: attention, and the head (2026-11-19)
+
+Both were found by profiling the stage split of the served round, not by guessing. Size of the prize
+first: of a 15.3 ms drafter round, `logits_top16_ids` was 6.84 ms and the five attention blocks 3.74 ms —
+together **69% of the round** — while mlp/qkv/conv, the stages every quantisation campaign optimised,
+were 2.9 ms.
+
+### 11.1 Attention was 16.9x off its bandwidth floor — RUN
+
+Floor: 5 layers x 8.00 MiB of bf16 KV = 41.9 MB = 0.221 ms at 190 GB/s. Measured 3.737 ms, i.e. 11 GB/s.
+Cause: `tf_fxd2_attn_tile` launched **grid = 8 CTAs, one per KV head**, so 8 of 48 SMs, scalar
+`LDG.E.U16` loads, no tensor-core instruction, and a serial 5-shuffle softmax walk over 2048 positions.
+The 256-CTA warp-per-(row,head) variant is 19x slower for the opposite reason (more CTAs, no position
+split, redundant KV reads).
+
+Built: `kernels/cuda/draft2_attn_split.cu`, ported from the repo's own `tf_q35_attn_partial8` /
+`attn_rows8` / `attn_merge` pattern — uint4 KV tiles, `cp.async` double buffering, `mma.sync` BF16, one
+chunk of one KV head per CTA, fp32 (max, sum, out) partials merged by a second kernel. Grid at the served
+shape: 5 chunks x 416 keys x 8 KV heads = **40 CTAs**, one wave of 48 SMs. Gated by
+`TF_FLASHNEXT_ATTN_SPLIT=1`; unset is the old path, byte for byte. Old variants untouched.
+SASS: 64 `HMMA.16816.F32.BF16`, 12 `LDGSTS.E.BYPASS.128`, 0 `LDG.E.U16`.
+
+Measured, `draft-check --repeat 15` on `fixture/sequence`, **both measurement orders**:
+
+| stage | flag off | flag on | delta |
+|---|---:|---:|---:|
+| attention (5 layers) | 3.795 | 1.275 | **-2.60** |
+| logits_top16_ids | 6.977 | 7.397 | +0.42 |
+| selector_scores (host, harness) | 3.071 | 3.359 | +0.29 |
+| proposals | 1.441 | 1.756 | +0.32 |
+| fc_ctx | 0.707 | 0.894 | +0.19 |
+| mlp (5) | 1.544 | 1.815 | +0.27 |
+| **served round** | **16.07 / 16.13** | **15.17 / 15.36** | **-0.85** |
+
+**The attention stage wins 2.60 ms and the round only keeps 0.85**, because every other stage slows down
+deterministically — reproduced in both orders to the hundredth of a millisecond, so it is not clock drift,
+and the split's partials are appended after the logits arena, so it is not buffer placement. Prime suspect:
+power/clock response after tensor-core bursts, since the loss falls hardest on the streaming stages
+(fc_ctx +26%, mlp +18%, proposals +22%, head +6%). Unresolved; flagged rather than explained away.
+Proposals move in 4/15 reps, which is inside the documented rounding caveat (a 1.7e-7 rel-L2 shift moved
+7/16). Full-bit identity was never a goal for this path.
+
+### 11.2 The fp8 head is lossless *with* a rescore, and the fit is irrelevant — RUN
+
+Instrument: `tools/dflash2/quantize/fit_head.py` (new), 6,160 real head-input rows from the **fp8-body**
+drafter over the 8 harvested chunks, fit on chunks 0-5, evaluated on 6-7.
+
+| arm | recall@16 all / held-out | set-exact | top-1 | teacher-forced accept vs bf16 head |
+|---|---|---|---|---|
+| fp8 rtn | 0.9716 / 0.9683 | 0.5804 | 0.9640 | +0.0057 [-0.0011, +0.0148] (null) |
+| fp8 fitted (closed form) | 0.9715 / 0.9689 | 0.5826 | 0.9687 | +0.0068 (null) |
+| **fp8 rtn + bf16 rescore@64** | **1.0000 / 1.0000** | **1.0000** | **1.0000** | **0.0000, identical slot vector** |
+| fp8 fitted + bf16 rescore@64 | 1.0000 / 1.0000 | 1.0000 | 1.0000 | 0.0000 |
+
+Three findings, in order of how much they change the plan:
+
+1. **The earlier "fp8 fails the gate" verdict was an instrument artefact of the 49-row sample and a
+   miscounted K-sweep.** On 6,160 rows fp8 already scores 0.9683 held-out, and the true top-16 containment
+   of fp8's top-64 is **1.0000**, not 0.968 (0.968 was *recall@64*, a different quantity). A bf16 rescore of
+   64 survivors (448 ids, 2.3 MB/round) then makes the candidate set exactly bf16's.
+2. **The closed-form fit is worthless here** and should not be shipped as a separate arm: 0.9061x the RTN
+   logits error, paired -0.00013 recall [-0.0011, +0.0008], 1,022 rows better against 1,025 worse. e4m3's
+   log grid means per-block scale shuffling (+-16%) is the whole search space and 85% of blocks never clip.
+   Kept on disk for the record, not proposed for serving.
+3. **The head is worth ~3.4 ms**, 22% of the drafter round, with no measurable quality cost — unlike the
+   body quantisation, where 4 bits bought nothing because mlp/qkv were never the bill.
+
+Not yet servable: `draft_check.zig` requires `lm_head.weight` bf16 and `cuda_drafter2.zig` raises
+`Draft2HeadNotBf16`; the block-128 fp8 `takeFp8`/`projQ`/`lane.matmulF32` path exists, but the per-round
+gather of 64 bf16 head rows for the rescore is new. That plumbing is the next commit, not this one.
