@@ -139,3 +139,42 @@ this one.
 
 **Where a collapse would show:** accept length 3.34 → ≤2.5, or degenerate proposals (repeats, all
 seven identical). Neither appeared, on fixture or served.
+
+## 6. Deployment, measured on the running build (2026-11-18)
+
+`dflash2` merged fast-forward into `running` (72 commits, pushed), rebuilt in
+`~/Projects/tf-wt/running`, and the fp8 artifact staged at
+`~/.cache/tensorfold/dflash2-fp8` with all three sha256 verified against its own `SHA256SUMS`.
+
+**Blocker: any drafter plus `--spill-gib` dies at startup.**
+
+```
+info: flashnext: --drafter ...: DFlash2, taps { 5, 15, 25, 35, 45 }, 7 drafts a round
+info: cuda_window_graph.HeadKey graphs: 1 captured, 0 updated, 0 replayed, 1 held
+error: ProbeUnmarked
+```
+
+The same unit without `--drafter` starts in 72 s, so it is not a merge regression, and it reproduces
+with `--learn-daily-gib` and `--prompt-cache-disk` removed — `--spill-gib` alone is enough.
+`flashnext_disk.zig` calls `learned.probe`, which requests marks at 4096 and `toks.len - 8` and
+requires both to fire (`learned.zig`: `p.marks != marks.len → ProbeUnmarked`); a speculative round
+commits past a mark position, so `marked()` never runs for it. **Hypothesis, not yet confirmed by a
+run with drafting forced off inside the probe** — that is the one-line test.
+
+**And on the production config it loses to MTP.** Same binary, same four short coding prompts,
+`--context 262144 --parallel 4 --kv-cache fp8 --vision --thinking`:
+
+| arm | decode tok/s | tokens/round | drafts offered/round | accept rate |
+| --- | --- | --- | --- | --- |
+| MTP (no drafter) | **52.5** | **3.764** | 6.56 | 0.669 |
+| DFlash2 fp8 | 39.2 | 2.430 | 3.19 | 0.669 |
+
+At `--context 32768` the fp8 arm measured 38.9 tok/s, so context length is not the cause. The
+window-cost curve is identical in both runs (37.19 ms at one row, 100.90 at 32), so it is not a
+depth-rule reaction to a different cost estimate either. What differs is the traffic shape: these
+are short coding answers, where MTP's head is strong — consistent with MTP winning 12/16 GSM8K
+prompts, and worse than the 16-prompt GSM8K pair (49.4 vs 53.0). **n = 4 prompts**, so this is
+directional, not a verdict; it is enough to say fp8 is not the default on this config.
+
+The unit therefore ships with MTP and carries the fp8 line commented, with both findings inline.
+
