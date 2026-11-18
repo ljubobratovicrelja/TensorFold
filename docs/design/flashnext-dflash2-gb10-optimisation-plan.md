@@ -7,10 +7,16 @@ number that quietly disappears is one somebody re-derives later.
 
 The one-line state of play: the port is at the vendor's card on acceptance (3.33 vs 3.26 accept
 length) and behind it on cost per round, because the drafter pays a large fixed per-round cost that
-this box's bus makes expensive. A served round is **18.75 ms**, and its two biggest items are the
-target's `lm_head` (6.99 ms, 37.5%) and the five attention layers (4.45 ms, 23.9%). The context
-fuse, second at 5.10 ms a day ago, is now 0.71 ms (§4) — which moved weight-read work from 54% of
-the round to 67% and made precision, not kernels, the next fork.
+this box's bus makes expensive. A served round on the published bf16 drafter is **18.75 ms**, and its
+two biggest items are the target's `lm_head` (6.99 ms, 37.5%) and the five attention layers (4.45 ms,
+23.9%). The context fuse, second at 5.10 ms a day ago, is now 0.71 ms (§4) — which moved weight-read
+work from 54% of the round to 67% and made precision, not kernels, the next fork.
+
+That fork is now taken: a second drafter checkpoint with the seven decoder linears in weight-only FP8
+takes the same binary to **16.02 ms** (−14.5%) on this fixture, with the bf16 arm provably unchanged
+(§4.3; artifact, flag and cost in `flashnext-dflash2-fp8-checkpoint.md`). It moves proposals — 64 of
+112 slots — so it is **not a shipped default yet**: acceptance through a served stream is the gate,
+and that run has not happened.
 
 ## 1. The bar
 
@@ -172,6 +178,41 @@ Cold improves only 1.6×: the bit-exact scalar dot is instruction-bound (~11 fma
 so 1,900 rows still cost 190 ms. That is first-token latency, not throughput, and it is the one place
 a non-exact kernel is tempting — see §5 for why it was refused.
 
+### 4.3 A second checkpoint: weight-only FP8 on the decoder linears
+
+The seven linears that dominate the byte bill (`mlp.gate/up/down`, `self_attn.q/k/v/o`, 852 MB of
+bf16) now have an e4m3 build with 128×128 block scales, bf16 activations and fp32 accumulate —
+**W8A16**, not W8A8: at 8 rows the activations are 205 KB a layer against 590 MB of mlp weights, so
+quantizing them would buy 0.03% of the traffic and add risk. `fc`, the convs, every norm and the
+selector stay bf16 in both arms. The artifact is a separate 780.3 MB checkpoint
+(`checkpoints/dflash2-fp8/`, manifest + `SHA256SUMS` committed, the blob gitignored), selected with
+`--drafter-precision bf16|fp8`; omitted, the checkpoint's own tensors decide, and mismatches are
+refused at load. Full detail: `flashnext-dflash2-fp8-checkpoint.md`.
+
+Same binary, same session, `fixture/sequence`, 15 served reps each:
+
+| stage | bf16 | fp8 | delta | |
+|---|---:|---:|---:|---|
+| mlp (5) | 2.757 | 1.544 | −1.213 | −44.0% |
+| qkv (5) | 0.834 | 0.532 | −0.302 | −36.3% |
+| attn_proj (5) | 0.546 | 0.379 | −0.167 | −30.6% |
+| attention (5) | 4.385 | 3.380 | −1.005 | −22.9% |
+| head, `fc_ctx`, `proposals` (untouched) | 9.14 | 9.14 | ±0.02 | noise |
+| **served round** | **18.731** | **16.019** | **−2.712** | **−14.5%** |
+| cold round (rep 0) | 284.167 | 216.039 | −68.128 | −24.0% |
+
+**1.69 ms of the 2.71 is weight bytes; 1.00 ms is attention, which the arm does not touch.** The likely
+mechanism is cross-stage clock coupling — bf16 mlp moves twice the bytes, the SoC clocks down, tiny-M
+attention follows — and the evidence fits without proving it: fp8 attention held 0.675–0.681 ms/layer
+across two runs in opposite order while bf16 attention read 0.87 then 1.10. Recorded as a hypothesis,
+not as a kernel win.
+
+The bf16 arm is gated bit-identical (`regress.py check base base-bf16`: PASS, every stage tensor
+equal, tol 0). The fp8 arm is **not** and cannot be: 48 of 112 proposal slots are identical, 64 differ,
+one rep fully identical and one fully divergent, with hidden drift median 7.4e-3 relative L2. That is
+the selector amplifying a 2.6% weight error, exactly as §5 predicted, and it is why acceptance — not
+proposal identity — is this change's gate. It has not been measured through a served stream yet.
+
 ## 5. Closed — do not re-run
 
 Each of these cost real time. The reason is recorded so it is not re-derived.
@@ -221,6 +262,9 @@ onto §3, and two of its conclusions move because of that.
    with acceptance **4.24 → 4.24 unchanged** (one reports 4.16 for INT8 as indistinguishable). Our
    stages run at 187–214 GB/s, so halving bytes should translate; the unmeasured risk is that our fp8
    path is a 128×128 block-scaled kernel and its dequant overhead may not amortise at 8 rows.
+   **Built and measured (§4.3): 1.69 ms, not 2.07 — the dequant overhead does not fully amortise at
+   8 rows, and mlp lands at 44% cheaper rather than 50%.** What is left of this item is not speed but
+   the acceptance question, which needs the served A/B.
 2. **The head's GEMM, 5.43 ms — the largest single byte block, 1,271.4 MB at 234 GB/s.** At the box
    rate, so only fewer bytes move it, and the survey has two scoped routes:
    - **FP8 head** (635.7 MB, ~2.71 ms) **after** an offline per-slot top-16 fidelity check. Its

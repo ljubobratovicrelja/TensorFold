@@ -5,8 +5,10 @@ for `Qwen3.8-Flash-Next-FP4-Local` on a DGX Spark (GB10). DFlash2 is a 5-layer d
 to five target-layer hidden-state taps and drafts a block of 8 rows (7 proposals), which the target
 verifies; verification makes output lossless, so only acceptance length and round cost matter.
 
-Measured state: the drafter's round in the served regime is **18.75 ms** (`fixture/sequence`, 15 served
-reps; 22.99 ms before the context-fuse change of 2026-11-18, and the 0.77 ms spread is run to run) and
+Measured state: the drafter's round in the served regime is **18.75 ms** on the published bf16
+checkpoint (`fixture/sequence`, 15 served reps; 22.99 ms before the context-fuse change of 2026-11-18)
+and **16.02 ms** with the weight-only FP8 build of the seven decoder linears (−14.5%, same binary, same
+session, `flashnext-dflash2-fp8-checkpoint.md`), and
 acceptance is **3.34 tokens/round at width 8**. End to end that is ~70 ms of wall clock a round
 including the target's verify — 45.0 tok/s measured before the fuse change, ~47.7 by arithmetic after it
 — against AR 25.5 and MTP 59.6 on the same 16 GSM8K prompts. On the vendor's own card that is parity on
@@ -30,6 +32,7 @@ the negative results cost real time; but only one of them describes the current 
 | file | contents | status |
 | --- | --- | --- |
 | `flashnext-dflash2-gb10-optimisation-plan.md` | Current scoreboard: served-round stage breakdown (`fixture/sequence`, 15 served reps), the byte rate of every weight-read stage, the harness that produces every number (`draft-check`, `regress.py`, env knobs), what has been changed (tiled attention, `head_tile` 8192, the batched context fuse), the closed questions, and the ranked open work. §7 is the retraction log for superseded measurements. | **LIVE** |
+| `flashnext-dflash2-fp8-checkpoint.md` | The shipped FP8 weight artifact and the switch: what is quantized (7 decoder linears) and what is not (`fc`, convs, norms, selector), the scale convention, the reproducible tooling and its manifest, `--drafter-precision bf16\|fp8` with checkpoint-decides default, the measured bf16→fp8 delta on `fixture/sequence`, the 64-of-112 proposal movement and why proposal identity is the wrong gate here, and what the served acceptance A/B still has to prove. | **LIVE** |
 | `flashnext-dflash2-quantization-survey.md` | What practitioners and researchers actually do about memory bandwidth on DGX Spark / GB10, and what transfers to us: format comparison measured on this box, per-component vendor support, which layers tolerate quantization, what a quantized `lm_head` does to a top-k candidate set, activation-aware and calibration methods, post-quant recovery, and the non-precision alternatives (vocabulary trim, low-rank head, two-stage retrieval). Every claim graded [M-GB10] / [M-other] / [V] / [P] and cited; §10 maps each option onto our stages with bytes, ms and acceptance risk. **No local experiment** — nothing in its §7 has been run here. | **REFERENCE** (its §2 baseline and §10 arithmetic are pre-fuse; the plan §6 is the rebased version) |
 | `flashnext-dflash2-vendor-baseline.md` | The incoai card at source (GB300, FP8, SGLang, block 4) plus the corrected like-for-like comparison against our width-8 run, and the three corrections to what the repo previously believed about MTP vs DFlash2. | **REFERENCE** (card) / its §2 measurement rows are superseded by the plan §1 |
 | `flashnext-dflash2-handoff.md` | The long mid-project handoff: repo/checkpoint paths, build and serve commands, commit map, MTP baseline, the five rounds of drafter debugging as they happened, the z-lab suite, and §14's then-open list. Carries a banner; §1–§14 are the historical record. | **HISTORY** |
@@ -48,16 +51,18 @@ the negative results cost real time; but only one of them describes the current 
    Everything you measure should be comparable to §3, and §2 tells you how.
 2. `flashnext-dflash2-vendor-baseline.md` — what the bar actually is, at source, with the width and the
    model named. Read it before quoting any number, ours or theirs.
-3. `flashnext-dflash2-quantization-survey.md` — before proposing any precision change: what is measured
-   elsewhere, what the risk actually is, and which options are already ruled out.
-4. `flashnext-dflash2-handoff.md` §1 — paths, build line, serve line, commit map. Skip §2–§14 unless you
+3. `flashnext-dflash2-fp8-checkpoint.md` — the fp8 arm as built: the artifact, the flag, what it
+   measured, and the acceptance gate that is still open.
+4. `flashnext-dflash2-quantization-survey.md` — before proposing any further precision change: what is
+   measured elsewhere, what the risk actually is, and which options are already ruled out.
+5. `flashnext-dflash2-handoff.md` §1 — paths, build line, serve line, commit map. Skip §2–§14 unless you
    need the history of a specific bug.
-5. `flashnext-dflash2-divergence-brief.md` §6 — the debugging discipline. This is the part that is still
+6. `flashnext-dflash2-divergence-brief.md` §6 — the debugging discipline. This is the part that is still
    binding: first-divergent-stage localisation, same-precision reference runs, no lossless-sha arguments
    about drafter quality.
-6. `flashnext-dflash2-serving-defects.md` §7 — how the served path was fixed, and the shape of the
+7. `flashnext-dflash2-serving-defects.md` §7 — how the served path was fixed, and the shape of the
    bugs (state that must ride a snapshot, cost tables that must be published) that recur.
-7. `flashnext-dflash2-kernels.md` and `flashnext-dflash2-tap-ring.md` — geometry and state contracts, when
+8. `flashnext-dflash2-kernels.md` and `flashnext-dflash2-tap-ring.md` — geometry and state contracts, when
    you touch a kernel or the ring.
 
 Only if you are reconstructing why something was tried: `acceptance-log.md`, `drafter.md`,
@@ -78,6 +83,15 @@ Each entry is a claim an agent may still find in the tree, and what is true inst
   2026-11-18. The 13 GB/s was never a bandwidth figure: `tf_fxd2_fuse` launched a block per row and each
   block streamed the whole 65.5 MB weight, so the cost was `rows × 65.5 MB`. The batched `glm_fuse_dot`
   makes the stage **0.71 ms** (3.8%), bit-identical, proposals unchanged on 16/16 reps.
+- **"fp8 changes nothing but speed, so gate it on proposal identity."** Wrong in both halves. The fp8
+  weight arm moves **64 of 112** proposal slots (48 identical) while every untouched stage is
+  unchanged — the selector amplifies a 2.646% weight error, exactly as the refused tensor-core fuse did
+  with 1.7e-7. Proposal identity is the gate for a refactor; per-slot accept length over many prompts is
+  the gate for a precision change.
+- **"All 35 quantized matrices are ~2.6% off, so the least accurate ones can be kept in bf16."** There is
+  no spread to exploit: relL2 is 2.643–2.650% across all 35 and **all 26,000 blocks exceed 2%**, because
+  2.6% is e4m3's own noise floor for these weights. A per-block mixed-precision fallback has nothing to
+  select on here.
 - **"Weight bytes are only 55% of the round."** The survey's §2 figure, computed before the fuse fix.
   Now **67%**, because the fix removed non-byte cost from a fixed total. Do not use 55% to discount
   precision work.
