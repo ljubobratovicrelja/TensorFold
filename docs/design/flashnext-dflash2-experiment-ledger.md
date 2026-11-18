@@ -244,10 +244,69 @@ Two method rules this paid for:
   its chunk spread is not comparable to anything — including to itself next week.
 
 Verdict: fidelity-wise affine4 fitted is the best 4-bit format (4.99–5.40% mean output rel-L2 against
-fp8's 2.1%), and acceptance-wise **all of it is free** at this resolution. That kills the "4-bit costs
-acceptance" objection and leaves exactly one open question, which this harness cannot answer: does the
-byte win show up as round time in the actual speculative loop? That needs the engine to load an affine4
-drafter, and `cuda_drafter2.zig` still has no q4 path.
+fp8's 2.1%), and acceptance-wise **all of it is free** at this resolution. That killed the "4-bit costs
+acceptance" objection and left one question this harness could not answer: does the byte win show up as
+round time in the actual speculative loop? §10 answers it with the arm built and served.
+
+## 10. The 4-bit body, served (2026-11-18)
+
+The offline fit is now a loadable arm. `cuda_draft2_fwd.zig` gained `Precision.affine4`: the same
+`cuda.qlinear.Affine4` weights gemma4's assistant uses (group 64, one signed bf16 scale **and** one bf16
+bias a group, codes 0..15), `affine4_pack`'s tiling, `qmm_group`'s tile. `quantize/export_affine4.py`
+writes the artifact from the fit's own codes; the loader names the arm by `<checkpoint>/affine4/manifest.json`,
+because a 4-bit export keeps its bf16 rows and no tensor dtype can confirm the claim.
+
+**Bytes it actually saves.** 458.75M quantized weights: bf16 917 MB, fp8 458 MB + scales, affine4
+229 MB of words + 28 MB of parameters = **258 MB**. Loaded drafter 1,206 MB (bf16) → ~780 (fp8) →
+~530 MB (affine4), so a round streams **32% fewer weight bytes than fp8**.
+
+**Round, `draft-check` on `fixture/sequence`, 15 served reps, both arms in both orders:**
+
+| arm | served round (median, 14 reps) | cold |
+|---|---:|---:|
+| bf16 | 19.16 ms | 283.8 ms |
+| fp8, first order | 15.59 ms | 215.7 ms |
+| fp8, second order | 15.75 ms | 215.8 ms |
+| affine4 | **15.32 ms** | 225.8 ms |
+
+The two fp8 rows are the same artifact measured at the two ends of the sequence, so the arm-to-arm
+difference (1.7–2.7%) is larger than fp8's own run-to-run spread (1.0%). On a real harvested chunk
+(`/tmp/harv10/out/chunk-0003`, position 1957) all three arms return the **same seven proposals**
+`[248058, 198, 27, 1628, 21402, 956, 29]`, and a stage-level comparison against a torch run holding each
+arm's own weights puts affine4 2–3× further from that reference than fp8 — flat across layers 0..4, i.e.
+the coarser format's own noise rather than an accumulating tiling error.
+
+−1.7% of the drafter round. The byte model promised ~1.2 ms (the fp8 arm's mlp 1.54 → ~0.77 ms a round
+plus qkv and the projections); the arm delivers 0.27 ms. **The affine4 decode is not byte-limited at this
+size**: `projA4` pays a `groupSums` pass per projection and qmm_group's cluster tile reads the packed
+words less efficiently per byte than `qmmf`'s lane matmul reads e4m3 codes. Halving the bytes again
+would not halve the stage.
+
+**Served end-to-end, 16 GSM8K prompts, 1024 max tokens, temp 1.0 / top-p 0.95 / top-k 20, pinned seeds,
+one server at a time on :8099 (`harness/accept_ab.py`, numbers from each server's own `done chatcmpl`
+line):**
+
+| arm | accept len | tok/s | implied round |
+|---|---:|---:|---:|
+| fp8 | 3.3205 | 48.48 | 68.17 ms |
+| affine4 | 3.3154 | 48.66 | 67.53 ms |
+
+Paired: accept **−0.15% (CI −1.0%, +0.86%)**, tok/s **+0.19 ± 0.55**. Both CIs span zero. And the free
+losslessness check holds: **16/16 completions have the same `sha` in both arms** — the 4-bit drafter
+changed its proposals and not one output token.
+
+So the honest shape of the win: 32% fewer drafter weight bytes buys **1.7% of the drafter round and
+nothing measurable end-to-end**, because the drafter is ~23% of a 68 ms round and the decode is not
+byte-bound. 4-bit is free, not faster — and fp8 is the arm to serve until something makes the decode
+bandwidth-limited (a fused groupSums, or a qmm tile that reads words at the rate the lane matmul reads
+e4m3).
+
+Two things this cost, both worth knowing before touching the loader again:
+
+* Zig 0.17's `.limited(len)` **refuses a file of exactly `len`** (`StreamTooLong`), so an exact-size
+  guard has to cap at `len + 1` and compare afterwards.
+* The artifact's file names must be **checkpoint** tensor names (`layers.0.self_attn.q_proj.weight`),
+  not the fit's compact keys (`L0_q`): the loader asks the manifest for the checkpoint's own name.
 
 Method rule this campaign just paid for: **calibrate and evaluate on real activations only.** The same
 fit run on `analysis/align_bf16/fixture/window` (synthetic taps, `gen_inputs.py`, random token ids) read
