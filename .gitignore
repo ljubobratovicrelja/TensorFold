@@ -12,6 +12,9 @@ venv/
 .DS_Store
 *.swp
 *.log
+# Quantized drafter checkpoints: the artifact is 780 MB and there is no git-lfs on this box.
+# manifest.json + SHA256SUMS + tools/dflash2/quantize pin it; the blob itself stays out of history.
+checkpoints/*/model.safetensors
 .zig-toolchain
 .zig-cache/
 zig-out/

@@ -19,6 +19,7 @@
 //! quantized head, a quantized embedding table, or bits other than 4.
 
 const std = @import("std");
+const api = @import("engine_api");
 const lanes = @import("lanes");
 const prompt = @import("cuda_prompt.zig");
 const weights = @import("cuda_prompt_wt.zig");
@@ -43,7 +44,11 @@ pub const Opened = struct {
 pub fn Opener(comptime F: type) type {
     return struct {
         /// `dir`'s DFlash2 drafter over engine `p`, four bits, mirroring `families/qwen3_5/cuda_drafter_open.zig`.
-        pub fn openDrafter(gpa: std.mem.Allocator, io: std.Io, p: *anyopaque, dir: []const u8, bits: u8) !Opened {
+        ///
+        /// `precision` is the weights' — `--drafter-precision` — and null leaves it to the
+        /// checkpoint's own tensors; either way a checkpoint whose declared precision and its
+        /// tensors disagree is refused at load (`Draft.open` -> `DrafterPrecisionMismatch`).
+        pub fn openDrafter(gpa: std.mem.Allocator, io: std.Io, p: *anyopaque, dir: []const u8, bits: u8, precision: ?api.DrafterPrecision) !Opened {
             const self: *F.Cuda = @ptrCast(@alignCast(p));
             const e = self.engine;
             const head_q = e.head_q;
@@ -75,10 +80,14 @@ pub fn Opener(comptime F: type) type {
 
             const head = try check.detile(gpa, io, e.driver, head_q.w.ptr, cfg.vocab, cfg.hidden);
             // the detiled table's ownership passes to the drafter: every failure from here frees it
+            const want: ?d2.Precision = if (precision) |q| switch (q) {
+                .bf16 => .bf16,
+                .fp8 => .fp8,
+            } else null;
             const dr = try d2.Draft2.init(gpa, io, e.driver, e.stream.*, dir, cfg, .{
                 .embed = e.table.w.ptr,
                 .head = head.ptr,
-            }, head);
+            }, head, want);
             errdefer dr.deinit();
             try self.setTaps(dr.taps());
             dr.host = .{ .ctx = self, .detach = detach };

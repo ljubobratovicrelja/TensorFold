@@ -301,6 +301,47 @@ pub const Debug = struct {
     layers: u64 = 0,
 };
 
+/// The weight precision a round runs: the checkpoint as published, or a weight-only fp8 build whose
+/// seven decoder-linear groups a projection at a time carry e4m3 codes and fp32 block scales
+/// (`cuda/fp8.zig`). Selected by the caller — `open`'s `want` — and resolved to the checkpoint's own
+/// contents when the caller says nothing (`null`), which is also where a disagreement is refused.
+pub const Precision = enum {
+    bf16,
+    fp8,
+
+    pub fn name(p: Precision) []const u8 {
+        return switch (p) {
+            .bf16 => "bf16",
+            .fp8 => "fp8",
+        };
+    }
+
+    /// `--drafter-precision`'s spellings; null for anything else.
+    pub fn parse(s: []const u8) ?Precision {
+        inline for (.{ Precision.bf16, Precision.fp8 }) |p| if (std.mem.eql(u8, s, p.name())) return p;
+        return null;
+    }
+};
+
+/// One quantized projection on the device: `npad * k` e4m3 codes in `cuda/fp8.zig`'s fragment
+/// order, then `npad * (k / 64)` fp32 scale tiles, both out of the weights' one arena.
+pub const Q = struct {
+    codes: u64,
+    scales: u64,
+    n: u32,
+    k: u32,
+    npad: u32,
+
+    pub fn weight(q: Q) cuda.qmmf.Weight {
+        return .{ .mode = .fp8g, .codes = q.codes, .scales = q.scales, .n = q.n, .k = q.k, .npad = q.npad };
+    }
+};
+
+/// A projection the round multiplies by: bf16 rows as published, or its block-FP8 packing. The
+/// union is the dispatch — a bf16 checkpoint binds every `bf16` field and reaches the same kernels
+/// it always did, byte for byte.
+pub const Lin = union(Precision) { bf16: u64, fp8: Q };
+
 /// The drafter's weights, one arena, bound by `cuda_draft2_weights.zig`'s names and shapes.
 pub const Weights = struct {
     arena: cuda.DeviceBuffer,
@@ -322,29 +363,82 @@ pub const Weights = struct {
         w.* = undefined;
     }
 
+    /// Reserve `len` bytes at the next 256-byte boundary and return the arena offset.
+    fn book(w: *Weights, len: usize) !usize {
+        const at = (w.at + 255) & ~@as(usize, 255);
+        if (at + len > w.arena.len) return error.ArenaExhausted;
+        w.at = at + len;
+        return at;
+    }
+
     fn take(w: *Weights, ck: *core.Checkpoint, name: []const u8, shape: []const usize) !u64 {
         const t = try ck.expect(name, .bf16, shape);
-        const at = (w.at + 255) & ~@as(usize, 255);
-        if (at + t.bytes.len > w.arena.len) return error.ArenaExhausted;
-        w.at = at + t.bytes.len;
+        const at = try w.book(t.bytes.len);
         try w.arena.upload(at, t.bytes);
         return w.arena.ptr + at;
     }
+
+    /// A block-FP8 projection: `[n, k]` e4m3 codes and its `[blocks(n), blocks(k)]` scales, repacked
+    /// on the host into the kernel's fragment and tile orders (`cuda/fp8.zig`), then booked like any
+    /// other tensor. The checkpoint's names are the contract's; a build that spells them under
+    /// `model.` is read too, because that is how an export writes them.
+    fn takeFp8(w: *Weights, gpa: std.mem.Allocator, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize) !Q {
+        const codes = try expectNamed(ck, name, .f8_e4m3, &.{ n, k });
+        var name_buf: [96]u8 = undefined;
+        const scale_name = try std.fmt.bufPrint(&name_buf, "{s}_scale_inv", .{name});
+        const scales = try expectNamed(ck, scale_name, null, &.{ (n + 127) / 128, (k + 127) / 128 });
+        const npad = cuda.fp8.padded(n);
+        const host = try gpa.alloc(u8, npad * k);
+        defer gpa.free(host);
+        cuda.fp8.packCodes(host, codes.bytes, n, k);
+        const inv = try gpa.alloc(f32, scales.numel());
+        defer gpa.free(inv);
+        try core.quant.fp8.widen(scales, inv, false);
+        const tiles = try gpa.alloc(f32, npad * (k / cuda.qmmf.group));
+        defer gpa.free(tiles);
+        cuda.fp8.packScales(tiles, inv, n, k);
+        const cat = try w.book(host.len);
+        try w.arena.upload(cat, host);
+        const sat = try w.book(std.mem.sliceAsBytes(tiles).len);
+        try w.arena.upload(sat, std.mem.sliceAsBytes(tiles));
+        return .{ .codes = w.arena.ptr + cat, .scales = w.arena.ptr + sat, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) };
+    }
 };
+
+/// `name`'s tensor, or the same name under the `model.` prefix an export writes it with; `dtype`
+/// null accepts any scale dtype (`core.quant.fp8.widen` converts f32/bf16/f16).
+fn expectNamed(ck: *core.Checkpoint, name: []const u8, dtype: ?core.checkpoint.DType, shape: []const usize) !core.checkpoint.Tensor {
+    var buf: [96]u8 = undefined;
+    const full = if (ck.has(name))
+        name
+    else if (ck.has(try std.fmt.bufPrint(&buf, "model.{s}", .{name})))
+        try std.fmt.bufPrint(&buf, "model.{s}", .{name})
+    else {
+        std.log.err("fp8 drafter has no tensor {s}", .{name});
+        return error.MissingTensor;
+    };
+    const t = try ck.get(full);
+    const dtype_ok = if (dtype) |d| t.dtype == d else t.dtype == .f32 or t.dtype == .bf16 or t.dtype == .f16;
+    if (!dtype_ok or t.rank != shape.len or !std.mem.eql(usize, t.shape[0..t.rank], shape)) {
+        std.log.err("{s}: {t} {any}, expected {any} {any}", .{ full, t.dtype, t.shape[0..t.rank], dtype, shape });
+        return error.UnexpectedTensor;
+    }
+    return t;
+}
 
 /// One layer's tensors, in `cuda_draft2_weights.layerTensor`'s order.
 pub const Layer = struct {
     input_norm: u64,
     post_norm: u64,
-    q: u64,
-    k: u64,
-    v: u64,
-    o: u64,
+    q: Lin,
+    k: Lin,
+    v: Lin,
+    o: Lin,
     q_norm: u64,
     k_norm: u64,
-    gate: u64,
-    up: u64,
-    down: u64,
+    gate: Lin,
+    up: Lin,
+    down: Lin,
     /// The two-tap dynamic convolution's base kernel `[2, 2, hidden]` and its projection
     /// `[2 * 2 * groups, hidden]`, input side then output side.
     attn_base: u64,
@@ -426,6 +520,19 @@ pub const Draft = struct {
     m16: cuda.Function,
     tile16: cuda.Function,
     headw: cuda.DeviceBuffer,
+    /// The weights' precision, resolved at load: `want` when the caller named one, else what the
+    /// checkpoint's own tensors say. Every projection's dispatch reads this one enum.
+    precision: Precision,
+    /// What the caller asked for: null leaves it to the checkpoint (and still refuses a checkpoint
+    /// whose declared precision and its tensors disagree).
+    want: ?Precision = null,
+    /// The lane matmul the fp8 arms' three groups run on (`cuda/qmmf.zig`), loaded only when the
+    /// weights are fp8: a bf16 round never loads the module, and its rows never leave the kernels
+    /// they have always used.
+    lane: ?cuda.qmmf.Lane = null,
+    /// The K-slice partials a reduce plans asks for (`Lane.partBytes`), sized once for the shapes a
+    /// round's projections can take; null on the bf16 arm.
+    qpart: ?cuda.DeviceBuffer = null,
     /// The context fuse's dot: `glm_fuse_dot`, one CTA per 64 output columns with every row of the
     /// chunk inside it, so a chunk of the prefix streams the whole 65 MB `fc` once for all its rows
     /// instead of once per row — with the per-row kernel's scalar K-order arithmetic unchanged.
@@ -455,7 +562,7 @@ pub const Draft = struct {
     /// Open `dir`'s drafter against `cfg` (the served target's own config) and `target`'s two
     /// tensors. Every refusal here is one a load should never survive: a shape this module's
     /// kernels do not fix, or a checkpoint that is not the served drafter's.
-    pub fn open(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, dir: []const u8, cfg: config.Config, target: Target) !*Self {
+    pub fn open(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, stream: cuda.Stream, dir: []const u8, cfg: config.Config, target: Target, want: ?Precision) !*Self {
         if (target.embed == 0 or target.head == 0) return error.TargetTensorsMissing;
         const c = try draft2.read(gpa, io, dir, cfg);
         if (c.n_taps != n_taps) return error.DraftTapCountUnsupported;
@@ -469,7 +576,7 @@ pub const Draft = struct {
 
         const s = try gpa.create(Self);
         errdefer gpa.destroy(s);
-        s.* = .{ .gpa = gpa, .io = io, .d = d, .stream = stream, .c = c, .w = undefined, .target = target, .mod = undefined, .rows = undefined, .fns = undefined, .mm = undefined, .m16 = undefined, .tile16 = undefined, .headw = undefined, .fuse_dot = undefined };
+        s.* = .{ .gpa = gpa, .io = io, .d = d, .stream = stream, .c = c, .w = undefined, .target = target, .mod = undefined, .rows = undefined, .fns = undefined, .mm = undefined, .m16 = undefined, .tile16 = undefined, .headw = undefined, .precision = .bf16, .want = want, .fuse_dot = undefined };
         s.mod = try cuda.Module.load(d, cuda.kernels.qwen35_draft);
         errdefer s.mod.unload();
         s.rows = try cuda.qwen35_bf16_rows.Kernels.load(d);
@@ -523,6 +630,8 @@ pub const Draft = struct {
 
     pub fn deinit(s: *Self) void {
         s.w.deinit(s.gpa);
+        if (s.qpart) |*b| b.free();
+        if (s.lane) |*l| l.unload();
         s.headw.free();
         s.rows.unload();
         s.mod.unload();
@@ -769,9 +878,9 @@ pub const Draft = struct {
         try stageLayer(s, i, "conv_attn_in_{d}", &.{.{ .ptr = b.xin, .cols = H }}, B, H, .bf16);
         // the block's attention projections: one launch each for all B rows, so a weight row streams
         // once a layer instead of once a row (`denseBatch`'s bytes are `dense`'s, bit for bit)
-        try denseBatch(s, b.xin, l.q, b.qraw, qw, H, B);
-        try denseBatch(s, b.xin, l.k, b.kraw, kvw, H, B);
-        try denseBatch(s, b.xin, l.v, b.vb, kvw, H, B);
+        try projBatch(s, b.xin, l.q, b.qraw, qw, H, B);
+        try projBatch(s, b.xin, l.k, b.kraw, kvw, H, B);
+        try projBatch(s, b.xin, l.v, b.vb, kvw, H, B);
         // q, k and v side by side, before the per-head norm and the rotation: the projections the
         // block's attention is built out of
         try stageLayer(s, i, "qkv_{d}", &.{ .{ .ptr = b.qraw, .cols = qw }, .{ .ptr = b.kraw, .cols = kvw }, .{ .ptr = b.vb, .cols = kvw } }, B, qw + 2 * kvw, .bf16);
@@ -784,7 +893,7 @@ pub const Draft = struct {
         // engine projects the prefix once a layer, and the two cannot be separated without a second
         // copy of the ring. The tensor is the attention's own output.
         try stageLayer(s, i, "attn_{d}", &.{.{ .ptr = b.att, .cols = qw }}, B, qw, .bf16);
-        try denseBatch(s, b.att, l.o, b.o, H, qw, B);
+        try projBatch(s, b.att, l.o, b.o, H, qw, B);
         // the output projection's own rows: `attn_i` is the attention before `o_proj`
         try stageLayer(s, i, "attn_proj_{d}", &.{.{ .ptr = b.o, .cols = H }}, B, H, .bf16);
         try dynConv(s, b.o, b.dyn, l.attn_base, b.h, b.h2, 1);
@@ -794,10 +903,10 @@ pub const Draft = struct {
         try dense(s, b.x, l.mlp_conv, b.dyn, dyn, H, B);
         try dynConv(s, b.x, b.dyn, l.mlp_base, 0, b.xin, 0);
         try stageLayer(s, i, "conv_mlp_in_{d}", &.{.{ .ptr = b.xin, .cols = H }}, B, H, .bf16);
-        try denseBatch(s, b.xin, l.gate, b.gate, c.intermediate, H, B);
-        try denseBatch(s, b.xin, l.up, b.up, c.intermediate, H, B);
+        try projBatch(s, b.xin, l.gate, b.gate, c.intermediate, H, B);
+        try projBatch(s, b.xin, l.up, b.up, c.intermediate, H, B);
         try siluMul(s, b.gate, b.up, b.act, B * c.intermediate);
-        try denseBatch(s, b.act, l.down, b.o, H, c.intermediate, B);
+        try projBatch(s, b.act, l.down, b.o, H, c.intermediate, B);
         try stageLayer(s, i, "mlp_{d}", &.{.{ .ptr = b.o, .cols = H }}, B, H, .bf16);
         try dynConv(s, b.o, b.dyn, l.mlp_base, b.h2, b.h, 1);
         try stageLayer(s, i, "conv_mlp_out_{d}", &.{.{ .ptr = b.h, .cols = H }}, B, H, .bf16);
@@ -846,8 +955,8 @@ pub const Draft = struct {
                 }
             }
             if (!stale) {
-                try dense(s, b.ctx, l.k, b.kcr, kvw, H, n);
-                try dense(s, b.ctx, l.v, b.vc, kvw, H, n);
+                try projRows(s, b.ctx, l.k, b.kcr, kvw, H, n);
+                try projRows(s, b.ctx, l.v, b.vc, kvw, H, n);
                 try normRope(s, b.kcr, l.k_norm, b.kc, kvw, c.kv_heads, @intCast(at), n);
                 try ringPut(s, b.kc, b.vc, s.ringK(st, i), s.ringV(st, i), kvw, @intCast(at), n);
             }
@@ -1078,6 +1187,36 @@ fn denseBatch(s: *Draft, x: u64, w: u64, out: u64, n: usize, k: usize, rows: usi
     return s.rows.denseBatch(s.stream, x, w, out, rows, n, k);
 }
 
+/// A block-FP8 projection for `rows` rows: the lane matmul over its codes and scale tiles, K sliced
+/// as `qmmf.splitK` says for the shape and reduced when the plan asks (`Lane.matmul`).
+///
+/// The output is bf16 exactly as `dense`'s is — the kernel accumulates fp32 and rounds once a row —
+/// so every stage after a projection reads the buffer it always read, at the width it always had.
+fn projQ(s: *Draft, x: u64, q: Q, out: u64, rows: usize) !void {
+    const lane = s.lane orelse return error.DrafterPrecisionMismatch;
+    const w = q.weight();
+    const part: u64 = if (s.qpart) |b| b.ptr else 0;
+    if (lane.partBytes(rows, w) > (if (s.qpart) |b| b.len else 0)) return error.DrafterPartTooSmall;
+    try lane.matmul(s.stream, x, w.k, rows, w, out, part);
+}
+
+/// One of the seven quantized groups' projections, over the block's rows at once: bf16 takes the row
+/// batch kernel, unchanged; fp8 takes the lane matmul.
+fn projBatch(s: *Draft, x: u64, l: Lin, out: u64, n: usize, k: usize, rows: usize) !void {
+    switch (l) {
+        .bf16 => |w| try denseBatch(s, x, w, out, n, k, rows),
+        .fp8 => |q| try projQ(s, x, q, out, rows),
+    }
+}
+
+/// The same for the prefix's chunked rows, whose bf16 kernel is the per-row `dense`.
+fn projRows(s: *Draft, x: u64, l: Lin, out: u64, n: usize, k: usize, rows: usize) !void {
+    switch (l) {
+        .bf16 => |w| try dense(s, x, w, out, n, k, rows),
+        .fp8 => |q| try projQ(s, x, q, out, rows),
+    }
+}
+
 /// tf_fxd2_silu_mul(GATE, UP, OUT, n): one thread an element.
 fn siluMul(s: *Draft, gate: u64, up: u64, out: u64, n: usize) !void {
     try launch(s, s.fns.silu_mul, .{ @intCast((n + 255) / 256), 1, 1 }, 256, 0, .{ gate, up, out, ci(n) });
@@ -1208,7 +1347,43 @@ fn loadWeights(gpa: std.mem.Allocator, io: std.Io, s: *Draft, dir: []const u8) !
     const c = s.c;
     var ck = try core.Checkpoint.openModel(gpa, io, dir);
     defer core.checkpoint.cache.close(&ck);
-    var w: Weights = .{ .arena = try cuda.DeviceBuffer.alloc(s.d, contract.bytes(c)), .fc = 0, .hidden_norm = 0, .norm = 0, .hidden_proj = 0, .pred = 0, .succ = 0, .layers = &.{} };
+    // The precision, resolved before a byte is booked: the caller's word if it gave one, else what
+    // the checkpoint's own tensors say — and a checkpoint whose two halves disagree is refused here
+    // rather than half-read (`DrafterPrecisionMismatch`), because a bf16 GEMM over e4m3 codes is a
+    // round of noise that looks like a weak drafter.
+    const scales_present = ck.has("layers.0.mlp.down_proj.weight_scale_inv") or
+        ck.has("model.layers.0.mlp.down_proj.weight_scale_inv");
+    // What the tensors say, then what the config claims, then what the caller asked for: the
+    // caller wins, an unstated config defers to the tensors, and any two of them disagreeing is a
+    // refusal rather than a guess.
+    const actual: Precision = if (scales_present) .fp8 else .bf16;
+    const declared: ?Precision = if (s.c.declared) |d| switch (d) {
+        .bf16 => .bf16,
+        .fp8 => .fp8,
+    } else null;
+    if (declared) |d| if (d != actual) {
+        std.log.err("drafter {s}: config.json declares {s} weights, but its tensors are {s}", .{ dir, d.name(), actual.name() });
+        return error.DrafterPrecisionMismatch;
+    };
+    const p = s.want orelse declared orelse actual;
+    if (p != actual) {
+        std.log.err("drafter {s}: --drafter-precision {s}, but its tensors are {s}", .{ dir, p.name(), actual.name() });
+        return error.DrafterPrecisionMismatch;
+    }
+    s.precision = p;
+    if (p == .fp8) {
+        s.lane = try cuda.qmmf.Lane.load(s.d, (try s.d.currentCapability()) / 10);
+        if (s.lane) |*lane| {
+            const part = qpartBytes(c, lane);
+            if (part > 0) s.qpart = try cuda.DeviceBuffer.alloc(s.d, part);
+        }
+    }
+    const arena_bytes = switch (p) {
+        .bf16 => contract.bytes(c),
+        // plus the 256-byte alignment of each of the extra scale/image bookings
+        .fp8 => contract.fp8Bytes(c) + (64 << 10),
+    };
+    var w: Weights = .{ .arena = try cuda.DeviceBuffer.alloc(s.d, arena_bytes), .fc = 0, .hidden_norm = 0, .norm = 0, .hidden_proj = 0, .pred = 0, .succ = 0, .layers = &.{} };
     errdefer w.arena.free();
     w.layers = try gpa.alloc(Layer, c.layers);
     errdefer gpa.free(w.layers);
@@ -1226,23 +1401,32 @@ fn loadWeights(gpa: std.mem.Allocator, io: std.Io, s: *Draft, dir: []const u8) !
     var name_buf: [64]u8 = undefined;
     var shape_buf: [4]usize = undefined;
     for (w.layers, 0..) |*l, i| {
-        var t: [contract.per_layer]u64 = undefined;
-        for (&t, 0..) |*ptr, k| {
+        var t: [contract.per_layer]u64 = @splat(0);
+        // the seven quantized groups: one dispatch a projection, in the contract's own order
+        var lin: [7]Lin = undefined;
+        for (0..contract.per_layer) |k| {
             const e = try contract.layerTensor(c, i, k, &name_buf, &shape_buf);
-            ptr.* = try w.take(&ck, e.name, e.shape);
+            if (contract.quantized(k)) {
+                lin[quantizedAt(k).?] = switch (p) {
+                    .bf16 => .{ .bf16 = try w.take(&ck, e.name, e.shape) },
+                    .fp8 => .{ .fp8 = try w.takeFp8(gpa, &ck, e.name, e.shape[0], e.shape[1]) },
+                };
+                continue;
+            }
+            t[k] = try w.take(&ck, e.name, e.shape);
         }
         l.* = .{
             .input_norm = t[0],
             .post_norm = t[1],
-            .q = t[2],
-            .k = t[3],
-            .v = t[4],
-            .o = t[5],
+            .q = lin[0],
+            .k = lin[1],
+            .v = lin[2],
+            .o = lin[3],
             .q_norm = t[6],
             .k_norm = t[7],
-            .gate = t[8],
-            .up = t[9],
-            .down = t[10],
+            .gate = lin[4],
+            .up = lin[5],
+            .down = lin[6],
             .attn_base = t[11],
             .attn_conv = t[12],
             .mlp_base = t[13],
@@ -1253,6 +1437,37 @@ fn loadWeights(gpa: std.mem.Allocator, io: std.Io, s: *Draft, dir: []const u8) !
     // does not understand, which is worse to half-read than to refuse.
     if (ck.unused() != 0) return error.UnexpectedTensor;
     return w;
+}
+
+/// A quantized tensor's slot in the seven-layer `lin` array: q, k, v, o, gate, up, down.
+fn quantizedAt(k: usize) ?usize {
+    return switch (k) {
+        2 => 0,
+        3 => 1,
+        4 => 2,
+        5 => 3,
+        8 => 4,
+        9 => 5,
+        10 => 6,
+        else => null,
+    };
+}
+
+/// The widest K-slice partial span a quantized projection can need at the rows a round uses: the
+/// block's rows and a context chunk's, over the shapes this config's layers carry.
+fn qpartBytes(c: Config, lane: *const cuda.qmmf.Lane) usize {
+    const H = c.hidden;
+    const shapes = [_][2]usize{
+        .{ c.qWidth(), H }, .{ c.kvWidth(), H }, .{ c.kvWidth(), H },
+        .{ H, c.qWidth() },  .{ c.intermediate, H }, .{ c.intermediate, H },
+        .{ H, c.intermediate },
+    };
+    var most: usize = 0;
+    for (shapes) |s| for ([2]usize{ c.block, ctx_chunk }) |rows| {
+        const w = cuda.fp8.weight(0, 0, s[0], s[1]);
+        most = @max(most, lane.partBytes(rows, w));
+    };
+    return most;
 }
 
 fn bytes(factors: anytype) !usize {

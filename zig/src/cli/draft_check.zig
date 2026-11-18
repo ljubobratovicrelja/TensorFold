@@ -23,8 +23,13 @@ const tile_rows: usize = 64;
 
 const usage =
     \\usage: tensorfold draft-check --drafter DIR --target DIR --fixture DIR --out DIR [--repeat N]
+    \\                              [--drafter-precision bf16|fp8]
     \\
     \\  --drafter DIR   the DFlash2 drafter checkpoint
+    \\  --drafter-precision P
+    \\                  the drafter's weight precision: bf16 (as published) or fp8 (weight-only, W8A16).
+    \\                  Omitted, the checkpoint's own tensors decide, and a checkpoint whose declared
+    \\                  precision and contents disagree is refused.
     \\  --target DIR    the target checkpoint; only its embed table and head are read
     \\  --fixture DIR   a pre-collected ring (manifest.json, ids.bin, ring.bin)
     \\  --out DIR       where rep{i}/ is written
@@ -45,6 +50,7 @@ const Args = struct {
     fixture: []const u8 = "",
     out: []const u8 = "",
     repeat: usize = 0,
+    precision: ?draftcheck.Precision = null,
 };
 
 fn parse(args: []const []const u8) !Args {
@@ -65,6 +71,8 @@ fn parse(args: []const []const u8) !Args {
             a.out = v;
         } else if (std.mem.eql(u8, flag, "--repeat")) {
             a.repeat = std.fmt.parseInt(usize, v, 10) catch return error.BadRepeat;
+        } else if (std.mem.eql(u8, flag, "--drafter-precision")) {
+            a.precision = draftcheck.Precision.parse(v) orelse return error.BadDrafterPrecision;
         } else return error.UnknownFlag;
     }
     if (a.drafter.len == 0 or a.target.len == 0 or a.fixture.len == 0 or a.out.len == 0)
@@ -139,6 +147,6 @@ pub fn main(init: std.process.Init, argv: []const [:0]const u8) !u8 {
         .head_bf16 = true,
     };
 
-    try draftcheck.runFixtureAt(gpa, io, &driver, stream, o.drafter, m, o.fixture, o.out, o.repeat);
+    try draftcheck.runFixtureAt(gpa, io, &driver, stream, o.drafter, m, o.fixture, o.out, o.repeat, o.precision);
     return 0;
 }

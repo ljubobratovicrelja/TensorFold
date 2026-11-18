@@ -40,6 +40,10 @@ pub const Draft = struct {
     theta: f32,
     taps: [max_taps]u32 = @splat(0),
     n_taps: usize = 0,
+    /// `dflash_config.precision`, when the export states one. It is a *claim*, checked against the
+    /// tensors at load (`cuda_draft2_fwd.zig`): a folder that says fp8 and holds bf16 rows is
+    /// refused, not read.
+    declared: ?DeclaredPrecision = null,
 
     pub fn qWidth(d: Draft) usize {
         return d.heads * d.head_dim;
@@ -136,6 +140,7 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, target: config.Config) !
         if (std.mem.indexOfScalar(u32, c.taps[0..i], c.taps[i]) != null) return error.BadDraftConfig;
     }
     c.n_taps = taps.array.items.len;
+    c.declared = declaredPrecision(d.object);
 
     // The drafter's head IS the target's head, so its rows must be the target's width. A
     // mismatch here is silent garbage rather than a crash, so it is refused at admission.
@@ -148,6 +153,24 @@ pub fn parse(gpa: std.mem.Allocator, bytes: []const u8, target: config.Config) !
     if (c.block < 2 or c.block > max_block) return error.UnsupportedDraftConfig;
     if (c.window < 16) return error.UnsupportedDraftConfig;
     return c;
+}
+
+/// The weight-precision markers an export's `dflash_config.precision` may carry. Only the two the
+/// loader can honour are listed; an unreadable value is ignored (the tensors still decide).
+pub const DeclaredPrecision = enum { bf16, fp8 };
+
+fn declaredPrecision(o: std.json.ObjectMap) ?DeclaredPrecision {
+    const v = o.get("precision") orelse return null;
+    if (v != .string) return null;
+    const names = [_]struct { tag: DeclaredPrecision, text: []const u8 }{
+        .{ .tag = .fp8, .text = "fp8" },
+        .{ .tag = .fp8, .text = "fp8_w8a16" },
+        .{ .tag = .fp8, .text = "w8a16" },
+        .{ .tag = .bf16, .text = "bf16" },
+        .{ .tag = .bf16, .text = "bfloat16" },
+    };
+    for (names) |n| if (std.mem.eql(u8, v.string, n.text)) return n.tag;
+    return null;
 }
 
 /// The selector's held candidates a row, as the reference's `lp_top`.

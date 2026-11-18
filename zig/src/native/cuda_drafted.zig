@@ -63,7 +63,15 @@ pub fn wrap(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, loaded: 
         problem.* = try std.fmt.allocPrint(a, "--drafter: {s} checkpoints load no draft model on CUDA", .{F.model_type});
         return null;
     }
-    const opened = F.openDrafter(gpa, io, loaded.ctx, dir, o.drafter_bits) catch |e| {
+    // A family whose drafter has a weight-precision arm declares `drafter_precision`; the rest keep
+    // their one published precision and refuse the flag's fp8 by name before a byte is loaded.
+    const opened = (if (comptime @hasDecl(F, "drafter_precision"))
+        F.openDrafter(gpa, io, loaded.ctx, dir, o.drafter_bits, o.drafter_precision)
+    else if (o.drafter_precision == .fp8) {
+        problem.* = try std.fmt.allocPrint(a, "--drafter-precision fp8: {s} serves its drafter as published (bf16)", .{F.model_type});
+        return null;
+    } else
+        F.openDrafter(gpa, io, loaded.ctx, dir, o.drafter_bits)) catch |e| {
         problem.* = try std.fmt.allocPrint(a, "the native CUDA engine cannot load the drafter {s} ({s})", .{ dir, @errorName(e) });
         return null;
     };

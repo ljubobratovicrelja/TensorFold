@@ -83,6 +83,40 @@ pub fn expected(d: Draft, out: *[max_tensors]Tensor, shapes: *[max_tensors][4]us
     return n;
 }
 
+/// Whether layer tensor `k` is one a weight-only fp8 checkpoint stores as e4m3 codes plus a
+/// `weight_scale_inv` beside it: the three decoder-linear groups (mlp gate/up/down, attention
+/// q/k/v and o). Everything else — the fuse `fc`, the two convs, every norm, the selector — stays
+/// bf16 in both arms, because a block-FP8 GEMM is only paid for where the bytes dominate.
+pub fn quantized(k: usize) bool {
+    return switch (k) {
+        2, 3, 4, 5, 8, 9, 10 => true,
+        else => false,
+    };
+}
+
+/// Row blocks and codes a block-FP8 projection `[n, k]` takes on the device: `npad * k` code bytes
+/// (`fp8.padded`), then `npad * (k / 64)` fp32 scale tiles.
+pub fn fp8LinearBytes(n: usize, k: usize) usize {
+    const npad = (n + 127) / 128 * 128;
+    return npad * k + npad * (k / 64) * 4;
+}
+
+/// The weight bytes an fp8 checkpoint's contract accounts for: `bytes` with each quantized
+/// projection's bf16 rows replaced by its codes and scale tiles.
+pub fn fp8Bytes(d: Draft) usize {
+    var total: usize = bytes(d);
+    var buf: [64]u8 = undefined;
+    var shape: [4]usize = undefined;
+    for (0..d.layers) |i| for (0..per_layer) |k| {
+        if (!quantized(k)) continue;
+        const t = layerTensor(d, i, k, &buf, &shape) catch continue;
+        const n = t.shape[0];
+        const cols = t.shape[1];
+        total = total - n * cols * 2 + fp8LinearBytes(n, cols);
+    };
+    return total;
+}
+
 /// The `k`-th tensor of layer `i` (`0 .. per_layer`), built into `buf` for its name and `shape` for its extents.
 pub fn layerTensor(d: Draft, i: usize, k: usize, buf: []u8, shape: *[4]usize) !Tensor {
     const heads, const hd, const hidden = .{ d.heads, d.head_dim, d.hidden };

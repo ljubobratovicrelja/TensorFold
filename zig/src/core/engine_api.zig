@@ -269,6 +269,11 @@ pub const Family = struct {
 /// The math an NVFP4 checkpoint runs: its own (FP4 rows into NVFP4 layers, FP8 into FP8 ones), or bf16 rows throughout.
 pub const Precision = enum { checkpoint, full };
 
+/// --drafter-precision: the draft model's weight precision — the checkpoint as published, or a
+/// weight-only fp8 build (`--drafter-precision fp8`). Families whose drafter has no quantized arm
+/// refuse `.fp8` by name rather than reading e4m3 codes as bf16 rows.
+pub const DrafterPrecision = enum { bf16, fp8 };
+
 /// What a server asks of the engine it opens: the checkpoint, and the serve flags an engine reads.
 pub const Open = struct {
     pub const slideRefusal = @import("engine_slide.zig").refusal;
@@ -298,6 +303,11 @@ pub const Open = struct {
     drafter: ?[]const u8 = null,
     drafter_name: ?[]const u8 = null, // the supplied --drafter name, before resolving its directory
     drafter_bits: u8 = 4,
+    /// --drafter-precision: the drafter's weight precision — `bf16` as published, or a weight-only
+    /// fp8 build. Null leaves it to the checkpoint's own tensors (a family still refuses a
+    /// checkpoint whose declared precision and contents disagree). Only a family whose drafter has a
+    /// quantized arm reads this as anything but a refusal.
+    drafter_precision: ?DrafterPrecision = null,
     rope_yarn: ?f64 = null, // --rope-yarn: YaRN over the checkpoint's trained window; families without it refuse
     /// --record: each stream's committed rows and tapped features written under this folder, for drafter training.
     record: ?[]const u8 = null,

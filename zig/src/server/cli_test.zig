@@ -245,6 +245,11 @@ test "parse and capabilities share the table" {
     try std.testing.expectEqualStrings("x", (try parse(a, &.{ "m", "--drafter", "x" }, &u)).drafter.?);
     try std.testing.expectEqual(@as(u8, 0), (try parse(a, &.{ "m", "--drafter-bits", "0" }, &u)).drafter_bits);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--drafter-bits", "8" }, &u));
+    // --drafter-precision: explicit wins, absent defers to the checkpoint's own tensors (null)
+    try std.testing.expectEqual(@as(?api.DrafterPrecision, .fp8), (try parse(a, &.{ "m", "--drafter-precision", "fp8" }, &u)).drafter_precision);
+    try std.testing.expectEqual(@as(?api.DrafterPrecision, .bf16), (try parse(a, &.{ "m", "--drafter-precision", "bf16" }, &u)).drafter_precision);
+    try std.testing.expectEqual(@as(?api.DrafterPrecision, null), args.drafter_precision);
+    try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--drafter-precision", "fp8x" }, &u));
     try std.testing.expectEqualStrings("/r", (try parse(a, &.{ "m", "--record", "/r" }, &u)).record.?);
     try std.testing.expectEqualStrings("fp8", (try parse(a, &.{ "m", "--kv-cache", "fp8" }, &u)).kv_cache);
     try std.testing.expectError(error.Usage, parse(a, &.{ "m", "--kv-cache", "int4" }, &u));

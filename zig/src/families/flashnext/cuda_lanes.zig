@@ -34,6 +34,9 @@ pub fn Namespace(comptime Tri: type) type {
         /// namespace this file returns — a decl on the module root is not seen).
         pub const takes_drafter = true;
         pub const openDrafter = @import("cuda_drafter_open.zig").Opener(@This()).openDrafter;
+        /// This family's drafter takes `--drafter-precision`: `native/cuda_drafted.zig`'s `wrap`
+        /// passes the flag through where this is declared, and refuses `.fp8` where it is not.
+        pub const drafter_precision = true;
         pub const formats: []const []const u8 = &.{ "mlx-q4g32", "modelopt-mixed" };
         // the model's window: past 2,048 keys the block indexer picks each row's 512 best blocks of 4 (cuda_batch.zig)
         pub const default_context: i64 = @intCast(prompt.max_tokens);

@@ -52,6 +52,9 @@ const fwd = @import("cuda_draft2_fwd.zig");
 const dr = lanes.drafter;
 const Stream = lanes.Stream;
 
+/// The weights' precision, re-exported from the forward (`bf16` as published, or weight-only fp8).
+pub const Precision = fwd.Precision;
+
 /// The drafter's block: the anchor's row and `block - 1` proposals beside it.
 pub const block = fwd.block;
 /// Proposals a round holds, and the rows a verify round carries beside its anchor.
@@ -296,6 +299,8 @@ pub const Draft2 = struct {
         cfg: config.Config,
         target: fwd.Target,
         head: cuda.DeviceBuffer,
+        /// The weights' precision (`--drafter-precision`), or null for the checkpoint's own.
+        want: ?Precision,
     ) !*Self {
         // the detiled head is this drafter's from the first line, whatever refuses below: the caller
         // hands it over and never frees it again
@@ -306,7 +311,7 @@ pub const Draft2 = struct {
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .io = io, .d = d, .stream = stream, .fwd = undefined, .head = owned };
         self.tap_source = tapring.sourceFromEnv();
-        self.fwd = try fwd.Draft.open(gpa, io, d, stream, dir, cfg, target);
+        self.fwd = try fwd.Draft.open(gpa, io, d, stream, dir, cfg, target, want);
         errdefer self.fwd.deinit();
         self.fwd.target.head = self.head.ptr;
         try self.measure();
