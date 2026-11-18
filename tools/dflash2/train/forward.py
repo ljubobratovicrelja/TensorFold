@@ -444,3 +444,65 @@ def acceptance(proposed, posterior) -> int:
             break
         n += 1
     return n
+
+
+# --------------------------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------------------------
+
+def selftest(device: str = "cuda") -> int:
+    """Exercise the rounding-sensitive elementary ops on synthetic tensors — no checkpoint, no
+    fixture, a few KB of scratch. Checks the dtypes/shapes each kernel contract requires."""
+    dev = torch.device(device)
+    torch.manual_seed(0)
+
+    t = torch.tensor([1.0, 0.1, -3.3, 1e-8], dtype=torch.float32)
+    assert torch.equal(rbf(t), t.to(torch.bfloat16).float())
+    print(f"rbf         in {tuple(t.shape)} fp32 -> bf16 round-trip, max|d| {float((rbf(t) - t).abs().max()):.2e}")
+
+    x = torch.randn(4, 64, device=dev).to(torch.bfloat16)
+    w = torch.randn(64, device=dev).to(torch.bfloat16)
+    y = rms_norm(x, w)
+    assert y.shape == x.shape and y.dtype == torch.bfloat16
+    print(f"rms_norm    {tuple(x.shape)} bf16 -> {tuple(y.shape)} {y.dtype}")
+
+    xr = torch.randn(4, 2 * HD, device=dev).to(torch.bfloat16)
+    wr = torch.randn(HD, device=dev).to(torch.bfloat16)
+    yr = norm_rope(xr, wr, 2, 17)
+    assert yr.shape == xr.shape and yr.dtype == torch.bfloat16
+    print(f"norm_rope   {tuple(xr.shape)} heads=2 pos0=17 -> {tuple(yr.shape)} {yr.dtype}")
+
+    d, tt = 64, 4
+    xc = torch.randn(tt, d, device=dev).to(torch.bfloat16)
+    dyn = torch.randn(tt, 2 * KERNEL * (d // GROUP), device=dev).to(torch.bfloat16)
+    base = torch.randn(KERNEL, KERNEL, d, device=dev).to(torch.bfloat16)
+    y0 = dyn_conv(xc, dyn, base, 0)
+    y1 = dyn_conv(xc, dyn, base, 1, res=xc)
+    assert y0.shape == xc.shape and y0.dtype == torch.bfloat16
+    assert y1.shape == xc.shape and y1.dtype == torch.bfloat16
+    print(f"dyn_conv    {tuple(xc.shape)} d={d} -> branch0 {y0.dtype}, branch1+res {y1.dtype}")
+    print(f"ok  device {dev}  cuda available {torch.cuda.is_available()}")
+    return 0
+
+
+def main(argv: Optional[list[str]] = None) -> int:
+    import argparse
+
+    ap = argparse.ArgumentParser(
+        description="The DFlash2 drafter forward in torch. This file is a library: parity.py "
+                    "imports it, holds the fixtures and the engine binary, and reports the diff. "
+                    "Only --selftest runs anything on its own.")
+    ap.add_argument("--selftest", action="store_true",
+                    help="run the elementary ops (rbf/rms_norm/norm_rope/dyn_conv) on synthetic "
+                         "tensors; needs no checkpoint and no fixture")
+    ap.add_argument("--device", default="cuda", help="cuda (default) or cpu")
+    args = ap.parse_args(argv)
+    if args.selftest:
+        return selftest(args.device)
+    ap.print_help()
+    print("\nFor the end-to-end check against the engine:  python parity.py --help")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
