@@ -77,6 +77,15 @@ rows into the dump), `TF_FLASHNEXT_LG_DUMP=<dir>` (head input + fp32 logits, row
 | `proposals` — the selector walk | 1.44 | 5.4% | 3.57 |
 | qkv, attn_proj, convs, norms | the rest | | |
 
+**The same numbers as a figure:** `docs/design/profiles/2026-11-18-served-round.png`, drawn by
+`tools/dflash2/plot_stages.py` from a 16-rep `fixture/sequence` capture. Four views: the stages
+ranked (A), categories served against cold on a log axis (B), the round in execution order as a
+cumulative curve (C), and every rep (D). Panel D clips the cold round on purpose — at 17x a served
+round it would otherwise flatten the run-to-run wobble the panel exists to show.
+
+    .venv-plot/bin/python tools/dflash2/plot_stages.py tools/dflash2/runs/profile --out PNG
+
+The script prints the whole table to stdout as well, so the figure is never the only record.
 `selector_scores` (3.08 ms) appears in the dump but is a **host recomputation the harness adds**,
 not part of the round — it is excluded from the share column.
 
