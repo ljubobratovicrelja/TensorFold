@@ -68,6 +68,9 @@ rows into the dump), `TF_FLASHNEXT_LG_DUMP=<dir>` (head input + fp32 logits, row
 
     cold  398.2 ms        served  23.80 ms        ~17x
 
+A second capture of 16 reps reads **22.99 ms, sd 0.95** (the figure in `profiles/`). The ~3% between
+captures is clock state, the same reason the speed gate compares medians and not single runs.
+
 | stage | ms | share | cold rep |
 |---|---|---|---|
 | `logits_top16_ids` — the target head, 7 rows over a 248,320 vocab | **6.98** | **26.2%** | 8.62 |
