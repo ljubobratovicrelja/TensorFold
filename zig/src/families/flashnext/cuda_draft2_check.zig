@@ -326,6 +326,9 @@ const Man = struct {
     pos_end: usize,
     row_bytes: usize,
     source: []const u8 = "",
+    /// optional: one round per entry, run in order on one state. Positions that advance by the
+    /// accepted run give the served (reuse) path; a single position is the cold round.
+    positions: []const u32 = &.{},
     ring_file: []const u8 = "ring.bin",
     ids_file: []const u8 = "ids.bin",
 };
@@ -341,6 +344,8 @@ const Fixture = struct {
     n_taps: usize,
     window: usize,
     pos_end: usize,
+    /// the rounds to run, in order, when the manifest carries `positions`
+    positions: []usize = &.{},
     sha: [3][64]u8 = .{ @splat('0'), @splat('0'), @splat('0') },
 
     fn open(gpa: std.mem.Allocator, io: std.Io, dir: []const u8) !Fixture {
@@ -376,6 +381,12 @@ const Fixture = struct {
             .window = man.window,
             .pos_end = man.pos_end,
         };
+        if (man.positions.len != 0) {
+            const pos = try gpa.alloc(usize, man.positions.len);
+            errdefer gpa.free(pos);
+            for (man.positions, 0..) |v, idx| pos[idx] = v;
+            f.positions = pos;
+        }
         f.sha[0] = sha256Hex(ring);
         f.sha[1] = sha256Hex(ids_bytes);
         f.sha[2] = sha256Hex(text);
@@ -385,6 +396,7 @@ const Fixture = struct {
     fn deinit(f: *Fixture, gpa: std.mem.Allocator) void {
         gpa.free(f.ring);
         gpa.free(f.ids);
+        if (f.positions.len != 0) gpa.free(f.positions);
     }
 };
 
@@ -418,8 +430,8 @@ pub fn runFixtureAt(
     dir: []const u8,
     m: Model,
     fx_dir: []const u8,
-    out_dir: []const u8,
-    warmup: usize,
+    out_dir_: []const u8,
+    reps: usize,
 ) !void {
     if (!draft2.declared(gpa, io, dir)) return error.DraftCheckNotADrafter;
     try checkModel(m);
@@ -444,105 +456,111 @@ pub fn runFixtureAt(
     defer d.deinit();
     if (d.c.mask != mask_token) return error.FixtureMaskMismatch;
 
-    // 3. the context span: `min(window, P)` positions ending where the block begins. This is the
-    // whole of the "clip to what the ring holds" rule: the span is the ring's own length, never the
-    // sequence's.
+    // 3. the rounds. A manifest may carry `positions`: one round per entry, run in order on the SAME
+    // state, each ending where its block begins. Consecutive positions that advance by the accepted
+    // run are the SERVED regime: `fuseFrom` reuses the span the round before projected, so only the
+    // accepted rows are fused and re-projected. Replaying one position is a rewind, which the engine
+    // deliberately re-fuses in full, so a one-position fixture can only measure the cold round
+    // (measured: two warm rounds on `fixture/window` still read 435.8 ms against 438.0 cold).
     const win: usize = d.c.window;
-    const ctx_len = @min(win, P);
-    const lo = P - ctx_len;
-    var ctx = try cuda.DeviceBuffer.alloc(driver, try std.math.mul(usize, ctx_len, fx.row_bytes));
+    var one: [1]usize = .{P};
+    const seq: []const usize = if (fx.positions.len != 0) fx.positions else one[0..];
+
+    // a window wide whatever a round's own span is, so a sequence can grow its span round to round
+    // without reallocating and no round can outrun the buffer
+    var ctx = try cuda.DeviceBuffer.alloc(driver, try std.math.mul(usize, win, fx.row_bytes));
     defer ctx.free();
-    const gather = try gpa.alloc(u8, ctx_len * fx.row_bytes);
+    const gather = try gpa.alloc(u8, win * fx.row_bytes);
     defer gpa.free(gather);
-    for (0..ctx_len) |i| {
-        const slot = (lo + i) % fx.rows;
-        @memcpy(gather[i * fx.row_bytes ..][0..fx.row_bytes], fx.ring[slot * fx.row_bytes ..][0..fx.row_bytes]);
-    }
-    try ctx.upload(0, gather);
+    const ctx_host = try gpa.alloc(u8, win * hidden * 2);
+    defer gpa.free(ctx_host);
 
     var st = try d.create();
     defer st.deinit();
 
-    // 3b. warm rounds: the same round again on the same state.
-    //
-    // NOTE (measured): on a static fixture this is a NO-OP — `fuseFrom` reuses only when `hi >
-    // fused_end`, and replaying the same position gives `hi == kv_end`, so every round here is the
-    // cold one. That is deliberate in the engine (a rewound prefix is re-fused), but it means a
-    // fixture with one captured position CANNOT measure the served steady state: 2 warm rounds on
-    // `fixture/window` still report 435.8 ms against 438.0 cold. A serving round advances the
-    // position by the accepted run, so `hi > kv_end` and only `accepted + 1` rows are fused and
-    // projected. Profiling the served round needs a fixture whose positions advance.
-    var warm_prop: [block - 1]u32 = @splat(0);
-    for (0..warmup) |_| {
-        try d.draft(&st, .{ .ctx = ctx.ptr, .ctx_len = ctx_len, .anchor = fx.ids[P], .position = P }, &warm_prop);
-    }
-
-    // 4. one round, stage by stage. The collector synchronises at every boundary, so its numbers
-    // are the work's and not the enqueue's.
-    var k = stage_dump.Collector.init(gpa, io, driver, stream);
-    defer k.deinit();
-    d.traceStages(&k);
-    var prop: [block - 1]u32 = @splat(0);
-    const t0 = nowNs(io);
-    try d.draft(&st, .{ .ctx = ctx.ptr, .ctx_len = ctx_len, .anchor = fx.ids[P], .position = P }, &prop);
-    const t1 = nowNs(io);
-    d.traceStages(null);
-    const round_ms = @as(f64, @floatFromInt(t1 - t0)) / 1e6;
-
-    // 5. the context: a window wide, and (TF_FLASHNEXT_STAGE_CTX_TENSOR=1) the one tensor a full
-    // round would otherwise only summarise. Off by default so a serving-sized window does not put
-    // 20 MB of `.npy` beside every dump; a harness that wants the fuse's own rows asks for them.
-    const ctx_host = try gpa.alloc(u8, ctx_len * hidden * 2);
-    defer gpa.free(ctx_host);
-    var done: usize = 0;
-    while (done < ctx_len) {
-        const n = @min(fwd.ctx_chunk, ctx_len - done);
-        const at = lo + done;
-        const slot = at % win;
-        const head_n = @min(n, win - slot);
-        try cuda.memory.download(driver, st.fused.ptr + slot * hidden * 2, ctx_host[done * hidden * 2 ..][0 .. head_n * hidden * 2]);
-        if (n > head_n) try cuda.memory.download(driver, st.fused.ptr, ctx_host[(done + head_n) * hidden * 2 ..][0 .. (n - head_n) * hidden * 2]);
-        done += n;
-    }
-    if (ctxTensorWanted()) {
-        const e = k.find("fc_ctx") orelse return error.StageMissing;
-        try k.addHost("fc_ctx_rows", ctx_host, ctx_len, hidden, .bf16, e.ms);
-    }
-
-    // 6. the selector's lattice scores, on the host, from the round's own tables
-    const sel = try selectorScores(gpa, driver, d, &k, fx.ids[P], &prop);
-    defer gpa.free(sel.scores);
-    try k.addHost("selector_scores", std.mem.sliceAsBytes(sel.scores), sel.rows, sel.topk, .f32, sel.ms);
-
-    // 7. the dumps
-    try writeStages(gpa, io, out_dir, .{
-        .drafter = dir,
-        .pos = P,
-        .ctx_len = ctx_len,
-        .ctx_lo = lo,
-        .window = win,
-        .anchor = fx.ids[P],
-        .round_ms = round_ms,
-        .ctx_stats = stage_dump.stats(ctx_host, ctx_len, hidden, .bf16),
-        .sel = sel,
-        .sha = fx.sha,
-    }, &k, &prop);
-
-    std.log.info("draftfix: position {d} ctx {d} from {d} anchor {d} proposals {any} round {d:.2} ms -> {s}", .{
-        P, ctx_len, lo, fx.ids[P], prop, round_ms, out_dir,
-    });
-    for (prop) |id| {
-        if (@as(usize, id) >= vocab) return error.FixtureProposalOutOfVocab;
-    }
-    var distinct: usize = 0;
-    for (0..prop.len) |i| {
-        var seen = false;
-        for (0..i) |j| {
-            if (prop[j] == prop[i]) seen = true;
+    const n_reps: usize = if (reps == 0) seq.len else reps;
+    for (0..n_reps) |rep| {
+        const pos = seq[rep % seq.len];
+        if (pos >= fx.pos_end) return error.FixturePositionPastIds;
+        // the span is `min(window, pos)` positions ending where the block begins: the ring's own
+        // length, never the sequence's
+        const ctx_len = @min(win, pos);
+        const lo = pos - ctx_len;
+        for (0..ctx_len) |idx| {
+            const slot = (lo + idx) % fx.rows;
+            @memcpy(gather[idx * fx.row_bytes ..][0..fx.row_bytes], fx.ring[slot * fx.row_bytes ..][0..fx.row_bytes]);
         }
-        if (!seen) distinct += 1;
+        try ctx.upload(0, gather[0 .. ctx_len * fx.row_bytes]);
+
+        var rep_buf: [4096]u8 = undefined;
+        const out_dir: []const u8 = if (n_reps == 1) out_dir_ else try std.fmt.bufPrint(&rep_buf, "{s}/rep{d}", .{ out_dir_, rep });
+        if (n_reps > 1) try std.Io.Dir.cwd().createDirPath(io, out_dir);
+
+        // 4. one round, stage by stage. The collector synchronises at every boundary, so its numbers
+        // are the work's and not the enqueue's.
+        var k = stage_dump.Collector.init(gpa, io, driver, stream);
+        defer k.deinit();
+        d.traceStages(&k);
+        var prop: [block - 1]u32 = @splat(0);
+        const t0 = nowNs(io);
+        try d.draft(&st, .{ .ctx = ctx.ptr, .ctx_len = ctx_len, .anchor = fx.ids[pos], .position = pos }, &prop);
+        const t1 = nowNs(io);
+        d.traceStages(null);
+        const round_ms = @as(f64, @floatFromInt(t1 - t0)) / 1e6;
+
+        // 5. the context: a window wide, and (TF_FLASHNEXT_STAGE_CTX_TENSOR=1) the one tensor a full
+        // round would otherwise only summarise. Off by default so a serving-sized window does not put
+        // 20 MB of `.npy` beside every dump; a harness that wants the fuse's own rows asks for them.
+        var done: usize = 0;
+        while (done < ctx_len) {
+            const n = @min(fwd.ctx_chunk, ctx_len - done);
+            const at = lo + done;
+            const slot = at % win;
+            const head_n = @min(n, win - slot);
+            try cuda.memory.download(driver, st.fused.ptr + slot * hidden * 2, ctx_host[done * hidden * 2 ..][0 .. head_n * hidden * 2]);
+            if (n > head_n) try cuda.memory.download(driver, st.fused.ptr, ctx_host[(done + head_n) * hidden * 2 ..][0 .. (n - head_n) * hidden * 2]);
+            done += n;
+        }
+        if (ctxTensorWanted()) {
+            const e = k.find("fc_ctx") orelse return error.StageMissing;
+            try k.addHost("fc_ctx_rows", ctx_host, ctx_len, hidden, .bf16, e.ms);
+        }
+
+        // 6. the selector's lattice scores, on the host, from the round's own tables
+        const sel = try selectorScores(gpa, driver, d, &k, fx.ids[pos], &prop);
+        defer gpa.free(sel.scores);
+        try k.addHost("selector_scores", std.mem.sliceAsBytes(sel.scores), sel.rows, sel.topk, .f32, sel.ms);
+
+        // 7. the dumps
+        try writeStages(gpa, io, out_dir, .{
+            .drafter = dir,
+            .pos = pos,
+            .ctx_len = ctx_len,
+            .ctx_lo = lo,
+            .window = win,
+            .anchor = fx.ids[pos],
+            .round_ms = round_ms,
+            .ctx_stats = stage_dump.stats(ctx_host, ctx_len, hidden, .bf16),
+            .sel = sel,
+            .sha = fx.sha,
+        }, &k, &prop);
+
+        std.log.info("draftfix: rep {d} position {d} ctx {d} from {d} anchor {d} proposals {any} round {d:.2} ms -> {s}", .{
+            rep, pos, ctx_len, lo, fx.ids[pos], prop, round_ms, out_dir,
+        });
+        for (prop) |id| {
+            if (@as(usize, id) >= vocab) return error.FixtureProposalOutOfVocab;
+        }
+        var distinct: usize = 0;
+        for (0..prop.len) |idx| {
+            var seen = false;
+            for (0..idx) |q| {
+                if (prop[q] == prop[idx]) seen = true;
+            }
+            if (!seen) distinct += 1;
+        }
+        if (distinct < 2) std.log.warn("draftfix: the walk is degenerate ({d} distinct ids)", .{distinct});
     }
-    if (distinct < 2) std.log.warn("draftfix: the walk is degenerate ({d} distinct ids)", .{distinct});
 }
 
 /// The selector's scores for the predecessors the walk actually took, recomputed on the host from

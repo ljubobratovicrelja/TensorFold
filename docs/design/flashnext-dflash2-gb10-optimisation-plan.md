@@ -147,3 +147,39 @@ Consequence for the plan:
   projection** as well as the attention kernel (see `layer()`'s stage markers).
 - Profiling the served round needs a fixture whose **positions advance** across rounds, carrying
   real taps for each. That is the next harness change, before any further kernel work.
+
+## The served round, measured (2026-11-18) — this is the scoreboard that counts
+
+`fixture/sequence` (new): 44 rounds on **one** `State`, positions advancing 1900 → 2047 by 3–4,
+the shape a decode has. Rep 0 is the cold round, reps 1+ are the served ones.
+
+    cold  400.1 ms      served  25.5 ms (median of 11)      16x
+
+Stage medians over the served reps, and the same stage in the cold rep:
+
+    logits_top16_ids     8.60 ms  30.5%    8.62      <- the head, 8 rows over a 248,320 vocab
+    fc_ctx               5.14 ms  18.2%  306.68      <- fuses only the accepted rows; the weight read dominates
+    attn_0..4            5.05 ms  17.9%   76.0       <- 1.01 ms/layer
+    mlp_0..4             2.76 ms   9.8%    2.77
+    proposals            1.32 ms   4.7%    3.57
+    (selector_scores is a HOST recomputation the harness adds, not part of the round: 3.01 ms)
+
+### What this reverses
+
+- **The head is the first lever, not the last.** It was 1.9% of the cold round and is 30.5% of the
+  served one, because the cold round's fuse swamps it. Draft-vocabulary reduction — the lever I
+  dropped on the cold profile — is back on top: the kernel streams the whole 1.27 GB matrix every
+  round for 8 rows, at a measured ~148 GB/s (so ~8.6 ms is already near the machine's rate; the win
+  has to come from reading fewer bytes, not from a faster kernel).
+- **`fc_ctx` is 5.14 ms for ~4 rows.** It streams the 65 MB `fc` weight per round at ~13 GB/s — 11x
+  below what the head kernel achieves on the same box. That is a real inefficiency, and it is 18%
+  of the served round.
+- **Attention is done.** `tf_fxd2_attn_tile` measured in the served regime: **0.568 vs 0.823 ms a
+  layer** (legacy via `TF_FLASHNEXT_ATTN_LEGACY=1`), round **26.14 vs 28.58 ms, −8.5%**, and the
+  capture is bit-identical stage for stage. Its earlier "no effect" reading was the cold fixture.
+
+### Ranked next work
+
+1. Draft vocabulary / head bytes (30.5%).
+2. `fc_ctx` weight-read efficiency (18.2%).
+3. Layer block projections (mlp 9.8%, qkv/attn_proj the rest).

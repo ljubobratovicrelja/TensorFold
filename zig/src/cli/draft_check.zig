@@ -28,9 +28,10 @@ const usage =
     \\  --target DIR    the target checkpoint; only its embed table and head are read
     \\  --fixture DIR   a pre-collected ring (manifest.json, ids.bin, ring.bin)
     \\  --out DIR       where rep{i}/ is written
-    \\  --repeat N      rounds to capture, each into its own rep (default 1)
-    \\  --warm N        untraced rounds on the same state first: the served (reuse) path, not the
-    \\                  cold one that projects and fuses the whole window (default 0)
+    \\  --repeat N      rounds to capture on ONE state (default: every `positions` entry in the
+    \\                  manifest, else 1). N == 1 writes into --out itself; N > 1 writes
+    \\                  --out/rep{i}. A manifest `positions` list advancing by the accepted run is
+    \\                  the served regime; one position repeated is the cold round every time.
     \\
 ;
 
@@ -43,8 +44,7 @@ const Args = struct {
     target: []const u8 = "",
     fixture: []const u8 = "",
     out: []const u8 = "",
-    repeat: usize = 1,
-    warm: usize = 0,
+    repeat: usize = 0,
 };
 
 fn parse(args: []const []const u8) !Args {
@@ -65,13 +65,10 @@ fn parse(args: []const []const u8) !Args {
             a.out = v;
         } else if (std.mem.eql(u8, flag, "--repeat")) {
             a.repeat = std.fmt.parseInt(usize, v, 10) catch return error.BadRepeat;
-        } else if (std.mem.eql(u8, flag, "--warm")) {
-            a.warm = std.fmt.parseInt(usize, v, 10) catch return error.BadRepeat;
         } else return error.UnknownFlag;
     }
     if (a.drafter.len == 0 or a.target.len == 0 or a.fixture.len == 0 or a.out.len == 0)
         return error.MissingFlag;
-    if (a.repeat == 0) return error.BadRepeat;
     return a;
 }
 
@@ -142,13 +139,6 @@ pub fn main(init: std.process.Init, argv: []const [:0]const u8) !u8 {
         .head_bf16 = true,
     };
 
-    for (0..o.repeat) |i| {
-        var buf: [4096]u8 = undefined;
-        const rep = try std.fmt.bufPrint(&buf, "{s}/rep{d}", .{ o.out, i });
-        try std.Io.Dir.cwd().createDirPath(io, rep);
-        try std.Io.File.stdout().writeStreamingAll(io, rep);
-        try std.Io.File.stdout().writeStreamingAll(io, "\n");
-        try draftcheck.runFixtureAt(gpa, io, &driver, stream, o.drafter, m, o.fixture, rep, o.warm);
-    }
+    try draftcheck.runFixtureAt(gpa, io, &driver, stream, o.drafter, m, o.fixture, o.out, o.repeat);
     return 0;
 }

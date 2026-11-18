@@ -50,6 +50,10 @@ VOCAB = 248320
 CASES = {
     "block8": dict(pos_end=9),
     "window": dict(pos_end=2048),
+    # the served regime: consecutive rounds on ONE state, each ending where its block begins and
+    # advancing by a plausible accepted run, so the round after the first reuses the span the one
+    # before projected instead of re-fusing the whole window
+    "sequence": dict(pos_end=2048, sequence_start=1900),
 }
 
 OUT = sys.argv[1] if len(sys.argv) > 1 else os.path.join(os.path.dirname(os.path.abspath(__file__)), "fixture")
@@ -111,6 +115,15 @@ def main():
             "row_bytes": len(TAPS) * HIDDEN * 2,
             "source": f"gen_inputs.py seed={SEED} case={name}",
         }
+        if "sequence_start" in spec:
+            # a decode's advance is the accepted run plus the anchor; 2..4 accepted is the shape our
+            # own served rounds show (accept_len ~3.3)
+            positions, at = [], spec["sequence_start"]
+            while at < pos_end - 1:
+                positions.append(int(at))
+                at += int(rng.integers(3, 5))
+            positions.append(pos_end - 1)
+            man["positions"] = positions
         with open(os.path.join(d, "manifest.json"), "w") as f:
             json.dump(man, f, indent=2)
             f.write("\n")
@@ -119,6 +132,8 @@ def main():
             for fn in ("ring.bin", "ids.bin", "manifest.json"):
                 f.write(f"{sha256(os.path.join(d, fn))}  {fn}\n")
 
+        if "positions" in man:
+            print(f"{name}: {len(man['positions'])} rounds {man['positions'][:4]}...{man['positions'][-1]}")
         print(f"{name}: {pos_end} rows, ctx_len {min(WINDOW, pos_end - 1)}, "
               f"ring {os.path.getsize(ring_path)} B, tap mean {tap.mean():+.5f} std {tap.std():.5f} "
               f"min {tap.min():+.4f}")
