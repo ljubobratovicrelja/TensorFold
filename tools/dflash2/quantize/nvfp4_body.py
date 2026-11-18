@@ -336,6 +336,67 @@ def pick_group_scales(Wg: np.ndarray, G: np.ndarray, gs: float, mults=SCALE_MULT
     return best
 
 
+AFFINE_MULTS = (0.85, 0.925, 1.0, 1.08, 1.16)
+AFFINE_CLIPS = (0.0, 0.001, 0.005, 0.01, 0.02)
+
+
+def pick_affine_params(Wg: np.ndarray, G: np.ndarray, mults=AFFINE_MULTS,
+                       clips=AFFINE_CLIPS) -> tuple[np.ndarray, np.ndarray]:
+    """One (bias, scale) per output row of a [rows, group] block, minimising that row's output error.
+
+    Same trick as `pick_group_scales`: a group's contribution to the layer's output error is
+    delta^T G delta with G = X_g^T X_g for these `group` input columns, so a candidate pair is scored
+    without ever forming a (rows x neurons) product.
+
+    Candidates move along the axis the engine cannot: a wider span (m > 1) spends resolution on
+    weights that barely matter, a narrower one (m < 1, or clipping the group's tails) stops a single
+    outlier from setting the step for the other 63 weights. `clips` are quantiles; 0 is the engine's
+    own min/max recipe, so RTN is always in the candidate set. A pair is legal if the engine's snap
+    (`bias / scale` whole) still holds -- `affine4_recipe` does that, and the `m` multiplier keeps it
+    because it scales a value that was already whole.
+    """
+    n = Wg.shape[0]
+    best_err = np.full(n, np.inf, dtype=np.float64)
+    best_b = np.zeros(n, dtype=np.float32)
+    best_s = np.ones(n, dtype=np.float32)
+    for clip in clips:
+        if clip <= 0.0:
+            lo, hi = Wg.min(axis=1), Wg.max(axis=1)
+        else:
+            lo = np.quantile(Wg, clip, axis=1).astype(np.float32)
+            hi = np.quantile(Wg, 1.0 - clip, axis=1).astype(np.float32)
+        b, s0 = NV.affine4_recipe(lo, hi)
+        for m in mults:
+            s = (s0 * np.float32(m)).astype(np.float32)
+            dq = NV.affine4_dequant(NV.affine4_codes(Wg, b, s), b, s)
+            delta = Wg - dq
+            err = np.sum((delta @ G).astype(np.float64) * delta.astype(np.float64), axis=1)
+            better = err < best_err
+            best_err = np.where(better, err, best_err)
+            best_b = np.where(better, b, best_b).astype(np.float32)
+            best_s = np.where(better, s, best_s).astype(np.float32)
+    return best_b, best_s
+
+
+def fit_affine4(W: np.ndarray, X: np.ndarray, group: int,
+                mults=AFFINE_MULTS, clips=AFFINE_CLIPS) -> tuple[np.ndarray, int]:
+    """Per-group bias/scale search in the format the engine loads; returns dequant, groups moved."""
+    n, k = W.shape
+    nb = k // group
+    bias = np.empty(nb * n, dtype=np.float32)
+    scale = np.empty(nb * n, dtype=np.float32)
+    moved = 0
+    for gi, g0 in enumerate(range(0, k, group)):
+        Wg = np.ascontiguousarray(W[:, g0:g0 + group], dtype=np.float32)
+        Xg = np.ascontiguousarray(X[:, g0:g0 + group], dtype=np.float32)
+        b, s = pick_affine_params(Wg, Xg.T @ Xg, mults, clips)
+        sl = slice(gi * n, (gi + 1) * n)
+        bias[sl], scale[sl] = b, s
+        rb, rs = NV.affine4_recipe(Wg.min(axis=1), Wg.max(axis=1))
+        moved += int(np.count_nonzero((b != rb) | (s != rs)))
+    return NV.encode_affine4(W, bias, scale, group), moved
+
+
 def fit_scales(W: np.ndarray, X: np.ndarray, gs: float, group: int) -> tuple[np.ndarray, int]:
     """Per-row, per-block scale search -> dequantised weight, and how many blocks left RTN's scale."""
     n, k = W.shape
@@ -436,9 +497,14 @@ def fit(args) -> int:
     if "meta" not in calib:
         raise SystemExit(f"{args.calib}: no meta array; was this written by `collect`?")
     meta = json.loads(str(calib["meta"]))
-    mode, group = args.mode, args.group
+    mode, group, fmt = args.mode, args.group, args.format
     if group <= 0 or group % 2:
-        raise SystemExit(f"--group {group}: NVFP4 block scales cover whole groups of weights")
+        raise SystemExit(f"--group {group}: block scales cover whole groups of weights")
+    if fmt == "affine4" and group != NV.AFFINE4_GROUP:
+        raise SystemExit(f"--format affine4 is group {NV.AFFINE4_GROUP}; --group {group} is not a "
+                         f"legal affine4 block")
+    if fmt == "affine4" and mode == "scale+comp":
+        raise SystemExit("--format affine4 supports rtn and scale; the residual pass is NVFP4-only so far")
 
     weights = DrafterWeights(meta["drafter"])
     n_layers = weights.n_layers()
@@ -473,14 +539,19 @@ def fit(args) -> int:
         X_measure = X[hold] if hold.any() else X
 
         t0 = time.time()
-        gs = NV.global_scale(W)  # 448*6/amax, recorded in the report so the number can be reproduced
-        W_rtn, rel_rtn = NV.quantize_nvfp4_scaled(W, group, gs)
-        if mode == "rtn":
-            W_fit, moved = W_rtn, 0
-        elif mode == "scale":
-            W_fit, moved = fit_scales(W, X_fit, gs, group)
+        # 448*6/amax for NVFP4 (recorded so the number can be reproduced); affine4 has no global scale
+        gs = NV.global_scale(W) if fmt == "nvfp4" else None
+        if fmt == "affine4":
+            W_rtn, rel_rtn = NV.quantize_affine4_rtn(W, group)
+            W_fit, moved = (W_rtn, 0) if mode == "rtn" else fit_affine4(W, X_fit, group)
         else:
-            W_fit, moved = fit_scales_gptq(W, X_fit, gs, group)
+            W_rtn, rel_rtn = NV.quantize_nvfp4_scaled(W, group, gs)
+            if mode == "rtn":
+                W_fit, moved = W_rtn, 0
+            elif mode == "scale":
+                W_fit, moved = fit_scales(W, X_fit, gs, group)
+            else:
+                W_fit, moved = fit_scales_gptq(W, X_fit, gs, group)
         fp8 = fp8_baseline(W, X_measure)  # RTN in a different format: nothing to fit, nothing held out
         fit_s = time.time() - t0
 
@@ -533,7 +604,11 @@ def fit(args) -> int:
         "every output rel-L2 is measured on rows held out of the fit (every fifth calibration row); "
         "output_rel_l2_fitted_train is the same weight on the rows it was fitted to, and the gap "
         "between the two is how much a mode is fitting the calibration set rather than the layer",
-        "4-bit codes on a group-16 scale are the format; these are weights only (W4A16), so the "
+        f"format {fmt}: " + ("group-16 e2m1 codes with e4m3 block scales and one global scale"
+                             if fmt == "nvfp4" else
+                             "group-64 affine, one signed bf16 scale and one bf16 bias per group, "
+                             "which is the layout core/affine4.zig already loads") + "; these are "
+        "weights only (W4A16), so the "
         "numbers say nothing about a kernel that quantizes activations too",
         "fp8 is the repo's 128x128 block layout: an FP8 with smaller blocks would score better, so "
         "this is the shipped baseline, not FP8's best case",
@@ -557,9 +632,11 @@ def fit(args) -> int:
         "tool": {"name": "nvfp4_body", "stage": "fit",
                  "note": "CPU, numpy only, no gradients; output error measured on collected "
                          "calibration inputs, not on synthetic noise"},
+        "format": fmt,
         "mode": mode,
         "group": group,
-        "scale_mults": list(SCALE_MULTS),
+        "scale_mults": list(SCALE_MULTS) if fmt == "nvfp4" else list(AFFINE_MULTS),
+        "affine_clips": list(AFFINE_CLIPS) if fmt == "affine4" else None,
         "gptq_damp": GPTQ_DAMP if mode == "scale+comp" else None,
         "calibration": {k: meta[k] for k in
                         ("fixture", "positions", "rows", "drafter", "target") if k in meta},
@@ -788,7 +865,11 @@ def main(argv: list[str] | None = None) -> int:
     f.add_argument("--calib", required=True, help="a .npz written by `collect`")
     f.add_argument("--out", required=True, help="the JSON report to write")
     f.add_argument("--mode", default="scale", choices=("rtn", "scale", "scale+comp"))
-    f.add_argument("--group", type=int, default=NV.FP4_GROUP, help="weights per block scale (default 16)")
+    f.add_argument("--format", default="nvfp4", choices=("nvfp4", "affine4"),
+                   help="nvfp4 (group 16, e2m1 codes, e4m3 block scales) or affine4 (group 64, signed "
+                        "bf16 scale + bias per group, the layout core/affine4.zig loads)")
+    f.add_argument("--group", type=int, default=None,
+                   help="weights per block scale (default: 16 for nvfp4, 64 for affine4)")
     f.add_argument("--chunk", type=int, default=512, help="calibration rows per output-error chunk")
 
     e = sub.add_parser("eval", help="run the real drafter with each weight variant and score the proposals")
@@ -805,6 +886,8 @@ def main(argv: list[str] | None = None) -> int:
         _default_snapshots(args)
         return collect(args)
     if args.stage == "fit":
+        if args.group is None:
+            args.group = NV.AFFINE4_GROUP if args.format == "affine4" else NV.FP4_GROUP
         return fit(args)
     return evaluate(args)
 

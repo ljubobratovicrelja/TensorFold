@@ -130,3 +130,99 @@ def encode_nvfp4(w: np.ndarray, block_scales: np.ndarray, gs: float, group: int 
     scales = np.where(scales <= 0.0, np.float32(1e-12), scales)
     code = e2m1_round(blocks / scales)
     return (code * scales / np.float32(gs)).reshape(w.shape)
+
+# ---------------------------------------------------------------------------------------------
+# affine4: the 4-bit format the engine can actually load (core/affine4.zig)
+# ---------------------------------------------------------------------------------------------
+#
+# Group 64 along the input dim, one SIGNED scale and one bias per group, both stored as bf16, one
+# 4-bit code per weight. Dequant is `code * scale + bias`; the scale is negative whenever the bias is
+# non-negative, so a code still climbs monotonically from the bias end of the range. `prepare()` in
+# the Zig side also snaps `bias / scale` to a whole number, which is what makes code 0 mean exactly
+# the bias -- we keep that snap so a fitted group is still a legal affine4 group.
+
+AFFINE4_GROUP = 64
+AFFINE4_MAX_CODE = 15
+AFFINE4_ZERO = np.float32(1e-7)
+
+
+def affine4_recipe(lower: np.ndarray, upper: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """The engine's own group recipe: (bias, scale) from a group's [lower, upper] per row."""
+    lower = np.asarray(lower, dtype=np.float32)
+    upper = np.asarray(upper, dtype=np.float32)
+    bias = np.where(np.abs(lower) > np.abs(upper), lower, upper).astype(np.float32)
+    span = np.maximum((upper - lower) / np.float32(AFFINE4_MAX_CODE), AFFINE4_ZERO)
+    scale = np.where(bias >= 0.0, -span, span).astype(np.float32)
+    zero = np.round(bias / scale)
+    keep = zero != 0.0
+    scale = np.where(keep, bias / np.where(keep, zero, np.float32(1.0)), scale).astype(np.float32)
+    bias = np.where(keep, bias, np.float32(0.0)).astype(np.float32)
+    return bias, scale
+
+
+def affine4_codes(v: np.ndarray, bias: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    """Codes for a [rows, group] block: 0..15, rounded and clamped, exactly as the packer does."""
+    q = (np.asarray(v, dtype=np.float32) - bias[:, None]) / scale[:, None]
+    return np.clip(np.round(q), 0.0, float(AFFINE4_MAX_CODE)).astype(np.float32)
+
+
+def affine4_dequant(codes: np.ndarray, bias: np.ndarray, scale: np.ndarray) -> np.ndarray:
+    return (np.asarray(codes, dtype=np.float32) * scale[:, None] + bias[:, None]).astype(np.float32)
+
+
+def quantize_affine4_rtn(w: np.ndarray, group: int = AFFINE4_GROUP) -> tuple[np.ndarray, float]:
+    """Round-to-nearest affine4 for a whole [n, k] weight, engine recipe per group."""
+    w = np.asarray(w, dtype=np.float32)
+    if w.shape[-1] % group:
+        raise ValueError(f"{w.shape}: last dim is not a multiple of group {group}")
+    out = np.empty_like(w)
+    for g0 in range(0, w.shape[1], group):
+        blk = w[:, g0:g0 + group]
+        bias, scale = affine4_recipe(blk.min(axis=1), blk.max(axis=1))
+        out[:, g0:g0 + group] = affine4_dequant(affine4_codes(blk, bias, scale), bias, scale)
+    err = float(np.sum((out.astype(np.float64) - w.astype(np.float64)) ** 2))
+    ref = float(np.sum(w.astype(np.float64) ** 2))
+    return out, float(np.sqrt(err / ref)) if ref > 0 else 0.0
+
+
+def encode_affine4(w: np.ndarray, bias: np.ndarray, scale: np.ndarray,
+                   group: int = AFFINE4_GROUP) -> np.ndarray:
+    """Dequantise with caller-chosen per-group bias/scale: one entry each per `group` input columns."""
+    w = np.asarray(w, dtype=np.float32)
+    bias = np.asarray(bias, dtype=np.float32).ravel()
+    scale = np.asarray(scale, dtype=np.float32).ravel()
+    nb = w.shape[1] // group
+    if bias.size != w.shape[0] * nb:
+        raise ValueError(f"{w.shape}: expected {w.shape[0]*nb} groups, got {bias.size}")
+    out = np.empty_like(w)
+    for gi, g0 in enumerate(range(0, w.shape[1], group)):
+        sl = slice(gi * w.shape[0], (gi + 1) * w.shape[0])
+        blk = w[:, g0:g0 + group]
+        out[:, g0:g0 + group] = affine4_dequant(affine4_codes(blk, bias[sl], scale[sl]),
+                                                bias[sl], scale[sl])
+    return out
+
+
+def affine4_pack(w: np.ndarray, bias: np.ndarray, scale: np.ndarray,
+                 group: int = AFFINE4_GROUP) -> dict:
+    """The bytes an affine4 loader reads: 8 low-bit-first words per group plus bf16 scale and bias.
+
+    Not used by the fitter (it scores dequantised weights); it exists so a checkpoint produced here
+    can be handed to a loader without anyone re-deriving the layout.
+    """
+    import struct
+    w = np.asarray(w, dtype=np.float32)
+    n, k = w.shape
+    nb = k // group
+    codes = np.empty((n, k), dtype=np.uint8)
+    for gi, g0 in enumerate(range(0, k, group)):
+        sl = slice(gi * n, (gi + 1) * n)
+        codes[:, g0:g0 + group] = affine4_codes(w[:, g0:g0 + group], bias[sl], scale[sl]).astype(np.uint8)
+    words = np.zeros(nb * n * group // 8, dtype=np.uint32)
+    flat = codes.reshape(-1, 8)
+    for i in range(8):
+        words |= flat[:, i].astype(np.uint32) << np.uint32(4 * i)
+    def bf16(x: np.ndarray) -> np.ndarray:
+        return (np.asarray(x, dtype=np.float32).view(np.uint32) >> 16).astype(np.uint16)
+    return {"words": words.reshape(n, k // 8), "scales": bf16(scale).reshape(n, nb),
+            "biases": bf16(bias).reshape(n, nb), "group": group}
