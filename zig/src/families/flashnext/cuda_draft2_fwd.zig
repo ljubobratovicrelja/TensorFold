@@ -7,8 +7,9 @@
 //!
 //! 1. **fuse** the five taps of each of the *prefix's* positions — every position the target had
 //!    already computed when it proposed the block — into one 2560-wide context row a position
-//!    (`tf_fxd2_fuse`: `rms_norm(hidden_norm, taps @ fc^T)`). The kernel streams the whole of `fc`
-//!    a row, so it is a round's work and not a layer's: the fused rows are kept at their positions
+//!    (`rms_norm(hidden_norm, bf16(taps @ fc^T))`, one `glm_fuse_dot` launch a chunk of rows and
+//!    `tf_fxd2_rmsnorm` over its output, so the 65 MB weight is streamed once per chunk rather than
+//!    once per row). It is a round's work and not a layer's: the fused rows are kept at their positions
 //!    (`State.fused`) and every layer cross-attends to the same ones, which also lets a round read
 //!    the rows the round before it fused — consecutive rounds share all but the positions the
 //!    target accepted. The block's own rows never come from taps: `reference.py` hands the prefix's
@@ -104,6 +105,10 @@ fn m16Shared() u32 {
     return 3 * (16 * 128 + 8 * 32 * 8 * 4 + 128);
 }
 
+/// `glm_fuse_dot`'s dynamic shared: a K segment of the CTA's 64 weight columns, k-major, 66 halves
+/// a row so a warp's 32 columns do not collide in one bank.
+const fuse_dot_shared: u32 = 256 * 66 * 2;
+
 /// One round's inputs: a block of `block` rows to draft, and the prefix it cross-attends to.
 pub const Round = struct {
     /// `[ctx_len, n_taps * hidden]` bf16 on the device: the fused tap rows of the positions
@@ -192,6 +197,10 @@ pub const State = struct {
 
 /// Where a round's rows are in `State.scratch`; every offset is 256-byte aligned.
 pub const Bufs = struct {
+    /// The context fuse's matmul output, `[ctx_stage, hidden]` bf16: `rows` fp32 accumulations
+    /// rounded once, which is exactly the fp32 plane the fused kernel normed in place. The norm
+    /// reads a chunk here and writes the ring, so a chunk that wraps still costs one weight pass.
+    fus: u64,
     /// The block's token ids, u32: the anchor then `block - 1` mask tokens.
     ids: u64,
     /// The context chunk being read out of the fused ring, `[ctx_stage, hidden]` bf16 (`ctx_stage`
@@ -417,6 +426,10 @@ pub const Draft = struct {
     m16: cuda.Function,
     tile16: cuda.Function,
     headw: cuda.DeviceBuffer,
+    /// The context fuse's dot: `glm_fuse_dot`, one CTA per 64 output columns with every row of the
+    /// chunk inside it, so a chunk of the prefix streams the whole 65 MB `fc` once for all its rows
+    /// instead of once per row — with the per-row kernel's scalar K-order arithmetic unchanged.
+    fuse_dot: cuda.Function,
     /// Where the next round's internals are copied, or null (`Debug`). Set by `trace`, off by default,
     /// and read only by the two copy sites a round has.
     dbg: ?Debug = null,
@@ -456,7 +469,7 @@ pub const Draft = struct {
 
         const s = try gpa.create(Self);
         errdefer gpa.destroy(s);
-        s.* = .{ .gpa = gpa, .io = io, .d = d, .stream = stream, .c = c, .w = undefined, .target = target, .mod = undefined, .rows = undefined, .fns = undefined, .mm = undefined, .m16 = undefined, .tile16 = undefined, .headw = undefined };
+        s.* = .{ .gpa = gpa, .io = io, .d = d, .stream = stream, .c = c, .w = undefined, .target = target, .mod = undefined, .rows = undefined, .fns = undefined, .mm = undefined, .m16 = undefined, .tile16 = undefined, .headw = undefined, .fuse_dot = undefined };
         s.mod = try cuda.Module.load(d, cuda.kernels.qwen35_draft);
         errdefer s.mod.unload();
         s.rows = try cuda.qwen35_bf16_rows.Kernels.load(d);
@@ -485,6 +498,7 @@ pub const Draft = struct {
         errdefer s.mm.unload();
         s.m16 = try s.mm.function("glm_mm16_16");
         try s.m16.allowDynamicShared(m16Shared());
+        s.fuse_dot = try s.mm.function("glm_fuse_dot");
         s.tile16 = try s.mm.function("glm_mm_tile16");
         s.headw = try cuda.DeviceBuffer.alloc(d, s.c.vocab * s.c.hidden * 2);
         errdefer s.headw.free();
@@ -623,7 +637,7 @@ pub const Draft = struct {
         // the five layers' shared cross-attention context, fused once for the round and kept: every
         // layer reads the same rows, and the rows the last round fused are still good
         if (s.stg) |k| k.start();
-        try s.fusePrefix(st, r);
+        try s.fusePrefix(st, &b, r);
         try embed(s, b.ids, b.h);
         // the round's one shared stage: the prefix's five taps fused per position, plus the block's
         // embedding lookup. Its rows are a window wide, so it records a clock and no tensor — the
@@ -859,7 +873,7 @@ pub const Draft = struct {
     /// The ring is `window` slots and a prefix is at most a window long (`draft` refuses
     /// `ContextPastWindow`), so a span cannot alias its own slots, and a row a round still needs is
     /// overwritten only by a position a window ahead of it — which a prefix that short cannot fuse.
-    fn fusePrefix(s: *Self, st: *State, r: Round) !void {
+    fn fusePrefix(s: *Self, st: *State, b: *const Bufs, r: Round) !void {
         const c = s.c;
         const H = c.hidden;
         const k = c.n_taps * H;
@@ -875,8 +889,12 @@ pub const Draft = struct {
             // kernel being strictly row-wise
             const slot: usize = @intCast(p % c.window);
             const head = @min(n, c.window - slot);
-            try fuse(s, src, st.fused.ptr + slot * H * 2, head);
-            if (n > head) try fuse(s, src + head * k * 2, st.fused.ptr, n - head);
+            // the chunk's matmul, once, then the norm into the ring — which may wrap inside the
+            // chunk, so the norm runs twice over one chunk's staged output rather than the weight
+            // being streamed twice
+            try fuseGemm(s, src, b.fus, n);
+            try rmsnorm(s, b.fus, s.w.hidden_norm, st.fused.ptr + slot * H * 2, head);
+            if (n > head) try rmsnorm(s, b.fus + head * H * 2, s.w.hidden_norm, st.fused.ptr, n - head);
             if (s.timing) {
                 const t1 = nowNs(s.io);
                 s.t_fuse += t1 - t;
@@ -972,18 +990,27 @@ fn reuseFrom(lo: u64, hi: u64, kv_lo: u64, kv_end: u64) u64 {
     return fuseFrom(lo, hi, kv_lo, kv_end);
 }
 
-/// tf_fxd2_fuse(X, W, NORM, OUT, K, H, eps): grid (rows), 256 threads, `(K + 2H) * 2` shared.
+/// `glm_fuse_dot(X, ldx, W, OUT, M, H, K)`: `[rows, K] x [K, hidden]^T` into bf16 `rows x hidden`,
+/// grid `hidden / 64` — one CTA a 64-column tile, every row of the chunk inside it.
 ///
 /// `taps` is the first of `rows` contiguous `n_taps * hidden` rows: the prefix's rows from an
 /// arbitrary position, since `fusePrefix` fuses only the ones the ring is missing. `rows` is a chunk
-/// of the context, so it may not outrun the scratch's `ctx_chunk`, and its `out` is a slot of the
-/// fused ring — which may be the ring's start, when a chunk wraps.
-fn fuse(s: *Draft, taps: u64, out: u64, rows: usize) !void {
+/// of the context, so it may not outrun the scratch's `ctx_chunk`; one launch reads all of `fc`
+/// exactly once, whatever `rows` is.
+///
+/// The arithmetic contract is the fused kernel's, split at the module boundary the reference has:
+/// a scalar `fmaf` walk over K in order (`glm_fuse_dot`'s inner loop is the old row kernel's, with
+/// the weight's reuse fixed rather than its order reassociated), rounded once to bf16 — `rbf` of the
+/// accumulator — then `rmsnorm` over those bf16 values with `hidden_norm`, in `block_sum_serial`'s
+/// order. Every stage of it is the old kernel's arithmetic, bit for bit.
+fn fuseGemm(s: *Draft, taps: u64, tmp: u64, rows: usize) !void {
     if (rows == 0) return;
     if (rows > ctx_chunk) return error.ChunkPastScratch;
     const c = s.c;
     const k = c.n_taps * c.hidden;
-    try launch(s, s.fns.fuse, .{ @intCast(rows), 1, 1 }, 256, @intCast((k + 2 * c.hidden) * 2), .{ taps, s.w.fc, s.w.hidden_norm, out, ci(k), ci(c.hidden), c.eps });
+    try launch(s, s.fuse_dot, .{ @intCast(c.hidden / 64), 1, 1 }, 256, fuse_dot_shared, .{
+        taps, @as(c_longlong, ci(k)), s.w.fc, tmp, ci(rows), ci(c.hidden), ci(k),
+    });
 }
 
 /// tf_fxd2_rmsnorm(X, W, OUT, H, eps): grid (rows), 256 threads.
@@ -1247,6 +1274,7 @@ pub fn place(c: Config, base: u64, out: ?*Bufs) !usize {
     // the context staging: one chunk of the prefix, which is never narrower than the block
     const S = @max(B, ctx_chunk);
     const sizes = .{
+        .{ "fus", try bytes(.{ S, c.hidden, 2 }) },
         .{ "ids", try bytes(.{ B, 4 }) },
         .{ "ctx", try bytes(.{ S, c.hidden, 2 }) },
         .{ "h", try bytes(.{ B, c.hidden, 2 }) },
@@ -1444,8 +1472,7 @@ test "a round projects only the k/v positions the round before it did not" {
 }
 
 test "fusedReset drops the k/v span with the fusion" {
-    var st: State = .{ .ring = undefined, .fused = undefined, .scratch = undefined,
-        .kv_lo = 7, .kv_end = 99, .fused_lo = 3, .fused_end = 77 };
+    var st: State = .{ .ring = undefined, .fused = undefined, .scratch = undefined, .kv_lo = 7, .kv_end = 99, .fused_lo = 3, .fused_end = 77 };
     st.fusedReset();
     try std.testing.expectEqual(@as(u64, 0), st.kv_lo);
     try std.testing.expectEqual(@as(u64, 0), st.kv_end);
@@ -1457,8 +1484,7 @@ test "a position drop takes the block-end watermark with the spans" {
     // `Draft.invalidate` is a caller's position drop, and it is `State.invalidate`'s: the spans go
     // and the watermark `draft`'s `DraftContextGap` guard reads goes with them, or a genuine skip
     // would re-fuse its whole prefix and still be refused by a stale end.
-    var st: State = .{ .ring = undefined, .fused = undefined, .scratch = undefined,
-        .end = 1032, .kv_lo = 7, .kv_end = 99, .fused_lo = 3, .fused_end = 77 };
+    var st: State = .{ .ring = undefined, .fused = undefined, .scratch = undefined, .end = 1032, .kv_lo = 7, .kv_end = 99, .fused_lo = 3, .fused_end = 77 };
     st.invalidate();
     try std.testing.expectEqual(@as(u64, 0), st.end);
     try std.testing.expectEqual(@as(u64, 0), st.kv_lo);

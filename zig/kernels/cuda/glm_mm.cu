@@ -293,3 +293,52 @@ extern "C" __global__ void glm_mm_tile16(const __nv_bfloat16* __restrict__ src, 
 #pragma unroll
     for (int v = 0; v < 16; ++v) dst[c * 16 + v] = src[(long long)n * K + g * 64 + frag_k(lane, v)];
 }
+
+// One weight pass for a whole row block: out[m, :] = X[m, :] @ W^T for m < M, one CTA per 64 output
+// columns with every row of the block inside it, so the weight is read ONCE for all of them instead
+// of once per row (a 64-row chunk of a drafter's fused context is 65 MB read against 4 GB).
+//
+// The dot is a scalar `fmaf` walk over K in order, exactly as a per-row kernel walks it, so the
+// accumulator's fp32 bits and its one bf16 rounding are the per-row form's — this is the same
+// arithmetic with the weight's reuse fixed, not a reassociated one. Grid (H / 64), 256 threads,
+// dynamic shared of KS * NP bf16 holding the CTA's 64 weight rows a K segment at a time.
+//
+// Thread tid owns column `tid & 63` and rows `tid >> 6, +4, +8, ...`: a thread's weight words are
+// read once per K element and reused by all of its rows, and its rows' taps come from L1/L2 (every
+// CTA of the grid reads the same M rows). NP pads the shared stride off 64 so a warp's 32 columns
+// do not land in one bank.
+extern "C" __global__ void __launch_bounds__(256) glm_fuse_dot(const __nv_bfloat16* __restrict__ X, long long ldx,
+        const __nv_bfloat16* __restrict__ W, __nv_bfloat16* __restrict__ OUT, int M, int H, int K) {
+    constexpr int CT = 64, KS = 256, NP = 66;
+    extern __shared__ __nv_bfloat16 sh[];                       // [KS][NP]: the columns' next 256 k
+    const int tid = threadIdx.x, lane = tid & 63, rl = tid >> 6;
+    const int n0 = blockIdx.x * CT, col = n0 + lane;
+    const int nrow = (M - rl + 3) >> 2;                         // this lane's rows: rl + 4r, rl + 8, ...
+    float acc[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) acc[r] = 0.0f;
+    for (int k0 = 0; k0 < K; k0 += KS) {
+        // the segment's weight, k-major: a warp reads one column's 32 consecutive 16-byte pieces
+        for (int c = tid; c < CT * (KS / 8); c += 256) {
+            const int cc = c / (KS / 8), ki = (c % (KS / 8)) * 8;
+            if (k0 + ki + 8 > K) continue;                      // a tail segment shorter than KS
+            const uint4 v = *reinterpret_cast<const uint4*>(W + (long long)(n0 + cc) * K + k0 + ki);
+            const __nv_bfloat16* h = reinterpret_cast<const __nv_bfloat16*>(&v);
+#pragma unroll
+            for (int e = 0; e < 8; ++e) sh[(ki + e) * NP + cc] = h[e];
+        }
+        __syncthreads();
+        const int kmax = min(KS, K - k0);
+        // a thread's rows are strided by 4, so its taps stream one row at a time (a 16-row
+        // interleave reads 16 sectors to use 16 halves) and the dot stays the K-ascending walk
+        for (int r = 0; r < nrow; ++r) {
+            const __nv_bfloat16* x = X + (long long)(rl + (r << 2)) * ldx + k0;
+            float s = acc[r];
+            for (int kk = 0; kk < kmax; ++kk)
+                s = fmaf(__bfloat162float(x[kk]), __bfloat162float(sh[kk * NP + lane]), s);
+            acc[r] = s;
+        }
+        __syncthreads();
+    }
+    for (int r = 0; r < nrow; ++r) OUT[(long long)(rl + (r << 2)) * H + col] = __float2bfloat16_rn(acc[r]);
+}
