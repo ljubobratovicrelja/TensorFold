@@ -271,7 +271,7 @@ def panel_cat_ab(ax, base, cand, la, lb):
                         for c in cats], fontsize=8.5)
     ax.set_xscale("log")
     ax.set_xlabel("median ms over served reps (log scale)")
-    ax.set_title(f"A · categories — {la} vs {lb}", loc="left", fontsize=11)
+    ax.set_title("A · categories — before vs after", loc="left", fontsize=11)
     ax.legend(fontsize=8, loc="lower right")
     ax.set_xlim(0.009, max(vb + vc) * 40)      # the delta text is longer than the bars
     ax.grid(axis="x", alpha=0.25, which="both")
@@ -296,7 +296,7 @@ def panel_stage_ab(ax, base, cand, la, lb, top):
     ax.set_xscale("log")
     ax.set_xlim(max(0.004, min(tb[n] for n in names) * 0.5), max(tc.get(n, 0) for n in names) * 9)
     ax.set_xlabel("median ms over served reps (log scale)")
-    ax.set_title(f"B · per stage, top {top} by {la} — dot is {la}, dot is {lb}", loc="left", fontsize=11)
+    ax.set_title(f"B · per stage, top {top} — before → after", loc="left", fontsize=11)
     ax.scatter([], [], s=26, color=AB_A, label=la)
     ax.scatter([], [], s=26, color=AB_B, label=lb)
     ax.legend(fontsize=8, loc="lower right")
@@ -351,10 +351,14 @@ def panel_delta_order(ax, base, cand, order, la, lb):
     ax.step(range(len(seq)), cum, where="mid", color="#2c3e50", linewidth=1.6)
     ax.fill_between(range(len(seq)), 0, cum, step="mid", color=GAIN if cum[-1] < 0 else LOSS, alpha=0.10)
     ax.axhline(0, color="black", linewidth=0.8)
-    # the four biggest single moves, labelled — they are the whole story of the delta
-    for i in sorted(range(len(d)), key=lambda i: -abs(d[i]))[:4]:
+    # the four biggest single moves, labelled — they are the whole story of the delta. The first
+    # step's label would run off the left edge, and neighbouring steps collide, so they alternate.
+    for n, i in enumerate(sorted(range(len(d)), key=lambda i: -abs(d[i]))[:4]):
+        right = i > len(seq) * 0.8
+        dx = -8 if right else (8 if i < len(seq) * 0.15 else 4)
         ax.annotate(f"{short(seq[i])} {d[i]:+.2f}", (i, cum[i]), textcoords="offset points",
-                    xytext=(4, 10 if d[i] > 0 else -14), fontsize=7.6, family="monospace",
+                    xytext=(dx, 12 if n % 2 == 0 else -16), ha="right" if right else "left",
+                    fontsize=7.6, family="monospace",
                     color=LOSS if d[i] > 0 else GAIN,
                     arrowprops=dict(arrowstyle="-", color="#7f8c8d", linewidth=0.6,
                                     shrinkA=0, shrinkB=2))
@@ -415,7 +419,7 @@ def compare(a):
     fig.suptitle(f"DFlash2 drafter — {l_before} → {l_after} on the served fixture"
                  f"  ·  round {mb:.2f} → {ma:.2f} ms ({100 * (ma - mb) / mb:+.1f}%)"
                  f"  ·  stage sum {tb:.2f} → {ta:.2f} ms", fontsize=13, x=0.01, ha="left")
-    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    fig.tight_layout(rect=(0, 0.03, 1, 0.97))   # room for the rotated tick labels
     out = a.out or "compare.png"
     fig.savefig(out, dpi=130)
     print(f"\nwrote {out}")

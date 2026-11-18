@@ -45,7 +45,7 @@ def t975(n):
     return T975.get(df, 1.96) if df < 128 else 1.96
 
 
-def post(base, prompt, seed, max_tokens):
+def post(base, prompt, seed, max_tokens, draft=True):
     body = {
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
@@ -54,7 +54,7 @@ def post(base, prompt, seed, max_tokens):
         "top_p": 0.95,
         "top_k": 20,
         "seed": seed,
-        "draft": True,
+        "draft": draft,
         "chat_template_kwargs": {"enable_thinking": True},
     }
     req = urllib.request.Request(
@@ -93,7 +93,7 @@ def run_arm(a):
     for i, pr in enumerate(prompts):
         seed = a.seed_base + i
         try:
-            _, wall = post(a.base, pr, seed, a.max_tokens)
+            _, wall = post(a.base, pr, seed, a.max_tokens, a.draft)
         except Exception as e:  # a failed request is a row, not a crash
             print(f"[{i:3d}] ERROR {e}")
             rows.append({"arm": name, "i": i, "error": str(e)})
@@ -170,15 +170,22 @@ def compare(path_a, path_b, effect):
     if need:
         print(f"to resolve {100 * effect:.1f}% ({delta:.3f} tok/round) at this sd: "
               f"n >= {need} paired prompts")
-    if half > delta:
-        print(f"VERDICT: UNDERPOWERED — the CI (±{half:.3f}) is wider than the "
-              f"{delta:.3f} effect asked about. Do not call this arm parity or a regression.")
-    elif mean < -delta:
-        print("VERDICT: REGRESSION — the whole CI is below the effect asked about.")
-    elif mean > delta:
-        print("VERDICT: GAIN in acceptance, not a cost.")
+    lo, hi = mean - half, mean + half
+    # Three separate questions, and the old single ladder conflated them: is the effect zero, is it
+    # inside the band worth caring about, and is the sample able to see it at all.
+    if lo <= 0 <= hi:
+        print(f"VERDICT: INDISTINGUISHABLE FROM ZERO at n={n} — the CI spans 0 "
+              f"([{100 * lo / base:+.2f}%, {100 * hi / base:+.2f}%]).")
     else:
-        print(f"VERDICT: PARITY within ±{delta:.3f} tok/round at n={n}.")
+        sign = "LOSS" if hi < 0 else "GAIN"
+        print(f"VERDICT: real {sign} of {100 * mean / base:+.2f}% "
+              f"(CI [{100 * lo / base:+.2f}%, {100 * hi / base:+.2f}%], excludes 0).")
+        if abs(mean) < delta:
+            print(f"  It is inside the ±{100 * effect:.1f}% band you asked about, so it is small — "
+                  f"but it is not zero, and calling it parity would misreport the direction.")
+        if half > delta:
+            print(f"  The CI (±{100 * half / base:.2f}%) is wider than that band ({100 * effect:.1f}%), "
+                  f"so the size is not pinned down: n >= {need} would pin it.")
 
 
 def main():
@@ -193,6 +200,9 @@ def main():
     p.add_argument("--base", default="http://127.0.0.1:8099/v1/chat/completions")
     p.add_argument("--max-tokens", type=int, default=1024)
     p.add_argument("--seed-base", type=int, default=1000)
+    p.add_argument("--draft", action="store_true", default=True,
+                   help="send draft:true (default); --no-draft for the autoregressive arm")
+    p.add_argument("--no-draft", dest="draft", action="store_false")
     p.add_argument("--limit", type=int, default=0)
     a = p.parse_args()
     if a.compare:

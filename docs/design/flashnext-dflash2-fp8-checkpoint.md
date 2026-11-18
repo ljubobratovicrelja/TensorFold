@@ -97,21 +97,45 @@ last block. This is expected: §5 of the plan records that the selector amplifie
 a different candidate set, which is exactly why bit-exactness cannot be the gate for a precision
 change.
 
-## 4. What is still open, and what would close it
+## 4. The served A/B, run 2026-11-18
 
-**Acceptance is not measured yet.** Nothing here says fp8 drafts as well as bf16 through a served
-stream; it says the weights' error is 2.6% relL2 and the round is 2.7 ms shorter. The gate is
-per-prompt accept length over many prompts, and the instrument is `tools/dflash2/accept_ab.py`
-(paired A/B on the served path, verdict refused when the confidence interval is wider than the effect
-asked about).
+Four arms, one server at a time on `:8099`, the same 16 GSM8K prompts and seeds, numbers taken from
+the server's own `done chatcmpl` lines:
 
-Sizing matters and is the reason this is not a 16-prompt question: at a per-prompt accept-length
-spread of ~0.21, resolving a 2% effect needs ~39 paired prompts, and resolving 1% needs ~150.
+| arm | tok/s | accept len | round ms |
+|---|---:|---:|---:|
+| AR (`--no-drafts`) | 25.0 | 1.004 | 40.2 |
+| MTP (no `--drafter`) | 53.0 | 3.505 | 67.1 |
+| DFlash2 bf16 | 48.1 | 3.387 | 69.6 |
+| DFlash2 fp8 | 49.4 | 3.322 | 66.8 |
+
+**Losslessness holds: all four arms produced identical completion hashes on 16 of 16 prompts.** The
+fp8 checkpoint changes what the drafter proposes and nothing about what the target emits.
+
+Paired on the same prompts (`accept_ab.py --compare`):
+
+- **acceptance −1.94%**, 95% CI **−3.54% to −0.33%** — a real loss, not noise, and small. The
+  selector is doing exactly what §3 describes: a 2.646% weight error moves 64 of 112 slots, and the
+  accept length follows.
+- **throughput +1.31 tok/s**, CI **+0.61 to +2.01** — real, and bigger than the acceptance loss costs,
+  because the round is 2.8 ms cheaper.
+- The paired per-prompt sd was 0.111 tok/round, so 16 prompts *did* resolve a ~2% effect here
+  (n ≥ 11 was needed at that spread). That is luck, not a licence: at the 0.21 spread assumed when
+  this harness was written, the same 16 prompts would have resolved nothing.
+
+**Verdict: fp8 is a net gain on this box and this prompt set, and it is not free.** The honest summary
+is "−1.9% accept for +2.7% throughput, both statistically real", not "no cost".
+
+## 5. What is still open
 
 **Per-slot acceptance** (the vendor's width-8 shape is 0.740 / 0.662 / 0.592 / 0.621 / 0.389 / 0.429 /
-0.333) needs a tap-level replay rather than the server's `done` line, because the served log reports
-totals only. That is a second instrument.
+0.333) is not measured — the served log reports totals only, so this needs a tap-level replay rather
+than the `done` line. The aggregate says acceptance falls ~2%; per-slot data would say *where*, and
+that is what would tell us whether a bf16 rescue of one group (say `down_proj`) buys it back cheaply.
+
+**One prompt set.** 16 GSM8K prompts is one distribution. Coding and long-context streams are the
+other two shapes this box serves, and the survey's external evidence was for the 27B drafter, not
+this one.
 
 **Where a collapse would show:** accept length 3.34 → ≤2.5, or degenerate proposals (repeats, all
-seven identical). Neither appeared in 16 reps of the fixture, which is 16 rounds of evidence, not a
-guarantee.
+seven identical). Neither appeared, on fixture or served.

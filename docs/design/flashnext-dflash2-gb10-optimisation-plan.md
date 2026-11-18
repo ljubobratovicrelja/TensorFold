@@ -30,13 +30,32 @@ Measured here, same 16 GSM8K prompts, pinned seeds, single stream:
 
 | arm | tok/s | accept len | round ms | extra tokens | ms per extra token |
 |---|---|---|---|---|---|
-| AR | 25.5 | — | 39.2 | — | — |
-| MTP | 59.6 | 3.89 | 65.3 | 2.89 | **9.0** |
-| DFlash2 w8 | 45.0 | 3.34 | 74.2 | 2.34 | **15.0** |
+| AR | 25.0 | 1.004 | 40.2 | — | — |
+| MTP | 53.0 | 3.505 | 67.1 | 2.50 | **10.7** |
+| DFlash2 w8, bf16 | 48.1 | 3.387 | 69.6 | 2.38 | **12.2** |
+| DFlash2 w8, fp8 | 49.4 | 3.322 | 66.8 | 2.32 | **11.5** |
+
+Re-measured 2026-11-18 on the current binary, same 16 prompts, same seeds, one server at a time,
+each arm's numbers from the server's own `done chatcmpl` lines (`~/.hermes/cache/scratch/e2e/`).
+**All four arms produced identical completion hashes on 16 of 16 prompts** — verification is
+lossless, so drafting cannot change the output, and the fp8 checkpoint included.
+
+Against the previous run of this table: DFlash2 **45.0 → 48.1 tok/s** at bf16 (the fuse fix, worth
+4.6 ms a round end to end) and **→ 49.4** with the fp8 checkpoint. Paired on the same prompts, fp8
+against bf16 is **+1.31 tok/s (95% CI +0.61 to +2.01)** — real — while acceptance is **−1.94%
+(CI −3.54% to −0.33%)** — also real, small, and in the direction the selector predicted: the round
+is 2.8 ms cheaper and the candidate set is slightly worse, and the 2.8 ms wins.
+
+**MTP reads 53.0 here against the 59.6 recorded above, at an unchanged round cost (67.1 vs 65.3 ms),
+so the gap is acceptance (3.505 vs 3.89), not speed.** Nothing in the fp8 work touches the MTP path,
+and the AR arm is flat (25.0 vs 25.5), so this is either a different measurement regime in the older
+row or a genuine acceptance regression on the default path. **Unexplained — do not quote MTP as
+unregressed until it is bisected.**
 
 On the card's GB300 those last-column figures are ~2.2 ms (MTP) and ~1.8 ms (DFlash2) per extra
-token. So this box inflates MTP's overhead ~4× and DFlash2's ~8.5×, and the asymmetry is entirely
-the drafter's fixed per-round cost. That is the thing this file is about.
+token. So this box inflates MTP's overhead ~4.9× and DFlash2's ~6.8× at bf16 (6.4× at fp8) — the
+asymmetry is entirely the drafter's fixed per-round cost, and the fuse fix plus fp8 have moved it the
+right way without closing it. That is the thing this file is about.
 
 ## 2. How each number is obtained
 
@@ -124,9 +143,9 @@ The script prints the whole table to stdout as well, so the figure is never the 
 `selector_scores` (3.08 ms) appears in the dump but is a **host recomputation the harness adds**,
 not part of the round — it is excluded from the share column.
 
-End to end, by arithmetic rather than a fresh measurement: the 74.2 ms DFlash2 round of §1 less the
-4.24 ms this change removes is ~69.96 ms, i.e. **~47.7 tok/s** against 45.0. That needs re-measuring
-through the server before it is quoted as measured.
+End to end, now measured through the server rather than by arithmetic (§1): the bf16 round is
+**69.6 ms, 48.1 tok/s** (from 74.2 / 45.0), and the fp8 checkpoint takes it to **66.8 ms, 49.4 tok/s**
+with acceptance 3.322 against 3.387 — a real −1.94% accept for a real +2.7% throughput.
 
 ## 4. What we have changed
 

@@ -9,9 +9,11 @@ Measured state: the drafter's round in the served regime is **18.75 ms** on the 
 checkpoint (`fixture/sequence`, 15 served reps; 22.99 ms before the context-fuse change of 2026-11-18)
 and **16.02 ms** with the weight-only FP8 build of the seven decoder linears (−14.5%, same binary, same
 session, `flashnext-dflash2-fp8-checkpoint.md`), and
-acceptance is **3.34 tokens/round at width 8**. End to end that is ~70 ms of wall clock a round
-including the target's verify — 45.0 tok/s measured before the fuse change, ~47.7 by arithmetic after it
-— against AR 25.5 and MTP 59.6 on the same 16 GSM8K prompts. On the vendor's own card that is parity on
+acceptance is **3.387 tokens/round at width 8** (3.322 on the fp8 checkpoint). End to end, measured
+through the server on the same 16 GSM8K prompts, one arm at a time: **AR 25.0 · MTP 53.0 · DFlash2 bf16
+48.1 · DFlash2 fp8 49.4 tok/s**, with identical completion hashes on 16 of 16 prompts in all four arms.
+DFlash2 was 45.0 tok/s before the fuse fix; MTP's row reads 53.0 here against 59.6 in the earlier
+capture at an unchanged round cost, which is an open question (plan §1), not a settled regression. On the vendor's own card that is parity on
 acceptance (3.26) and behind on cost — 15.0 ms per extra token here against ~1.8 ms on GB300, the whole
 of it the drafter's fixed per-round weight traffic.
 
