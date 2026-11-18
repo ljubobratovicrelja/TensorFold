@@ -7,9 +7,9 @@ decoding verifies against the target's own argmax. So the gate is not "does it r
 return the same tensorfold.token_sha256 as the MTP build it replaced".
 
 Usage:
-    python3 tools/dflash2/two_paths.py --label mtp  --port 8099
-    python3 tools/dflash2/two_paths.py --label nodrafts --port 8099
-    python3 tools/dflash2/two_paths.py --label dflash2 --port 8099 --drafter <dir>
+    python3 tools/dflash2/harness/two_paths.py --label mtp  --port 8099
+    python3 tools/dflash2/harness/two_paths.py --label nodrafts --port 8099
+    python3 tools/dflash2/harness/two_paths.py --label dflash2 --port 8099 --drafter <dir>
 
 Each run prints one JSON line; pass the same --out to compare them, which is what the acceptance
 gate does. Greedy (temperature 0) because a sampled path may legitimately differ.

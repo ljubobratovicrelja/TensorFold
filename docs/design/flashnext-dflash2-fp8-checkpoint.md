@@ -88,7 +88,7 @@ times, while bf16 attention read **0.87 then 1.10**. A served stream gets this b
 drafter-only profile taken alone would not. It is recorded as a hypothesis, not as a kernel win.
 
 The figure: `docs/design/profiles/2026-11-18-fp8-vs-bf16-served.png`
-(`tools/dflash2/plot_stages.py CAPTURE --baseline BASE`, committed as `fb871c4d5`).
+(`tools/dflash2/harness/plot_stages.py CAPTURE --baseline BASE`, committed as `fb871c4d5`).
 
 **The cost: proposals move.** 48 of 112 proposal slots are identical between arms; 64 differ. Per rep
 the identical count is 1, 1, 4, 7, 1, 3, 1, 0, 3, 3, 2, 5, 4, 6, 3, 4 — one rep is fully identical,

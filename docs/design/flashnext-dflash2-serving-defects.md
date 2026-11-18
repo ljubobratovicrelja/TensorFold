@@ -86,7 +86,7 @@ until `family_costs` is non-empty, since the capped branch returns before readin
 
 ## 4. Harness gap (separate from the engine)
 
-`tools/dflash2/three_paths_bench.py` reads `tensorfold.speculative.{drafted,accepted}` for its
+`tools/dflash2/harness/three_paths_bench.py` reads `tensorfold.speculative.{drafted,accepted}` for its
 `acceptance_rate` column — this build emits no `speculative` sub-block, so the column is always
 `null`. The acceptance numbers live only in the server log line
 `[tensorfold] done … rounds=N accepted=X/Y`. Fix the harness to parse that line (or have the server
@@ -207,7 +207,7 @@ confirmed against them:
 ### The debugging path (differential, against the reference — not hypothesis-driven)
 
 1. **Drafter-math diff — ALREADY DONE, closed.** The dtype-matched CUDA-vs-reference stage diff exists
-   (`tools/dflash2/align_bf16/`, `compare.py` joins 52 stages over a frozen fixture with `SHA256SUMS`).
+   (`tools/dflash2/analysis/align_bf16/`, `compare.py` joins 52 stages over a frozen fixture with `SHA256SUMS`).
    Result (see `flashnext-dflash2-divergence-brief.md` §9–10): the tap-fusion rounding defect was real
    and is **fixed** (`3a173079b` — `tf_fxd2_rmsnorm`/`tf_fxd2_fuse` now round like the reference's
    `nn.Linear`→RMSNorm, `fc_ctx_rows` 99.08% bit-exact). The residual below `qkv_0` is **deterministic

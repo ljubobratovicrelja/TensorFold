@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """One prefill against a TF_FLASHNEXT_TAP_DUMP server, then a look at what landed.
 
-The reader of this is `tools/dflash2/tap_accept.py`: it wants a teacher-forced sequence of
+The reader of this is `tools/dflash2/analysis/tap_accept.py`: it wants a teacher-forced sequence of
 tokens long enough to fill the drafter's 2048-row window, plus the engine's own tap rows for
 that same sequence. So this sends a long, deterministic prompt and asks for a single token —
 the prefill is the measurement, the completion is not — and then prints the dump's geometry.
 
 The prompt text comes from the design doc beside it, so a rerun tokenizes to the same ids.
 
-    python3 tools/dflash2/tap_dump_run.py --dump-dir /tmp/tapdump-readout
+    python3 tools/dflash2/analysis/tap_dump_run.py --dump-dir /tmp/tapdump-readout
 """
 
 from __future__ import annotations
@@ -44,7 +44,7 @@ def main() -> int:
     ap.add_argument("--model", default="qwen3.8-flash-next")
     ap.add_argument("--dump-dir", required=True, help="the directory the server was started with")
     ap.add_argument("--words", type=int, default=700, help="prompt words (~1.3 tokens a word)")
-    ap.add_argument("--doc", default=str(Path(__file__).resolve().parents[2] / "docs/design/flashnext-dflash2-drafter.md"))
+    ap.add_argument("--doc", default=str(Path(__file__).resolve().parents[3] / "docs/design/flashnext-dflash2-drafter.md"))
     a = ap.parse_args()
 
     text = prompt_text(Path(a.doc), a.words)

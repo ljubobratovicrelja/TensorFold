@@ -1,7 +1,7 @@
 # Harvesting drafter training fixtures (2026-11-18)
 
 The drafter's input is the target's own residual taps, so no text corpus is usable until it has
-been run through the target. `tools/dflash2/harvest.py` does that: one prefill pass per chunk, and
+been run through the target. `tools/dflash2/harness/harvest.py` does that: one prefill pass per chunk, and
 the engine's existing `TF_FLASHNEXT_TAP_DUMP` capture becomes the fixture.
 
 This is **prefill only** — no sampling, no decode, no rollout — so the target's 45 tok/s decode
@@ -14,7 +14,7 @@ TF_FLASHNEXT_TAP_DUMP=/tmp/harv/dump TF_FLASHNEXT_TAP_SOURCE=mean4 \
   ./zig-out/native/bin/tensorfold-native serve "$TARGET" --port 8101 --context 16384 \
     --parallel 1 --kv-cache fp8 --no-drafts --no-thinking &
 
-python3 tools/dflash2/harvest.py --dump-dir /tmp/harv/dump --out /tmp/harv/out \
+python3 tools/dflash2/harness/harvest.py --dump-dir /tmp/harv/dump --out /tmp/harv/out \
   --tokenizer-dir "$TARGET" --chunk-tokens 2000 --corpus FILE...
 ```
 

@@ -28,7 +28,7 @@ to 1.0 a row on a real capture; the exact scale is immaterial to a bit-for-bit c
 just has to be a realistic one so no kernel's overflow path or a denormal tail is what is being
 tested).
 
-  python tools/dflash2/align_bf16/gen_inputs.py [outdir]
+  python tools/dflash2/analysis/align_bf16/gen_inputs.py [outdir]
 """
 
 import hashlib

@@ -27,7 +27,7 @@ ending mid-assistant-turn — so the 8-row blocks sit where they sit in use.
 
 ## The harvester writes the wrong region today
 
-`tools/dflash2/harvest.py` sends each chunk as `messages=[{role:user, ...}]`. Checked in
+`tools/dflash2/harness/harvest.py` sends each chunk as `messages=[{role:user, ...}]`. Checked in
 `ids.bin`: `im_start` occurs **once** per 2,000-token chunk, and the only assistant-region tokens
 are the five-token priming tail (`<|im_start|>assistant\n` + two markers). ~99% of harvested tokens
 teach the drafter to draft user text. Fix before the first training run.

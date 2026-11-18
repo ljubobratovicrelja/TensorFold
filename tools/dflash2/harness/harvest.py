@@ -17,8 +17,8 @@ whole OpenAI-shaped conversations verbatim. The chat template then renders the c
 assistant region and the pass ends at an assistant generation prompt, not in a user turn.
 
     TF_FLASHNEXT_TAP_DUMP=/tmp/harv/dump ./tensorfold-native serve T --port 8101 --no-drafts &
-    python3 tools/dflash2/harvest.py --dump-dir /tmp/harv/dump --out /tmp/harv/out --corpus DOCS...
-    python3 tools/dflash2/harvest.py --dump-dir /tmp/harv/dump --out /tmp/harv/out \
+    python3 tools/dflash2/harness/harvest.py --dump-dir /tmp/harv/dump --out /tmp/harv/out --corpus DOCS...
+    python3 tools/dflash2/harness/harvest.py --dump-dir /tmp/harv/dump --out /tmp/harv/out \
       --conversations sessions.jsonl
 
 Bytes: a full ring is 52,838,400 B per pass = 25.8 KB a token at 2048 tokens.

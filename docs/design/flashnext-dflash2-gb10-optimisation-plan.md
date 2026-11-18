@@ -68,7 +68,7 @@ rep, ~3.8 GiB device**, against ~60 s and 79 GiB for booting the full 48-layer t
 bit-identical to the serving path: 52 stages, proposals `{20, 1, 847, 471, 494, 348, 383}`, round
 437.74 ms standalone vs 439.47 ms through the engine.
 
-**`tools/dflash2/align_bf16/gen_inputs.py`** writes three fixtures: `block8` (**stale** — `pos_end`
+**`tools/dflash2/analysis/align_bf16/gen_inputs.py`** writes three fixtures: `block8` (**stale** — `pos_end`
 9, the check requires `>= block + 2 = 10`, it refuses `FixtureIdsShape`), `window` (2048 rows, one
 position) and **`sequence`** (2048 rows, 44 rounds, positions advancing 1900 → 2047 by 3–4).
 
@@ -77,7 +77,7 @@ position) and **`sequence`** (2048 rows, 44 rounds, positions advancing 1900 →
 the previous one projected. Rep 0 is the cold round, reps 1+ are the served ones. Without this,
 every measurement is of the wrong regime — see §7.
 
-**`tools/dflash2/regress.py`** — the gate. `capture <label> [--repeat N] [--via standalone|server]`,
+**`tools/dflash2/analysis/regress.py`** — the gate. `capture <label> [--repeat N] [--via standalone|server]`,
 `check <base> <cand>`, `list <run>`. Functional gate: every stage tensor must match the baseline
 (`--func-tol`, default 0 = bf16-exact). Speed gate: per-stage ms and the round total over the
 **median of `--repeat` reps** (default 3), because two captures of one binary measured 438 ms and
@@ -132,12 +132,12 @@ and `fc_ctx` (0.71).
 
 **The same numbers as a figure:** `docs/design/profiles/2026-11-18-served-round-post-fuse.png`
 (`2026-11-18-served-round.png` is the pre-fuse capture, kept for the comparison), drawn by
-`tools/dflash2/plot_stages.py`. Four views: the stages ranked (A), categories served against cold on
+`tools/dflash2/harness/plot_stages.py`. Four views: the stages ranked (A), categories served against cold on
 a log axis (B), the round in execution order as a cumulative curve (C), and every rep (D). Panel D
 clips the cold round on purpose; panel B's cold multiplier is computed from the data, because it
 moved from 60× to 268× when the fuse stopped re-reading its weight.
 
-    .venv-plot/bin/python tools/dflash2/plot_stages.py ~/.hermes/cache/scratch/verify-fuse --out PNG
+    .venv-plot/bin/python tools/dflash2/harness/plot_stages.py ~/.hermes/cache/scratch/verify-fuse --out PNG
 
 The script prints the whole table to stdout as well, so the figure is never the only record.
 `selector_scores` (3.08 ms) appears in the dump but is a **host recomputation the harness adds**,

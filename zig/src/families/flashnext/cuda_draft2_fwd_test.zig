@@ -3,7 +3,7 @@
 //! `tf_fxd2_select` does not build the reference's whole lattice. It builds one position's row of
 //! it at a time, because the walk is serial anyway: at step `t` it forms `ctx[r] = pred[prev] *
 //! h_proj[t]` once, dots it against each of the `topk` successors, and argmaxes. The reference
-//! (`tools/dflash2/reference.py`) instead materialises `lat[t, p, c]` for every predecessor index
+//! (`tools/dflash2/analysis/reference.py`) instead materialises `lat[t, p, c]` for every predecessor index
 //! `p` and walks it by index. The two must pick the same token every step, and the subtle place
 //! they could differ is the anchor: `prev = cat([anchor, cand[:, :-1]])` makes row 0's
 //! predecessor the *anchor token* for every `p`, and the walk starts at index 0.

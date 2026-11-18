@@ -139,7 +139,7 @@ Each entry is a claim an agent may still find in the tree, and what is true inst
   the raw logs/JSON. `docs/evidence-index.md` is the machine-readable index over them
   (`tools/evidence_index.py`, no GPU needed).
 - `tools/dflash2/README.md` — the torch reference port used for the tap-source question; not shipped,
-  nothing imports it. `tools/dflash2/align_bf16/` is the two-sided stage diff; `regress.py` is the gate;
+  nothing imports it. `tools/dflash2/analysis/align_bf16/` is the two-sided stage diff; `regress.py` is the gate;
   `tools/dflash2/run/matrix-mtp-report.md` is a generated warm/cold MTP matrix.
 - `docs/recipes/qwen3.8-flash-next.md`, `docs/recipes/flash-next-cuda.md` — serving recipes for the
   target family (Metal and CUDA). Not DFlash2-specific except where `--drafter` is passed.

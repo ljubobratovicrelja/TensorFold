@@ -10,7 +10,7 @@ For each stage: shape, the dtype it was recorded at (from both `stages.json`), m
 abs diff, relative L2 (`||a - b|| / ||a||`), cosine, and whether the two arrays are bit-identical.
 A stage only one side wrote is listed as MISSING, by name, and never silently dropped.
 
-  python tools/dflash2/align_bf16/compare.py <reference-dir> <ours-dir> [--csv out.csv] [--md out.md]
+  python tools/dflash2/analysis/align_bf16/compare.py <reference-dir> <ours-dir> [--csv out.csv] [--md out.md]
 """
 
 import argparse

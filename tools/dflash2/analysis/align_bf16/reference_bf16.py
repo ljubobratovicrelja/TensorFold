@@ -23,7 +23,7 @@ the tensor the stage actually holds (bf16 -> f32 is exact, so bit-identity of th
 identity of the dump; ids and logits are f32 on the device side already). `stages.json` records each
 stage's source dtype, so a comparer never has to guess.
 
-  python tools/dflash2/align_bf16/reference_bf16.py <fixture-case-dir> <out-dir>
+  python tools/dflash2/analysis/align_bf16/reference_bf16.py <fixture-case-dir> <out-dir>
 """
 
 import importlib.util

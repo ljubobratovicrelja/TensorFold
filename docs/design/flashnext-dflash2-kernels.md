@@ -2,7 +2,7 @@
 
 What to write, what to reuse, and where the numerics sit. Grounded in
 `zig/kernels/cuda/qwen35_draft.cu` (read, not assumed) and the working torch port at
-`tools/dflash2/reference.py` (which runs the real checkpoint end to end).
+`tools/dflash2/analysis/reference.py` (which runs the real checkpoint end to end).
 
 The conclusion up front: **most of this is already written.** qwen3_5's drafter kernels are
 argument-driven, not baked to its own dimensions, and the drafter's `head_dim` is 128 in both
@@ -51,7 +51,7 @@ Per layer, in order (mirrors `reference.py`'s `DraftLayer.forward`, which is ver
 6. `tf_q35d_attn` variant (§2.3) over `[k_ctx, k_n]` and `[v_ctx, v_n]`. In the engine the context is
    the **prefix** — the fused taps of `[p - ctx_len + 1, p]`, i.e. what the target had already
    computed when it proposed the block — never the block's own eight tap rows, which is the "leaky"
-   variant `tools/dflash2/tap_accept.py` keeps behind `--ctx-mode block`.
+   variant `tools/dflash2/analysis/tap_accept.py` keeps behind `--ctx-mode block`.
 7. `o_proj`, then **output-side conv**: `finish` with the stored delta, `branch = 1`.
 8. residual add; then the MLP with the same shape: `post_attention_layernorm` → conv prepare → `gate`/`up`/`silu` → `down` → conv finish → residual.
 

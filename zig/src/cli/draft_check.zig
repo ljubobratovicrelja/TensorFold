@@ -10,7 +10,7 @@
 //!     tensorfold draft-check --drafter DIR --target DIR --fixture DIR --out DIR [--repeat N]
 //!
 //! Each repetition writes `--out/rep{i}` with `stages.json` and its tensors, the layout the
-//! fixture harness writes, so `tools/dflash2/regress.py` reads either source unchanged.
+//! fixture harness writes, so `tools/dflash2/analysis/regress.py` reads either source unchanged.
 const std = @import("std");
 const cuda = @import("cuda");
 const core = @import("core");

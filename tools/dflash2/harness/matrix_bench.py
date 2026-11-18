@@ -72,17 +72,17 @@ Usage
 -----
     # one server, one path; the operator started it with the --drafter flag or without
     BASE_URL=http://127.0.0.1:8099/v1 MODEL=qwen3.8-flash-next \\
-    python3 tools/dflash2/matrix_bench.py --label df2-a --path-mode mtp
+    python3 tools/dflash2/harness/matrix_bench.py --label df2-a --path-mode mtp
 
     # the same build restarted with --drafter <dir>, into the same file; the report keeps them apart
-    python3 tools/dflash2/matrix_bench.py --label df2-a --path-mode dflash2 --reps 3
+    python3 tools/dflash2/harness/matrix_bench.py --label df2-a --path-mode dflash2 --reps 3
 
     # a half matrix after a crash, or one lane count to re-check
-    python3 tools/dflash2/matrix_bench.py --label df2-a --path-mode mtp --only-fills 0,20000
-    python3 tools/dflash2/matrix_bench.py --label df2-a --path-mode mtp --only-lanes 4
+    python3 tools/dflash2/harness/matrix_bench.py --label df2-a --path-mode mtp --only-fills 0,20000
+    python3 tools/dflash2/harness/matrix_bench.py --label df2-a --path-mode mtp --only-lanes 4
 
     # re-read the file without touching a server
-    python3 tools/dflash2/matrix_bench.py --report-only --out tools/dflash2/run/matrix.jsonl
+    python3 tools/dflash2/harness/matrix_bench.py --report-only --out tools/dflash2/run/matrix.jsonl
 
 Python 3 stdlib only (urllib, no requests, no torch, no build).
 """

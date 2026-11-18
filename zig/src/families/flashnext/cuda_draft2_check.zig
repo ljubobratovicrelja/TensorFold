@@ -1,9 +1,9 @@
 //! TF_FLASHNEXT_DRAFT_CHECK=1: score the CUDA DFlash2 drafter on a capture the engine just made.
 //!
 //! Research only, and off unless the variable is `1`. It answers, inside the engine rather than in a
-//! torch harness, the one question `tools/dflash2/tap_accept.py` answers outside it: does
+//! torch harness, the one question `tools/dflash2/analysis/tap_accept.py` answers outside it: does
 //! `cuda_draft2_fwd.zig`'s round — the real kernels over the real 81-tensor checkpoint — land the
-//! same tokens as `tools/dflash2/reference.py` on the same tap ring? What it is not: a serving path.
+//! same tokens as `tools/dflash2/analysis/reference.py` on the same tap ring? What it is not: a serving path.
 //! It drafts nothing for a reply, holds no lane, touches no cache; it reads one capture's ring, runs
 //! rounds over it and logs a line.
 //!
@@ -51,7 +51,7 @@
 //! TF_FLASHNEXT_DRAFT_CHECK_ROUNDS=120 TF_FLASHNEXT_CHUNK=2048 \
 //! TF_FLASHNEXT_DRAFTER_DIR=$HOME/.cache/huggingface/hub/models--incoai--Qwen3.8-Flash-Next-DFlash2/snapshots/a22a1744e85c17364dcc54a6a420af7135d4c7f6 \
 //!   <the server binary> --model <the served flashnext folder> ...
-//! python3 tools/dflash2/tap_dump_run.py --dump-dir /tmp/tapdump-draftcheck   # one 1455-token prefill
+//! python3 tools/dflash2/analysis/tap_dump_run.py --dump-dir /tmp/tapdump-draftcheck   # one 1455-token prefill
 //! ```
 //!
 //! then one line in the engine's log: `draftcheck: rounds 120 accepted 0.342 mean_advance 1.342
@@ -65,7 +65,7 @@
 //! logits, and the proposals (`cuda_draft2_debug.zig` has the layout). Each file isolates one
 //! stage — `tf_fxd2_fuse`, embed/anchor/mask, the layers one at a time, `tf_fxd2_head_topk` (which
 //! also settles the engine-head detile), `tf_fxd2_select` — and
-//! `python3 tools/dflash2/draft_compare.py --debug-dir <dir> --dump <the capture>` reads them
+//! `python3 tools/dflash2/analysis/draft_compare.py --debug-dir <dir> --dump <the capture>` reads them
 //! against `reference.py` stage by stage, reporting relative difference, row alignment and top-1
 //! agreement a stage, then token agreement and acceptance for the round.
 //!
@@ -73,7 +73,7 @@
 //! TF_FLASHNEXT_TAP_DUMP=/tmp/tapdump-draftcheck TF_FLASHNEXT_DRAFT_CHECK=1 \
 //! TF_FLASHNEXT_DRAFT_DEBUG=/tmp/draftdbg TF_FLASHNEXT_DRAFT_DEBUG_ROUNDS=0,1,64 \
 //!   <the same server invocation as above>
-//! python3 tools/dflash2/draft_compare.py --debug-dir /tmp/draftdbg --dump /tmp/tapdump-draftcheck
+//! python3 tools/dflash2/analysis/draft_compare.py --debug-dir /tmp/draftdbg --dump /tmp/tapdump-draftcheck
 //! ```
 //!
 //! Round 0's context is one row and round 1's two, so a dump that is meant to test the fusion or the

@@ -60,15 +60,15 @@ This script never starts, stops or kills a server, and refuses to talk to the pr
 Usage
 -----
     BASE_URL=http://127.0.0.1:8099/v1 MODEL=qwen3.8-flash-next \\
-    python3 tools/dflash2/three_paths_bench.py --label df2-a --path-mode mtp \\
+    python3 tools/dflash2/harness/three_paths_bench.py --label df2-a --path-mode mtp \\
         --out tools/dflash2/run/three_paths.jsonl
 
     # same build, restarted with --drafter <dir>, into the same file; the report then compares both
-    python3 tools/dflash2/three_paths_bench.py --label df2-a --path-mode dflash2 \\
+    python3 tools/dflash2/harness/three_paths_bench.py --label df2-a --path-mode dflash2 \\
         --out tools/dflash2/run/three_paths.jsonl --sampling both
 
     # re-read the file without touching a server
-    python3 tools/dflash2/three_paths_bench.py --report-only --out tools/dflash2/run/three_paths.jsonl
+    python3 tools/dflash2/harness/three_paths_bench.py --report-only --out tools/dflash2/run/three_paths.jsonl
 
 Python 3 stdlib only; no requests, no torch, no build.
 """

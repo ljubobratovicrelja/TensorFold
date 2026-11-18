@@ -1,5 +1,5 @@
 """DFlash2 drafter forward in torch, derived from the Zig/CUDA round, not from the old
-`tools/dflash2/reference.py` (which scores 0/7 and is structurally wrong).
+`tools/dflash2/analysis/reference.py` (which scores 0/7 and is structurally wrong).
 
 This file's only job is to reproduce the *shipped checkpoint's* proposals — i.e. what
 `zig/src/families/flashnext/cuda_draft2_fwd.zig` + `zig/kernels/cuda/qwen35_draft.cu` compute —

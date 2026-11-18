@@ -32,7 +32,7 @@ Read this before touching the code, then read
   `~/.cache/huggingface/hub/models--incoai--Qwen3.8-Flash-Next-DFlash2/snapshots/a22a1744e85c17364dcc54a6a420af7135d4c7f6`
 - Python: `~/.venvs/marker/bin/python` (torch present). Zig: `~/tools/zig-0.17.0`.
 - Build: `PATH=$HOME/tools/zig-0.17.0:$PATH zig build -Dgpu=spark -Dnvcc=/usr/local/cuda/bin/nvcc`
-- Server helper: `tools/dflash2/tfsrv.sh`; run the binary with
+- Server helper: `tools/dflash2/harness/tfsrv.sh`; run the binary with
   `serve <ckpt> --host 127.0.0.1 --port 8099 --name qwen3.8-flash-next --context 32768 --parallel 1 --kv-cache fp8 --drafter <drafter-dir>`
 - Serve with `--drafter` to enable DFlash2; without it the same binary serves MTP. MTP is
   still the default and has **not** regressed (see §4).
@@ -61,7 +61,7 @@ All of §13's commits are pushed to `origin/dflash2` (`3e8531e6a..d9bd10563`).
 ## 2. The headline: it is correct and useless
 
 One lane, one prompt, same binary, per-request `draft` flag, 100 tokens
-(`tools/dflash2/round_cost.py`):
+(`tools/dflash2/harness/round_cost.py`):
 
 - **no drafts**: 22–25 tok/s, 99 rounds, 39–42 ms/round
 - **MTP**: 37.0 tok/s, 56 rounds, 73/136 accepted (2.3 a round), 57 ms/round
@@ -129,7 +129,7 @@ or it will lie to you.
   and something subtler is wrong.
 - The tap dump is reproducible:
   `TF_FLASHNEXT_TAP_DUMP=/tmp/tapdump-readout` + one prefill via
-  `tools/dflash2/tap_dump_run.py`. Dumps exist at `/tmp/tapdump-readout`,
+  `tools/dflash2/analysis/tap_dump_run.py`. Dumps exist at `/tmp/tapdump-readout`,
   `/tmp/tapdump-normed`, `/tmp/tapdump-readout-bf16`.
 
 ---
@@ -144,7 +144,7 @@ or it will lie to you.
    the collapse kernel does not exist; only `readout` and `normed` are available.
    **In flight:** an analysis of the existing dumps that checks per-slot lm_head ranking,
    position offsets, and the four streams individually.
-2. **Our oracle shares our misreadings.** `tools/dflash2/reference.py` matched a SpecForge
+2. **Our oracle shares our misreadings.** `tools/dflash2/analysis/reference.py` matched a SpecForge
    port to ~1e-6, which felt like validation, but it was written by the same hand that
    wrote the engine. A convention error held in common is invisible to it. **In flight:**
    a diff of every operation against the vendor's own `model.py`
@@ -222,14 +222,14 @@ or it will lie to you.
 ## 8. How to reproduce each number
 
 - Throughput, drafts on/off, one process:
-  `python3 tools/dflash2/round_cost.py 8099 100` against a `--drafter` server.
+  `python3 tools/dflash2/harness/round_cost.py 8099 100` against a `--drafter` server.
 - Per-round cost split: start the server with `TF_DRAFT2_TIME=1` and read
   `draft2 stages: layers … head … select …` and `draft2 round: … = gather … + draft …`.
   Add `TF_TAP_TIME=1` for `round: … = verify … + rest` and `verify window: N rows, X ms`.
-- Teacher-forced acceptance: `~/.venvs/marker/bin/python tools/dflash2/tap_accept.py
+- Teacher-forced acceptance: `~/.venvs/marker/bin/python tools/dflash2/analysis/tap_accept.py
   --dump /tmp/tapdump-readout --block 8 --max-rounds 40 --ctx-mode prefix [--ctx-shift -1]`.
   It refuses a manifest whose layer list disagrees with the drafter's, by design.
-- Full matrix (MTP only, historically): `tools/dflash2/matrix_bench.py`; rows in
+- Full matrix (MTP only, historically): `tools/dflash2/harness/matrix_bench.py`; rows in
   `tools/dflash2/run/matrix.jsonl`, report in `tools/dflash2/run/matrix-mtp-report.md`.
   DFlash2 cells are all `DraftTapNotCovered` today — see §5.6.
 
@@ -260,7 +260,7 @@ or it will lie to you.
 1. Settle the tap tensor question from data (§5.1). If the correct capture is not
    `readout`, everything measured so far is a measurement of the wrong input.
 2. Run the vendor code itself on one round and diff proposals row by row against
-   `tools/dflash2/draft_compare.py`'s output (§5.2). Agreement there is the first oracle
+   `tools/dflash2/analysis/draft_compare.py`'s output (§5.2). Agreement there is the first oracle
    in this repo that is not self-referential.
 3. Force depth 7 and compare accepted-per-round against the depth the rule picks (§5.3).
 4. Only then the cost work: land the tiled head, and make the fused ring survive a

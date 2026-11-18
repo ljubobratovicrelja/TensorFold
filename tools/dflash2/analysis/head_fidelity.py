@@ -11,7 +11,7 @@ This tool answers it over head inputs dumped by the engine. It is personal-compu
 pure numpy, no torch, no GPU, no server, and it never loads the model -- it reads `lm_head` alone, out of
 its safetensors shard, through a JSON header read plus a memmap. That is 1.27 GB of a 102 GB checkpoint.
 
-    python tools/dflash2/head_fidelity.py --inputs DIR --ckpt SNAPSHOT --out report.json \\
+    python tools/dflash2/analysis/head_fidelity.py --inputs DIR --ckpt SNAPSHOT --out report.json \\
         [--vocab-ranks FILE] [--slots 7] [--top 16]
 
 `--inputs` is a `.npy` of `[rows, 2560]` bf16-widened rows, or a directory of them concatenated in name
@@ -68,7 +68,7 @@ BUCKETS = (("p>=0.9", 0.9, 2.0), ("0.6<=p<0.9", 0.6, 0.9), ("0.3<=p<0.6", 0.3, 0
 
 def fp8_module():
     """The repo's block-FP8 module (`quantize/dflash_fp8.py`), loaded by path: no package, no torch."""
-    path = Path(__file__).resolve().parent / "quantize" / "dflash_fp8.py"
+    path = Path(__file__).resolve().parent.parent / "quantize" / "dflash_fp8.py"
     if not path.is_file():
         raise SystemExit(f"missing {path}: this tool borrows the repo's block-FP8 arithmetic from it")
     spec = importlib.util.spec_from_file_location("dflash_fp8", path)

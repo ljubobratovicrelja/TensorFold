@@ -236,7 +236,7 @@ class DFlash2Draft:
                 ctx_positions: Optional[torch.Tensor] = None,
                 trace: Optional[dict] = None) -> torch.Tensor:
         # `trace`, when a dict is passed, is filled with the very tensors this forward computed
-        # (nothing is recomputed and no rounding is added) so tools/dflash2/draft_compare.py can put
+        # (nothing is recomputed and no rounding is added) so tools/dflash2/analysis/draft_compare.py can put
         # a stage of the CUDA round against the same stage here instead of against a mean advance.
         # taps: [B, ctx, 5*hidden] -> [B, ctx, hidden]
         ctx = rms_norm(taps @ self.fc.T, self.hidden_norm, self.cfg["eps"])

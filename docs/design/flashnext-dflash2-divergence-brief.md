@@ -117,11 +117,11 @@ style; the hidden-width ones are simply the two that predate the discipline.
 
 ## 5. How to verify the fix
 
-The harness is `tools/dflash2/align_bf16/`. It is a two-sided stage-diff: the reference
+The harness is `tools/dflash2/analysis/align_bf16/`. It is a two-sided stage-diff: the reference
 (`reference_bf16.py`, vendor torch in bf16 on GPU) and the engine (`run_engine_dflash2.sh`, the
 fixture mode of `cuda_draft2_check.zig`) both run one round over the same frozen fixture and dump 53
 named stages; `compare.py` joins them. The frozen fixture is
-`tools/dflash2/align_bf16/fixture/window/` (seed 20261116, pos_end 2048); its `SHA256SUMS` proves
+`tools/dflash2/analysis/align_bf16/fixture/window/` (seed 20261116, pos_end 2048); its `SHA256SUMS` proves
 both sides consumed the same bytes. `isolate_blocks.py` runs one block at a time.
 
 Verification sequence after the fix, in order, each gating the next:

@@ -2,7 +2,7 @@
 //!
 //! Research only, off unless the variable names a directory, and inert for the engine otherwise: it
 //! is the analyser half of `cuda_draft2_check.zig`. The check answers "does the CUDA round land the
-//! same tokens as `tools/dflash2/reference.py`"; when the answer is no, a single mean advance cannot
+//! same tokens as `tools/dflash2/analysis/reference.py`"; when the answer is no, a single mean advance cannot
 //! say *which stage* disagreed. This module is the file format that makes the stages separable:
 //!
 //! ```
@@ -17,7 +17,7 @@
 //! ```
 //!
 //! Every file is raw little-endian, no header, in the shape `tensors.json` names: the consumer is
-//! `tools/dflash2/draft_compare.py`, which loads them beside `reference.py` and prints a stage by
+//! `tools/dflash2/analysis/draft_compare.py`, which loads them beside `reference.py` and prints a stage by
 //! stage difference. `tensors.json` is written last, so a directory without one is a dump that did
 //! not finish rather than a dump with tensors missing.
 //!

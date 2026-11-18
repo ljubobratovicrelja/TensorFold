@@ -106,7 +106,7 @@ option onto our stages with bytes, ms and acceptance risk. Taken:
 
 ### 5.1 The per-slot top-16 fidelity check — RUN 2026-11-18
 
-Instrument: `tools/dflash2/head_fidelity.py` (CPU, numpy only, reads just `lm_head` out of its shard).
+Instrument: `tools/dflash2/analysis/head_fidelity.py` (CPU, numpy only, reads just `lm_head` out of its shard).
 Rows: 49 real served-round head inputs from `fixture/sequence` at positions 1904–1925, captured with
 `TF_FLASHNEXT_LG_DUMP` through `draft-check` (7.6 GB, no target boot), 7 slots × 7 rounds.
 

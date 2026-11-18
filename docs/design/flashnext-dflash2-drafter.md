@@ -17,14 +17,14 @@ Branch **`dflash2`**, worktree `~/Projects/tf-wt/dflash2`, pushed to `origin` at
 
 | step | state | what exists |
 | --- | --- | --- |
-| 0 tap-row measurement | **MECHANISM DONE; blocked on the torch reference** | engine exposes `TF_FLASHNEXT_TAP_DUMP`, real dumps on disk; `tools/dflash2/reference.py` scores 0/7 — see §0.6 |
+| 0 tap-row measurement | **MECHANISM DONE; blocked on the torch reference** | engine exposes `TF_FLASHNEXT_TAP_DUMP`, real dumps on disk; `tools/dflash2/analysis/reference.py` scores 0/7 — see §0.6 |
 | 1 MTP baseline E2E | **DONE** | measured, see §0.2 |
 | 2 tap capture | **RING WRITE DONE (single stream, all three bases; `mean4` default)** | `Hooks.tap_ring/tap_rows/tap_source`, `Pass.tapRingWrite`; persistence through Snap/disk still missing |
 | 3 drafter forward on CUDA | not started | spec in `flashnext-dflash2-kernels.md` |
 | 4 candidate selector on CUDA | not started | same spec, §2.5 |
 | 5 `openDrafter` wiring | not started | `cuda_drafted.wrap` still refuses flashnext |
 | 6 ring persistence (snapshot/disk tier) | not started | risk memo in `flashnext-dflash2-tap-ring.md` |
-| 7 final two-path E2E | not started | harness exists (`tools/dflash2/two_paths.py`) |
+| 7 final two-path E2E | not started | harness exists (`tools/dflash2/harness/two_paths.py`) |
 | 8 tensor contract | **DONE** | `cuda_draft2_weights.zig`, 6 tests |
 
 ### 0.1 Step 0 is blocked, and here is why (do not re-try the torch route)
@@ -41,12 +41,12 @@ The plan's step 0 assumed the target could be run in torch to capture taps. It c
 is already copied per tapped layer. What is missing is a caller that allocates those buffers and writes
 them to disk — a `TF_FLASHNEXT_TAP_DUMP=<dir>` env path that sets `hooks.taps`, `hooks.n_taps` and
 `hooks.taps_out` for one prompt pass, then dumps the five `[rows, 4 x 2560]` bf16 tensors. Feed those
-to `tools/dflash2/reference.py` (which runs the real drafter end to end) and compare acceptance length
+to `tools/dflash2/analysis/reference.py` (which runs the real drafter end to end) and compare acceptance length
 for `TapSource.readout` / `.normed` / `.mean4`. That is the whole experiment.
 
 ### 0.2 The MTP baseline that DFlash2 must beat (measured, not inherited)
 
-`dflash2` build, 32k window, 2 lanes, 256 greedy tokens, prompt in `tools/dflash2/two_paths.py`:
+`dflash2` build, 32k window, 2 lanes, 256 greedy tokens, prompt in `tools/dflash2/harness/two_paths.py`:
 
 | path | tok/s | TTFT | `token_sha256` |
 | --- | ---: | ---: | --- |
@@ -72,10 +72,10 @@ beat 78.66 tok/s**, or the integration is wrong somewhere.
 - `cuda_batch_state.zig` / `cuda_batch.zig` — `Hooks.taps/n_taps/taps_out`, `tapSlot`, and
   `Pass.tapDump`, called after `moeAdds` while `s.h` still holds that layer's output. Inert at
   `n_taps = 0`; pinned by a test that runs at `cuda_batch_state_test` 179/288.
-- `tools/dflash2/reference.py` (274) — torch port that runs the **real checkpoint** end to end
+- `tools/dflash2/analysis/reference.py` (274) — torch port that runs the **real checkpoint** end to end
   (forward + selector), verified: batch-2 is bit-identical to batch-1.
-- `tools/dflash2/two_paths.py` (105) — the equivalence check above.
-- `tools/dflash2/tfsrv.sh` (54) — test server by pidfile. **Never `pkill -f tensorfold-native`**: the
+- `tools/dflash2/harness/two_paths.py` (105) — the equivalence check above.
+- `tools/dflash2/harness/tfsrv.sh` (54) — test server by pidfile. **Never `pkill -f tensorfold-native`**: the
   pattern matches the caller's own `bash -c` and killed the shell once while writing this.
 
 ### 0.4 Traps a new agent will hit
@@ -111,7 +111,7 @@ The ring exists in the engine and produces real rows. What landed:
   produced by layer L+1's input mix, so `tapDump` only names the slot and `tapRingWrite` copies it
   at the top of the next layer. Writing at `tapDump` time can only give the four-stream `s.h`.
 - `TF_FLASHNEXT_TAP_DUMP=<dir>` (`cuda_tap_dump.zig`, wired in `Engine.forward`) writes
-  `ids.bin`/`ring.bin`/`manifest.json` for one prompt pass; `tools/dflash2/tap_dump_run.py` drives it.
+  `ids.bin`/`ring.bin`/`manifest.json` for one prompt pass; `tools/dflash2/analysis/tap_dump_run.py` drives it.
 - Trap paid for twice here: `copyCols` takes **byte** addresses but **value-unit** pitches and
   width. A contiguous `copy` is wrong for a ring whose slots interleave five taps.
 
@@ -124,7 +124,7 @@ Measured on this box, 1455-token prompt, fp8 KV, 32768 window:
 | same logits under fp8 and bf16 KV | identical `token_sha256` `499ef81c…` |
 | taps bit-identical across KV precision | **no — 4.9% mean relative delta, max 4.3.** §4.4's bit-identity expectation is wrong; e4m3 KV cannot give bit-identical residuals. The gate is the sha plus a bounded delta, and the acceptance experiment must use **fp8** taps because that is the served configuration. |
 
-`tools/dflash2/reference.py` still scores **0.000 of 7 accepted at 100% of rounds** (mean advance
+`tools/dflash2/analysis/reference.py` still scores **0.000 of 7 accepted at 100% of rounds** (mean advance
 1.000) on the real dump, including its leaky control — at chance, so the torch forward is
 structurally wrong while taps/head/embed are proven good by the rank test above. Until it is fixed
 there is no numeric ground truth to gate a Zig port against, which makes it the next task rather
@@ -153,7 +153,7 @@ the batched lane path, so `--drafter` can serve. The check is a diagnostic, not 
 
 ### 0.7 The comparison the DFlash2 path must beat (measured 2026-11-16)
 
-`tools/dflash2/matrix_bench.py`, warm (one unmeasured pass of the same prompts per cell, every
+`tools/dflash2/harness/matrix_bench.py`, warm (one unmeasured pass of the same prompts per cell, every
 measured row 100% `cached_tokens`), 3 reps a cell, fp8 KV, 131k window, 4-lane server,
 `--max-tokens 256`, thinking off, request model `qwen3.8-flash-next`:
 
@@ -436,7 +436,7 @@ places (the memory fit moved into step 1's measurement, and the original step 0 
 Not "does the port work" — that is known. This is "which of flashnext's rows is the tap": the
 read-out row, the down-projected row, or the normed variant (§4.1). The original route (a torch
 target forward) is impossible on this box, so the experiment now runs through the engine's
-`Hooks.taps_out` and `tools/dflash2/reference.py`. The definition that lands in the card's
+`Hooks.taps_out` and `tools/dflash2/analysis/reference.py`. The definition that lands in the card's
 acceptance-length band (2.8–3.3) wins. **If none reaches ~2.5, stop — the port is not worth starting.**
 
 **Step 1 — prove the memory fit (1 h, needs the box).**

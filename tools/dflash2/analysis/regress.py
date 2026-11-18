@@ -42,7 +42,7 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-WT = HERE.parent.parent
+WT = HERE.parents[2]
 ALIGN = HERE / "align_bf16"
 RUNNER = ALIGN / "run_engine_dflash2.sh"
 BIN = WT / "zig-out" / "native" / "bin" / "tensorfold-native"
@@ -50,7 +50,7 @@ HF = Path.home() / ".cache" / "huggingface" / "hub"
 TARGET = next(iter(sorted((HF / "models--nvidia--Qwen3.8-Flash-Next-FP4-Local" / "snapshots").glob("*"))), None)
 DRAFTER = next(iter(sorted((HF / "models--incoai--Qwen3.8-Flash-Next-DFlash2" / "snapshots").glob("*"))), None)
 DEFAULT_FIXTURE = ALIGN / "fixture" / "window"
-RUNS = HERE / "runs"
+RUNS = HERE.parent / "runs"
 
 # a host-side mirror of another stage's bytes; counting both doubles the round
 MIRRORS = {"fc_ctx_rows"}

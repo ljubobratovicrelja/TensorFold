@@ -15,7 +15,7 @@
 //!    target accepted. The block's own rows never come from taps: `reference.py` hands the prefix's
 //!    taps in as the cross-attention context and starts the block from the target's embedding table
 //!    (`anchor`, then `block - 1` mask tokens).
-//!    Fusing the block's own taps instead is the "leaky" variant of `tools/dflash2/tap_accept.py`,
+//!    Fusing the block's own taps instead is the "leaky" variant of `tools/dflash2/analysis/tap_accept.py`,
 //!    which shows the block the next seven positions' hidden states.
 //! 2. **five layers**: input norm, attention conv, q/k/v of the block's rows, the prefix's own k/v,
 //!    RoPE, block attention (bidirectional over the block, plus the whole prefix), output conv,
@@ -286,7 +286,7 @@ pub const Fault = extern struct {
 ///
 /// The copies are the round's own bytes, not a second computation: `ctx` is `tf_fxd2_fuse`'s output
 /// as the context attention reads it, and `layers` is the block hidden state the next sublayer reads.
-/// That is what lets `tools/dflash2/draft_compare.py` put a finger on one stage instead of on the
+/// That is what lets `tools/dflash2/analysis/draft_compare.py` put a finger on one stage instead of on the
 /// mean advance.
 pub const Debug = struct {
     /// `[ctx_rows, hidden]` bf16: the fused prefix rows of the round, `ctx_rows >= ctx_len`. Written

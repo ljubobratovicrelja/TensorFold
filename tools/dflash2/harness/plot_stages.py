@@ -16,7 +16,7 @@ produces cold rounds, so its ranking is of a regime the box serves once per stre
 `selector_scores` is a host recomputation the harness adds after the round, not GPU work; it is
 excluded from every total unless `--include-host` says otherwise.
 
-  .venv-plot/bin/python tools/dflash2/plot_stages.py CAPTURE [--out PNG] [--cold-rep 0]
+  .venv-plot/bin/python tools/dflash2/harness/plot_stages.py CAPTURE [--out PNG] [--cold-rep 0]
                                                        [--top 20] [--include-host] [--show]
 
 Two captures compare instead of profiling one — every panel then carries both arms and the delta:
@@ -26,7 +26,7 @@ Two captures compare instead of profiling one — every panel then carries both 
   C  the round, before and after   served and cold, with the delta in ms and %
   D  cumulative delta in order     where along the round the delta is actually won
 
-  .venv-plot/bin/python tools/dflash2/plot_stages.py CAPTURE --baseline BASE
+  .venv-plot/bin/python tools/dflash2/harness/plot_stages.py CAPTURE --baseline BASE
                                                        [--label X] [--label-b Y] [--out PNG]
 """
 

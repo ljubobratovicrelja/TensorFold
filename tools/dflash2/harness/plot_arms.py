@@ -17,7 +17,7 @@ completion token count is identical across arms: the x axis is a prompt index, a
 printed per prompt so a reader can weight prompts by length instead of treating a 109-token answer
 the same as a 900-token one.
 
-  .venv-plot/bin/python tools/dflash2/plot_arms.py mpl=rows-mtp.jsonl bf16=rows-bf16.jsonl \
+  .venv-plot/bin/python tools/dflash2/harness/plot_arms.py mpl=rows-mtp.jsonl bf16=rows-bf16.jsonl \
       fp8=rows-fp8.jsonl --out arms.png
 """
 
