@@ -187,6 +187,7 @@ pub const rules = [_]Rule{
     .{ .name = "TF_FLASHNEXT_WARM_AHEAD", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
     .{ .name = "TF_FLASHNEXT_TABLE_WARM", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
     .{ .name = "TF_FLASHNEXT_PROFILE", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
+    .{ .name = "TF_FLASHNEXT_LAYER_TIME", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0; a per-layer GPU time report for the target pass)" },
     .{ .name = "TF_FLASHNEXT_VERIFY_HOST_LOGITS", .scope = .flashnext, .kind = .flag, .forms = "0 or 1 (default 0)" },
     .{ .name = "TF_FLASHNEXT_DRAFTS", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 6; clamped to 1 through 15)" },
     .{ .name = "TF_FLASHNEXT_DRAFTS_GREEDY", .scope = .flashnext, .kind = .size, .forms = "a whole draft count from 0 to the native size maximum (default 8; clamped to 1 through 15)" },

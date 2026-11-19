@@ -55,6 +55,10 @@ CATEGORY = [
     ("final_norm_block", "norms", "#8e44ad"),
     ("logits_top16_vals", "head (mirror)", "#95a5a6"),
     ("logits_full", "head (mirror)", "#95a5a6"),
+    # the target's 48-layer pass (TF_FLASHNEXT_LAYER_TIME) names three stages the drafter does not
+    ("moe_out_", "moe write-back", "#1abc9c"),
+    ("embed", "embed", "#bdc3c7"),
+    ("head", "head (proj)", "#d35400"),
     ("proposals", "selector walk", "#34495e"),
     ("selector_scores", "selector (host)", "#7f8c8d"),
 ]
@@ -72,7 +76,8 @@ def category(stage):
 
 def short(stage):
     """A tick label that fits: the waterfall's x axis has ~50 stages and no room for full names."""
-    for prefix, abbrev in (("conv_attn_in_", "cai"), ("conv_attn_out_", "cao"),
+    for prefix, abbrev in (("moe_out_", "mo"), ("embed", "emb"),
+                           ("conv_attn_in_", "cai"), ("conv_attn_out_", "cao"),
                            ("conv_mlp_in_", "cmi"), ("conv_mlp_out_", "cmo"),
                            ("attn_proj_", "ap"), ("block_hidden_", "bh"),
                            ("logits_top16_ids", "head"), ("final_norm_block", "fnorm"),

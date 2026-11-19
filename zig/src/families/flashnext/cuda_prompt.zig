@@ -11,6 +11,7 @@ const pocket = @import("cuda_pocket.zig");
 const chunks = @import("cuda_chunk.zig");
 const tapdump = @import("cuda_tap_dump.zig");
 const draftcheck = @import("cuda_draft2_check.zig");
+const layer_time = @import("cuda_layer_time.zig");
 const layers_n = weights.layers_n;
 const linear_n = weights.linear_n;
 const attn_n = weights.attn_n;
@@ -133,6 +134,10 @@ pub const Engine = struct {
     /// --kv-cache fp8: each stream's attention caches are fp8 rows (cuda_heads.zig), half a bf16 cache's bytes.
     kv8: bool = false,
     round_graph: round_graph.Cache = .{},
+    /// TF_FLASHNEXT_LAYER_TIME / _DUMP: the target pass's per-layer GPU times, one event pool for the
+    /// engine's life (cuda_layer_time.zig). Null unless a flag asks for it, so the unset path has no
+    /// events, no allocation and no synchronise; a pass only branches on a null `Pass.clock`.
+    layer_clock: ?layer_time.Clock = null,
     graphs: @import("cuda_window_graph.zig").Graphs = .{}, // drafted windows, draft-head pieces, rollbacks on one GPU
     image_factory: ?*@import("cuda_images.zig").Vision = null,
     collective: ?*@import("cuda_collective.zig").Collective = null,
@@ -157,6 +162,7 @@ pub const Engine = struct {
         e.stream = stream;
         e.n_layers = 0;
         e.collective = null;
+        e.layer_clock = null;
         e.image_factory = null;
         e.round_graph = .{};
         e.graphs = .{};
@@ -223,10 +229,13 @@ pub const Engine = struct {
         e.scores = null;
         e.chunk = chunk;
         e.busy_chunk = busy;
+        // TF_FLASHNEXT_LAYER_TIME/_DUMP: the pass's event pool, made once here rather than on the pass's path
+        if (layer_time.wanted()) e.layer_clock = try layer_time.Clock.init(gpa, io, driver, layers_n);
         return e;
     }
 
     pub fn deinit(e: *Engine) void {
+        if (e.layer_clock) |*c| c.deinit();
         e.round_graph.clear();
         e.graphs.clear(e.gpa);
         e.pockets.deinit();
@@ -415,8 +424,18 @@ pub const Engine = struct {
             .m = if (seq.untaught) e.shipped() else e.model(),
             .seq = seq.view(scores),
             .hooks = hk,
+            .clock = if (e.layer_clock) |*c| c else null,
         };
-        if (capture == null) if (try @import("cuda_prompt_windows.zig").forwardGraph(e, Tri, &p, seq, ids, hk)) return;
+        if (capture == null) {
+            // TF_FLASHNEXT_LAYER_TIME records events on the pass's own stream, which a capture cannot hold
+            // (a record becomes a graph node, the pass's one synchronise is illegal inside it): refused
+            // here, before the capture begins, so a refusal never leaves window graphs switched off behind it.
+            if (e.layer_clock != null and @import("cuda_prompt_windows.zig").captures(e, &p, seq, ids, hk)) {
+                std.debug.print("layer_time: this prompt pass would be captured (TF_FLASHNEXT_WINDOW_GRAPH=1); set TF_FLASHNEXT_WINDOW_GRAPH=0 to profile it\n", .{});
+                return error.LayerTimeInGraph;
+            }
+            if (try @import("cuda_prompt_windows.zig").forwardGraph(e, Tri, &p, seq, ids, hk)) return;
+        }
         var at: usize = 0;
         while (at < ids.len) {
             const n = @min(s.cap, ids.len - at);
@@ -503,10 +522,16 @@ pub const Engine = struct {
                 .tap_rows = tap.tap_rows,
                 .tap_source = tap.tap_source,
             },
+            .clock = if (e.layer_clock) |*c| c else null,
         };
         const has_media = for (seqs) |q| {
             if (q.media != null) break true;
         } else false;
+        // TF_FLASHNEXT_LAYER_TIME is single-rank: a ranked round runs the collective's verify, not this loop
+        if (e.layer_clock != null and e.collective != null) {
+            std.debug.print("layer_time: a ranked (TP) round runs the collective's own verify; this profiler is single-rank\n", .{});
+            return error.LayerTimeRanked;
+        }
         if (e.collective != null and round_graph.enabled() and !has_media and e.layers[0].dense_cut == null) {
             const key = try round_graph.Key.init(seqs, s.ids, scores, out);
             try e.round_graph.run(key, &p, ids);

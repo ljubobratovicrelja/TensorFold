@@ -5,7 +5,7 @@ for `Qwen3.8-Flash-Next-FP4-Local` on a DGX Spark (GB10). DFlash2 is a 5-layer d
 to five target-layer hidden-state taps and drafts a block of 8 rows (7 proposals), which the target
 verifies; verification makes output lossless, so only acceptance length and round cost matter.
 
-Measured state: the drafter's round in the served regime is **18.75 ms** on the published bf16
+Measured state of the published and fp8 arms: the drafter's round in the served regime is **18.75 ms** on the published bf16
 checkpoint (`fixture/sequence`, 15 served reps; 22.99 ms before the context-fuse change of 2026-11-18)
 and **16.02 ms** with the weight-only FP8 build of the seven decoder linears (−14.5%, same binary, same
 session, `flashnext-dflash2-fp8-checkpoint.md`), and
@@ -16,6 +16,12 @@ DFlash2 was 45.0 tok/s before the fuse fix; MTP's row reads 53.0 here against 59
 capture at an unchanged round cost, which is an open question (plan §1), not a settled regression. On the vendor's own card that is parity on
 acceptance (3.26) and behind on cost — 15.0 ms per extra token here against ~1.8 ms on GB300, the whole
 of it the drafter's fixed per-round weight traffic.
+
+Since 2026-11-19 the drafter that gets deployed is the **combined arm** — affine4 body, split-KV
+attention, block-FP8 head with an exact bf16 rescore — with a **9.22 ms** drafter round and two
+cold-start served passes at **53.2 / 53.4 tok/s**, accept 3.287 / 3.307, 16/16 identical outputs
+(`flashnext-dflash2-optimized-drafter.md`; ledger §13). The figures above are the published and fp8
+arms and remain the comparison.
 
 The files below were written over several days by successive agents. They are kept, not pruned, because
 the negative results cost real time; but only one of them describes the current state.
@@ -35,6 +41,7 @@ the negative results cost real time; but only one of them describes the current 
 | --- | --- | --- |
 | `flashnext-dflash2-gb10-optimisation-plan.md` | Current scoreboard: served-round stage breakdown (`fixture/sequence`, 15 served reps), the byte rate of every weight-read stage, the harness that produces every number (`draft-check`, `regress.py`, env knobs), what has been changed (tiled attention, `head_tile` 8192, the batched context fuse), the closed questions, and the ranked open work. §7 is the retraction log for superseded measurements. | **LIVE** |
 | `flashnext-dflash2-experiment-ledger.md` | Every DFlash2 experiment, its measured result and its verdict (FIXED / CORRECT / NULL / WRONG / SUPERSEDED / OPEN), grouped by numerics, acceptance, serving state, round cost, precision and corpus, plus §7 the five things genuinely open. Start here before re-running anything. | **LIVE** |
+| `flashnext-dflash2-optimized-drafter.md` | **The deployment drafter.** What affine4 body + split-KV attention + block-FP8 head each are and what each buys, the exact serve line and env flags, the per-arm numbers with their session, n and CI, the losslessness claims and their limits, a one-line revert per part, the `key_value()` sign bug and why id-level checks missed it, and what is still unmeasured. Read this to run, measure or revert the arm; the derivations stay in the ledger (§9–§13). | **LIVE** |
 | `flashnext-dflash2-fp8-checkpoint.md` | The shipped FP8 weight artifact and the switch: what is quantized (7 decoder linears) and what is not (`fc`, convs, norms, selector), the scale convention, the reproducible tooling and its manifest, `--drafter-precision bf16\|fp8` with checkpoint-decides default, the measured bf16→fp8 delta on `fixture/sequence`, the 64-of-112 proposal movement and why proposal identity is the wrong gate here, and what the served acceptance A/B still has to prove. | **LIVE** |
 | `flashnext-dflash2-harvest.md` | The corpus harvester: one prefill pass per chunk through `TF_FLASHNEXT_TAP_DUMP` becomes a `draft-check` fixture, the measured cold prefill rates (2,039 tok/s at 2k chunks, 3,149 at 8k), the 27.1 KB/token ring and the 2 TB-a-night disk wall that forces streaming, the prompt-cache trap, and the 2,064-slot ring limit that fixes the chunk size. | **LIVE** |
 | `flashnext-dflash2-training-corpus.md` | What a drafter fine-tune needs and what this box can produce: the measured proof that document-shaped fixtures score 1.6 against 3.3 served (the drafter only drafts assistant-role text), the chat-template defect in the current harvester, the local agent-history inventory with the caveat that its assistant text is another model's, the torch-forward parity gate (216/224 slots), and the plan, sizing and why RL collapses into self-distillation here. | **LIVE** |
@@ -52,25 +59,27 @@ the negative results cost real time; but only one of them describes the current 
 
 ## Read in this order
 
-1. `flashnext-dflash2-gb10-optimisation-plan.md` — the state of play, the harness, and what is open.
+1. `flashnext-dflash2-optimized-drafter.md` — if you are here to run, measure or revert the drafter,
+   this is the entry point: the arm, the serve line, the per-arm numbers, the revert table.
+2. `flashnext-dflash2-gb10-optimisation-plan.md` — the state of play, the harness, and what is open.
    Everything you measure should be comparable to §3, and §2 tells you how.
-2. `flashnext-dflash2-vendor-baseline.md` — what the bar actually is, at source, with the width and the
+3. `flashnext-dflash2-vendor-baseline.md` — what the bar actually is, at source, with the width and the
    model named. Read it before quoting any number, ours or theirs.
-3. `flashnext-dflash2-fp8-checkpoint.md` — the fp8 arm as built: the artifact, the flag, what it
+4. `flashnext-dflash2-fp8-checkpoint.md` — the fp8 arm as built: the artifact, the flag, what it
    measured, and the acceptance gate that is still open.
-4. `flashnext-dflash2-training-corpus.md` and `flashnext-dflash2-harvest.md` — before any drafter
+5. `flashnext-dflash2-training-corpus.md` and `flashnext-dflash2-harvest.md` — before any drafter
    fine-tune: what the corpus must look like, what harvesting costs, and the parity gate.
-4. `flashnext-dflash2-quantization-survey.md` — before proposing any further precision change: what is
+6. `flashnext-dflash2-quantization-survey.md` — before proposing any further precision change: what is
    measured elsewhere, what the risk actually is, and which options are already ruled out.
-5. `flashnext-dflash2-handoff.md` §1 — paths, build line, serve line, commit map. Skip §2–§14 unless you
+7. `flashnext-dflash2-handoff.md` §1 — paths, build line, serve line, commit map. Skip §2–§14 unless you
    need the history of a specific bug.
-6. `flashnext-dflash2-divergence-brief.md` §6 — the debugging discipline. This is the part that is still
+8. `flashnext-dflash2-divergence-brief.md` §6 — the debugging discipline. This is the part that is still
    binding: first-divergent-stage localisation, same-precision reference runs, no lossless-sha arguments
    about drafter quality.
-7. `flashnext-dflash2-serving-defects.md` §7 — how the served path was fixed, and the shape of the
+9. `flashnext-dflash2-serving-defects.md` §7 — how the served path was fixed, and the shape of the
    bugs (state that must ride a snapshot, cost tables that must be published) that recur.
-8. `flashnext-dflash2-kernels.md` and `flashnext-dflash2-tap-ring.md` — geometry and state contracts, when
-   you touch a kernel or the ring.
+10. `flashnext-dflash2-kernels.md` and `flashnext-dflash2-tap-ring.md` — geometry and state contracts, when
+    you touch a kernel or the ring.
 
 Only if you are reconstructing why something was tried: `acceptance-log.md`, `drafter.md`,
 `crossround-brief.md`.

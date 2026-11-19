@@ -9,8 +9,9 @@ const window_graph = @import("cuda_window_graph.zig");
 const Engine = prompt.Engine;
 const Seq = prompt.Seq;
 
-/// A drafted window on one GPU as a graph (one chunk, scores left on the device, no media or adds); true once run.
-pub fn forwardGraph(e: *Engine, comptime Tri: type, p: *batch.Pass(Tri), seq: *Seq, ids: []const u32, hooks: batch.Hooks) !bool {
+/// Whether this pass is one `forwardGraph` records as a graph: its four refusals, in its own order, so a
+/// caller that must not run inside a capture (TF_FLASHNEXT_LAYER_TIME) can ask before the capture begins.
+pub fn captures(e: *Engine, p: anytype, seq: *Seq, ids: []const u32, hooks: batch.Hooks) bool {
     if (!window_graph.enabled() or hooks.logits != .all or hooks.host_logits or hooks.moe_add != null) return false;
     // A tapped pass copies a layer's rows into the stream's tap ring (`Pass.tapRingWrite`), and that
     // copy is inside the recorded graph with the ring's pointer baked in. The key below names the
@@ -18,6 +19,12 @@ pub fn forwardGraph(e: *Engine, comptime Tri: type, p: *batch.Pass(Tri), seq: *S
     // first stream's rows for every stream. A drafting server runs its windows unrecorded instead.
     if (hooks.n_taps != 0) return false;
     if (ids.len > @import("cuda_mtp.zig").max_rows or ids.len > p.s.cap or e.collective != null or seq.media != null or p.m.pocket != null) return false;
+    return true;
+}
+
+/// A drafted window on one GPU as a graph (one chunk, scores left on the device, no media or adds); true once run.
+pub fn forwardGraph(e: *Engine, comptime Tri: type, p: *batch.Pass(Tri), seq: *Seq, ids: []const u32, hooks: batch.Hooks) !bool {
+    if (!captures(e, p, seq, ids, hooks)) return false;
     const key = window_graph.Key.init(seq, seq.fed, ids.len, p.s, p.seq.scores, @intFromPtr(p.m.layers.ptr), hooks);
     try window_graph.stageWindow(p, ids, seq.fed);
     try e.graphs.window.run(e.gpa, e.stream.*, key, window_graph.Chunk(batch.Pass(Tri)){ .p = p, .ids = ids, .pos0 = seq.fed });

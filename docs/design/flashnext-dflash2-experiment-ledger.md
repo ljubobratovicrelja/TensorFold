@@ -422,3 +422,59 @@ Paired tok/s **+3.53 [+2.14, +4.91] = +7.25% CI [+4.31%, +10.19%]**, accept −0
 Lesson for the ledger: an id-level fidelity check is not a head check. Dump the value table the selector consumes (`TF_FLASHNEXT_HEAD_DUMP`) and compare *that*; a rank that orders correctly with negated scores passes every id-set test.
 
 Also worth recording: on affine4 the split-attention gain is **not** reproduced — +0.56% CI [−1.48%, +2.59%] against fp8 here, where the earlier affine4-vs-affine4 A/B gave +2.49% CI [+0.22%, +4.77%]. Treat the attention served effect as 0–2.5%, not 2.5%.
+
+## 13. The combined arm is the deployment drafter (2026-11-19)
+
+**Decision.** affine4 body + split-KV attention + block-FP8 head with its exact bf16 rescore, together,
+is the drafter that deployment and the coming days' real-traffic tests use. The operating manual (serve
+line, flags, per-arm numbers, revert table, failure modes, open items) is
+`flashnext-dflash2-optimized-drafter.md`; the parts are §10, §11.1, §11.2, and this section is the
+combined-arm baseline everything else is compared against.
+
+**Baseline, two cold-start passes**, one `:8099` server at a time, 16 GSM8K prompts
+(`/tmp/gsm8k_16.json`), `--max-tokens 1024`, temp 1.0 / top-p 0.95 / top-k 20, seeds 1000–1015,
+`--parallel 1 --context 16384 --kv-cache fp8`, `TF_FLASHNEXT_ATTN_SPLIT=1`,
+`TF_FLASHNEXT_HEAD_FP8=1 TF_FLASHNEXT_HEAD_FP8_DIR=/tmp/headfit/full1/rtn`,
+`--drafter checkpoints/dflash2-affine4` (`/tmp/baseline`, 06:56 and 06:59):
+
+| pass | tok/s | accept | round | outputs |
+|---|---:|---:|---:|---|
+| 1 | 53.24 | 3.2873 | 65.4 ms | 16/16 identical to pass 2 |
+| 2 | 53.41 | 3.3071 | 65.6 ms | |
+
+Pass-to-pass **+0.175 tok/s, sd 0.833**: the configuration repeats to under a tok/s in a session. The
+drafter is **9.22 ms of the 65.5 ms round (14%)**, so a free drafter caps at ~58.4–58.7 tok/s — the
+rest of the round is the target's verify pass, and acceptance (≈0.55 accepted per draft here, Σaccepted/Σdrafted,
+against MTP's 0.630 on real traffic, §2.1) is now the only lever on this axis.
+
+**Two corrections to §12, found while writing the manual.** The +2.49% CI [+0.22, +4.77] on disk
+(`/tmp/abattn`) is the paired **acceptance-length** delta of affine4 → affine4+split, not a throughput
+delta; the throughput delta in that session was +2.38 tok/s (+5.08%). And the +0.56% row does not
+reproduce from any rows file still on disk — `/tmp/aball`'s fp8-vs-affine4+split pair reads −0.69%
+CI [−2.32, +0.94]. Absolute tok/s also drift by up to ~1.5 between sessions for an unchanged arm (fp8: 48.48,
+48.21, 49.74 across three same-day sessions; the combined arm 51.73 in `abfix` against 53.24 here).
+Only same-session pairs are claims; the split-attention served effect stays **unresolved, 0–5%**.
+
+## 14. The target's round, layer by layer — first real numbers (2026-11-19)
+
+`TF_FLASHNEXT_LAYER_TIME=1` / `TF_FLASHNEXT_LAYER_DUMP=<dir>` (design: `flashnext-layer-time.md`) on the optimized drafter, one served round of a 44-token prompt, `max_tokens 32`, 19 captures (`/tmp/lt`). One warm prompt pass (rows 44, 147.9 ms) then 18 decode passes at rows 2–8.
+
+**Decode pass, medians over 18 reps: 46.84 ms of stage time against a round median of 47.63 ms (sd 4.59)** — the instrumented sum closes on the round to 1.7%, so the events are not lying about the shape of the pass.
+
+| family | ms | share |
+|---|---:|---:|
+| mlp (MoE, 48 layers) | 15.05 | 32.1% |
+| qkv (quantised GEMM) | 9.16 | 19.6% |
+| **conv_attn_in (attn pre-norm + fuses + readout)** | **6.53** | **13.9%** |
+| head | 5.29 | 11.3% |
+| **conv_mlp_in (mlp pre-norm + fuses)** | **4.88** | **10.4%** |
+| attn_proj (+ residual/gate) | 4.28 | 9.1% |
+| attention (rope, KV, scores, select) | 1.44 | 3.1% |
+| final_norm_block / block_hidden / moe_out / embed | 0.20 | 0.4% |
+
+Two things nobody had measured before this run:
+
+- **The norm/fuse stages are 24.3% of the pass (11.41 ms)** — nearly a third again of the whole quantised qkv GEMM, and 8× attention. `conv_attn_in` alone (6.53 ms) is the second-largest family in the model. Whatever the target's rounding is, it is not in the GEMMs and not in attention.
+- **The target's own head is 5.29 ms of a 47.6 ms pass (11.3%)** — the same stage we spent the day quantising in the *drafter* is the fourth-largest item in the target and is still bf16 here.
+
+Caveats, stated rather than buried: rows vary per pass (2–8), so the mix is a sample of the served distribution rather than one fixed shape; the profiler adds 387 event records and one synchronise per pass, so absolute values are ≤1–2% high; the plot is `plot_stages.py /tmp/lt` and its title still says "DFlash2 drafter" — the artifact is the target, only the plotter's default title is stale.

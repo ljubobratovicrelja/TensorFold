@@ -20,6 +20,7 @@ pub fn head(self: anytype, logits_host: ?[]u8) !void {
             try self.writeback(0, n);
             try self.copy(self.hooks.streams, s.h, n * wide * 2);
             if (mixer_keep.h != 0) try self.readoutKeep(self.m.mixer, 0, n, mixer_keep);
+            if (self.clock) |c| try c.headStart();
             return;
         },
         .all => {
@@ -31,6 +32,7 @@ pub fn head(self: anytype, logits_host: ?[]u8) !void {
                 row0 += l.rows;
             }
             try self.readoutKeep(self.m.mixer, 0, n, mixer_keep);
+            if (self.clock) |c| try c.headStart();
             const out = if (self.hooks.logits_out != 0) self.hooks.logits_out else return error.UnexpectedTensor;
             try self.projectHead(out, n);
             row0 = 0;
@@ -65,6 +67,7 @@ pub fn head(self: anytype, logits_host: ?[]u8) !void {
             }
             if (self.hooks.streams == 0) try self.writeback(0, 1);
             try self.readout(self.m.mixer, 0, 1);
+            if (self.clock) |c| try c.headStart();
             try self.projectHead(s.logits, 1);
             if (logits_host) |lh| {
                 try self.complete();

@@ -20,6 +20,7 @@ const zs = @import("cuda_zero_slice.zig");
 const ops = @import("cuda_batch_ops.zig");
 const split_lane = @import("cuda_split_lane.zig");
 const tapring = @import("cuda_tap_ring.zig");
+const layer_time = @import("cuda_layer_time.zig");
 
 const layers_n = wt.layers_n;
 const linear_n = wt.linear_n;
@@ -110,6 +111,9 @@ pub fn Pass(comptime Tri: type) type {
         hooks: Hooks,
         /// A decode round: row r is lanes[r]'s token at its own position and state; empty, the rows continue `seq`.
         lanes: []const Lane = &.{},
+        /// TF_FLASHNEXT_LAYER_TIME: this pass's event pool, the engine's (cuda_layer_time.zig). Null, every
+        /// boundary in the loop below is a null check and nothing is recorded, allocated or synchronised.
+        clock: ?*layer_time.Clock = null,
         rows: usize = 0,
         pos0: usize = 0,
         /// The MoE write-back the next layer (or the head) applies first, and the layer it came from.
@@ -334,6 +338,7 @@ pub fn Pass(comptime Tri: type) type {
             const g = try self.k.gdnSet(h); // before any launch: the full kernels, or the _h8 twins for a rank's half
             const pw = h.projWidth();
             const cd = h.convDim();
+            if (self.clock) |c| try c.stage(.qkv);
             _ = try self.lane(s.mixed, s.xsm, lw.proj, s.proj, s.dummy, n, 1);
             // a lone pass keeps its projection and conv window; a shared pass keeps each lane's own
             if (self.lanes.len == 0) {
@@ -344,6 +349,7 @@ pub fn Pass(comptime Tri: type) type {
             const fused = self.lanes.len == 0 and (n >= 64 or marks.inPass(self)) and self.k.forms.gdn_fused;
             const cuts = try marks.cuts(self, li, fused);
             if (fused and keep.log != 0) return error.UnexpectedTensor;
+            if (self.clock) |c| try c.stage(.attn);
             if (fused) {
                 // the three in one kernel a value head: the same per-row op sequences, no fp32 rows through memory
                 const st = self.seq.state[li].ptr;
@@ -379,6 +385,7 @@ pub fn Pass(comptime Tri: type) type {
                     row0 += l.rows;
                 }
             }
+            if (self.clock) |c| try c.stage(.attn_proj);
             if (!fused) try gdn_fused.norm(g.norm, self.stream, s.ys, s.proj, lw.norm.ptr, s.gout, s.gxs, n, h);
             if (self.lanes.len == 0) try self.shiftWindow(self.seq.conv[li].ptr, s.proj, pw, n, gdn.taps - 1, cd);
             self.out_slices = try split_lane.out(self, s.gout, s.gxs, lw);
@@ -431,12 +438,14 @@ pub fn Pass(comptime Tri: type) type {
             const pa = s.proj;
             const h = lw.heads;
             const pn = h.projN();
+            if (self.clock) |c| try c.stage(.qkv);
             _ = try self.lane(s.mixed, s.xsm, lw.proj, pa, s.dummy, n, 1);
             const qw2 = h.q * 2 * head_dim;
             const kw = h.kv * head_dim;
             try self.copyCols(pa, pn, keep.pq, qw2, qw2, n);
             try self.copyCols(pa + qw2 * 2, pn, keep.pk, kw, kw, n);
             try self.copyCols(pa + (qw2 + kw) * 2, pn, keep.pv, kw, kw, n);
+            if (self.clock) |c| try c.stage(.attn);
             if (self.lanes_attn) {
                 try batch_lanes.attn(self, lw, ai, pa);
             } else if (self.lanes.len > 0) {
@@ -455,6 +464,7 @@ pub fn Pass(comptime Tri: type) type {
                     row0 += l.rows;
                 }
             } else try self.attnRows(lw, ai, pa, n, .{ .pos = s.pos, .q = s.q, .iq = s.iq, .ao = s.ao });
+            if (self.clock) |c| try c.stage(.attn_proj);
             const gated = if (keep.gated != 0) keep.gated else s.gated;
             try self.tri.attnGate(s.ao, pa, gated, s.gxs_attn, n, pn, h.q, head_dim);
             self.out_slices = try split_lane.out(self, gated, s.gxs_attn, lw);
@@ -524,6 +534,7 @@ pub fn Pass(comptime Tri: type) type {
             const s = self.s;
             const n = self.rows;
             const pairs = n * slots;
+            if (self.clock) |c| try c.stage(.mlp);
             try self.copy(keep.moe_x, s.mixed, n * dims * 2);
             try self.tri.routerMany(s.mixed, lw.router.ptr, s.router_l, dims, n);
             try self.tri.topkMany(s.router_l, s.picks, s.wts, n);
@@ -586,6 +597,21 @@ pub fn Pass(comptime Tri: type) type {
             self.pos0 = pos0;
             self.pending = null;
             self.pending_f32 = false;
+            // TF_FLASHNEXT_LAYER_TIME: the engine's one event pool for this pass. `timed` is this pass's own
+            // claim on it: an error below releases the pool this call took, never one another pass holds.
+            var timed = false;
+            if (self.clock) |c| {
+                // a ranked pass runs the collective's verify, not this loop: say so rather than time nothing
+                if (self.m.collective != null) {
+                    std.debug.print("layer_time: a ranked (TP) pass runs the collective's own verify; this profiler is single-rank\n", .{});
+                    return error.LayerTimeRanked;
+                }
+                try c.begin(self.stream, n, s.cap, pos0, self.m.layers.len);
+                timed = c.busy;
+            }
+            defer if (timed) {
+                if (self.clock) |c| c.abandon();
+            };
             // the gather writes the scratch's pinned rows, so the last pass's uploads must have read them first
             if (!self.prepared and !self.staged) try s.ready();
             const emb = s.hostEmb(n);
@@ -594,6 +620,7 @@ pub fn Pass(comptime Tri: type) type {
             var thread: ?std.Thread = if (self.prepared or self.staged) null else try std.Thread.spawn(.{}, Gather.main, .{&gather});
             defer if (thread) |th| th.join();
             if (!self.staged) try self.stage(ids);
+            if (self.clock) |c| try c.embed();
             if (self.m.table_dense) {
                 try self.tri.embedDense(s.ids, self.m.table_w, s.h, dims, streams, n);
             } else {
@@ -602,6 +629,7 @@ pub fn Pass(comptime Tri: type) type {
             try @import("cuda_media.zig").inject(self.seq.media, self.lanes, self.stream, s.h, self.pos0, n);
             for (self.m.layers, 0..) |*lw, layer| {
                 const keep: LayerKeep = if (self.hooks.keep) |kp| kp.layers[layer] else .{};
+                if (self.clock) |c| try c.layer(layer);
                 if (layer == ple_layer) {
                     if (thread) |th| th.join();
                     thread = null;
@@ -634,6 +662,7 @@ pub fn Pass(comptime Tri: type) type {
                 if (keep.mix_branch != 0) try self.sumSlices(s.part, keep.mix_branch, true, n * dims, self.out_slices);
                 const sl = zs.slices(self.zero_slices, s.cap, n, self.out_slices);
                 self.zero_slices = false;
+                if (self.clock) |c| try c.stage(.conv_mlp);
                 if (hc.fuses(self, lw.mlp_hc, n, keep.mlp_hc)) {
                     try self.tri.hcWritebackNorm(s.h, s.h, s.pss, s.part, s.inj, s.dummy, s.dummy, lw.mlp_hc.scale.ptr, s.norm, eps, sl.stride, n, dims, streams, 4, 1, 1, sl.count);
                     try hc.readoutNative(self, lw.mlp_hc, 0, n);
@@ -642,13 +671,18 @@ pub fn Pass(comptime Tri: type) type {
                     try self.readoutKeep(lw.mlp_hc, 0, n, keep.mlp_hc);
                 }
                 try self.moeBlockKeep(lw, keep);
+                if (self.clock) |c| try c.stage(.moe_out);
                 try self.moeAdds(layer, keep);
                 // A tapped layer's output is copied out here, while `s.h` still holds it: the next
                 // layer overwrites it. See Hooks.tapDump for why the flush cannot wait for the head.
+                if (self.clock) |c| try c.stage(.hidden);
                 if (parts.tapSlot(self.hooks, layer) != null) try self.tapDump(layer);
                 self.pending = layer;
             }
+            if (self.clock) |c| try c.finalBlock();
             try self.head(logits_host);
+            // a report that fails (a driver error on the events, an allocation) never fails the pass
+            if (self.clock) |c| c.finish() catch |err| std.debug.print("layer_time: the report failed ({s})\n", .{@errorName(err)});
         }
 
         pub fn complete(self: *Self) !void {
