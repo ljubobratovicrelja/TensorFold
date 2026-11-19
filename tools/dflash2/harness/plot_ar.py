@@ -45,7 +45,7 @@ def main():
         ax1.plot(range(len(idx)), ys, marker="o", ms=4, lw=1.4, color=colours[k % 4],
                  label=f"{name} — {statistics.mean(ys):.2f} tok/s")
         ax1.axhline(statistics.mean(ys), color=colours[k % 4], lw=0.9, ls="--", alpha=0.5)
-    ax1.set_xlabel("prompt (16 public GSM8K test prompts, greedy, autoregressive only)")
+    ax1.set_xlabel("prompt (16 public GSM8K test prompts; sampling and drafting per arm, see note)")
     ax1.set_ylabel("tok/s")
     ax1.set_title("Per-prompt throughput")
     ax1.legend(fontsize=9, loc="lower right")
