@@ -116,6 +116,10 @@ pub const Engine = struct {
     table: embed.Table,
     mixer: HcW,
     head_q: Q4,
+    /// TF_FLASHNEXT_LMHEAD_FP8=<dir>: the head's FP8 arm (`cuda_head_fp8.zig`), loaded beside the
+    /// bf16 table the rescore gathers from. Null unless the flag names an artifact, and then no
+    /// allocation is made and every head call takes the shipped path.
+    head_fp8: ?*@import("cuda_head_fp8.zig").Head = null,
     eos: i64,
     layers: [layers_n]Layer,
     n_layers: usize,
@@ -166,6 +170,7 @@ pub const Engine = struct {
         e.stream = stream;
         e.n_layers = 0;
         e.collective = null;
+        e.head_fp8 = null;
         e.layer_clock = null;
         e.probe = null;
         e.image_factory = null;
@@ -204,6 +209,20 @@ pub const Engine = struct {
             e.head_q = try uploadQ4(gpa, driver, head_w.w, head_w.s, head_w.b, vocab, dims / 8);
         }
         errdefer e.head_q.free();
+        // TF_FLASHNEXT_LMHEAD_FP8=<dir>: rank through an FP8 copy of this same table and rescore the
+        // top-64 from its rows. Resolved here, while the store's maps are still open, and refused on
+        // a sharded head: the artifact is the whole vocabulary and the rescore gathers out of the
+        // whole tiled table, so half a head would be read at the wrong stride.
+        if (@import("cuda_head_fp8.zig").dirFromEnv()) |dir| {
+            if (world != 1 or e.head_q.n != vocab or e.head_q.native == null) {
+                std.log.err("flashnext: TF_FLASHNEXT_LMHEAD_FP8 needs one rank holding the whole bf16 head (world {d}, {d} rows of {d}, bf16 {s}); refusing", .{
+                    world, e.head_q.n, vocab, if (e.head_q.native == null) "no" else "yes",
+                });
+                return error.HeadFp8WholeHeadRequired;
+            }
+            e.head_fp8 = try @import("cuda_head_fp8.zig").Head.load(gpa, io, driver, dir, vocab, dims);
+        }
+        errdefer if (e.head_fp8) |h| h.deinit();
         var pack_mod = try cuda.Module.load(driver, cuda.kernels.experts_pack);
         defer pack_mod.unload();
         const pack_fn = try pack_mod.function(weights.pack_symbol);
@@ -254,6 +273,7 @@ pub const Engine = struct {
         e.ngram.deinit();
         for (e.layers[0..e.n_layers]) |*l| l.free(e.gpa);
         e.head_q.free();
+        if (e.head_fp8) |h| h.deinit();
         e.mixer.free();
         e.table.deinit();
         e.store.deinit();
@@ -292,7 +312,7 @@ pub const Engine = struct {
     /// The resident weights a pass reads, with the taught layers' pockets.
     pub fn model(e: *Engine) batch.Model {
         const m = e.pockets.mask();
-        return .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .table_dense = e.table.dense, .collective = e.collective, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .ngram = &e.ngram, .pocket = if (m != 0) .{ .ctx = e, .add = servePocket, .layers = m } else null };
+        return .{ .table_w = e.table.w.ptr, .table_s = e.table.s.ptr, .table_b = e.table.b.ptr, .table_dense = e.table.dense, .collective = e.collective, .layers = e.layers[0..e.n_layers], .mixer = e.mixer, .head = e.head_q, .head_fp8 = e.head_fp8, .ngram = &e.ngram, .pocket = if (m != 0) .{ .ctx = e, .add = servePocket, .layers = m } else null };
     }
 
     /// The weights a pass of streams that read the model as shipped reads (untaught): the pockets left out.

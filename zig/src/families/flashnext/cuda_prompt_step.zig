@@ -202,6 +202,10 @@ pub fn writeback(tri: anytype, s: *Scratch, h: u64, mode: usize, inj: u64, y: u6
 }
 
 pub fn readout(tri: anytype, s: *Scratch, hc_w: HcW, h: u64, inj: u64) !void {
+    // TF_FLASHNEXT_HC_FP8 loads no bf16 pair, and this row-at-a-time path (the disk-paged `Rows`
+    // pass) has no qmmf lane to read the FP8 tables with: refused by name rather than dereferencing
+    // the empty projections. The batched pass is the one the flag arms.
+    if (hc_w.fp8 != null) return error.HcFp8RowsUnsupported;
     try tri.hcDown(h, s.pss.ptr, hc_w.scale.ptr, s.norm.ptr, hc_w.down.w.ptr, hc_w.down.s.ptr, hc_w.down.b.ptr, s.dn.ptr, s.hc_part.ptr, eps, 1, hc_w.n_down, wide, dims, dims / 256, streams, hc_sk);
     const inj_ptr = if (hc_w.has_inj == 1) inj else s.act.ptr;
     try tri.hcReduceAct(s.hc_part.ptr, s.act.ptr, s.xs_act.ptr, inj_ptr, hc_sk, 1, streams, low, hc_w.n_down, hc_w.has_inj);

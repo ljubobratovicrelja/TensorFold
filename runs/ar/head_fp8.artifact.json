@@ -1,0 +1,114 @@
+{
+ "errors": {
+  "max_abs_err": {
+   "max": 0.008091509342193604,
+   "max_row": 171893,
+   "mean": 0.0018562130645243331,
+   "min": 0.0008980892598628998,
+   "p50": 0.0018136166036128998,
+   "p99": 0.002859935164451599
+  },
+  "mean_abs_err": {
+   "max": 0.0004907043767161667,
+   "max_row": 220,
+   "mean": 0.00023164159041649801,
+   "min": 9.550559479976073e-05,
+   "p50": 0.00023095875803846866,
+   "p99": 0.00030762408016016707
+  },
+  "rel_l2": {
+   "max": 0.028795571997761726,
+   "max_row": 222072,
+   "mean": 0.026423973841793697,
+   "min": 0.021219223737716675,
+   "p50": 0.026422539725899696,
+   "p99": 0.02756953479722142
+  },
+  "rows": 248320
+ },
+ "files": {
+  "head.fp8.e4m3.bin": {
+   "bytes": 635699200,
+   "sha256": "879cf8d6438b44c6c0adb96211dd129398fa545ec0bb9bab504d4e72f88ba9e3"
+  },
+  "head.fp8.errors.f32": {
+   "bytes": 2979840,
+   "sha256": "175b3f528d436aafb99297c11e4442757e5897a5eb4857c2093746d1ab0e986b"
+  },
+  "head.fp8.scales.f32": {
+   "bytes": 993280,
+   "sha256": "2b5e588676e888c7a074d5c03e8eb00492823a1365bee10025ffbed49c5b1f7f"
+  }
+ },
+ "format": "flashnext-lmhead-fp8-rtn",
+ "layout": {
+  "codes": {
+   "dtype": "uint8",
+   "file": "head.fp8.e4m3.bin",
+   "order": "row-major",
+   "shape": [
+    248320,
+    2560
+   ]
+  },
+  "per_row_errors": {
+   "columns": [
+    "max_abs_err",
+    "mean_abs_err",
+    "rel_l2"
+   ],
+   "dtype": "<f4",
+   "file": "head.fp8.errors.f32",
+   "note": "diagnostic only: the engine does not read this file",
+   "shape": [
+    248320,
+    3
+   ]
+  },
+  "scales": {
+   "dtype": "<f4",
+   "file": "head.fp8.scales.f32",
+   "order": "one per output row, row order",
+   "shape": [
+    248320
+   ]
+  }
+ },
+ "quantization": {
+  "activation_dtype": "BF16",
+  "calibration": "none (RTN, deterministic)",
+  "code_grid": "e4m3fn, 4-bit exponent bias 7, 3-bit mantissa, subnormals below 2^-6",
+  "code_rule": "code = round_to_nearest_even(w / scale), saturating at 448",
+  "dequant": "w ~= code * scale",
+  "max_code_magnitude": 126,
+  "precision": "fp8_w8a16",
+  "rows_with_zero_scale": 0,
+  "saturated_codes": 362585,
+  "scale_dtype": "F32",
+  "scale_rule": "per-output-row max-abs: scale[row] = amax(|w[row]|) / 448",
+  "weight_dtype": "F8_E4M3",
+  "zero_row_scale": 1.0
+ },
+ "schema_version": 1,
+ "shape": [
+  248320,
+  2560
+ ],
+ "source": {
+  "dir": "/home/relja/.cache/huggingface/hub/models--nvidia--Qwen3.8-Flash-Next-FP4-Local/snapshots/b9ce18a6887e18c089fdea8509a33e63429a3300",
+  "dtype": "BF16",
+  "safetensors": "model-00014-of-00021.safetensors",
+  "shape": [
+   248320,
+   2560
+  ],
+  "tensor": "lm_head.weight",
+  "tensor_bytes": 1271398400,
+  "tensor_sha256": "40bddd25d0d94a128ab08280faad39cfc3ee3064252761269115f544722607c9"
+ },
+ "tool": {
+  "layout": "row-major e4m3 codes + one f32 scale an output row; the loader permutes the codes into qmmf's fragment order (zig/src/cuda/fp8.zig:packCodes) and the scales into its [npad/64][k/64][64] fp32 tile",
+  "name": "tools/dflash2/quantize/quantize_lm_head.py",
+  "version": "1.0.0"
+ }
+}

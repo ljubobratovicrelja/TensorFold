@@ -1,0 +1,348 @@
+{
+ "arm": "mtp",
+ "generated": "2026-11-19T20:14:23+0100",
+ "source_rev": "c5666ef71",
+ "config": {
+  "model": "qwen3.8-flash-next",
+  "max_tokens": 1024,
+  "draft": true,
+  "temperature": 1.0,
+  "top_p": 0.95,
+  "top_k": 20,
+  "prompts": "gsm8k_16.json",
+  "thinking": false
+ },
+ "aggregate": {
+  "prompts": 16,
+  "tokens": 7905,
+  "wall_s": 136.08,
+  "tok_s_mean": 59.017,
+  "tok_s_median": 60.344,
+  "tok_s_min": 49.338,
+  "tok_s_max": 67.265,
+  "graded": 8,
+  "correct": 8
+ },
+ "rows": [
+  {
+   "i": 0,
+   "prompt_sha256": "bd7186ee500f8fcc",
+   "tokens": 263,
+   "wall_s": 5.0958,
+   "tok_s": 51.612,
+   "finish": "stop",
+   "text_sha256": "3f4124547d0b6a8b066ec0b831d4291ee659527294fa66fd5adec028b89927e0",
+   "chars": 903,
+   "pred": "18",
+   "gold": "18",
+   "text": "To determine how much Janet makes every day at the farmers' market, we need to calculate the number of eggs available for sale and then multiply that by the price per egg.\n\n**Step 1: Calculate the total number of eggs used by Janet.**\nJanet uses eggs for breakfast and for baking muffins.\n- Eggs for breakfast: 3\n- Eggs for muffins: 4\n\nTotal eggs used = $3 + 4 = 7$ eggs.\n\n**Step 2: Calculate the number of eggs remaining for sale.**\nJanet's ducks lay 16 eggs per day. We subtract the eggs she uses from the total production.\n- Total eggs laid: 16\n- Eggs used: 7\n\nRemaining eggs for sale = $16 - 7 = 9$ eggs.\n\n**Step 3: Calculate the daily revenue from sales.**\nJanet sells the remaining eggs at the farmers' market for $2 per egg.\n- Number of eggs for sale: 9\n- Price per egg: $2\n\nDaily revenue = $9 \\times 2 = 18$ dollars.\n\n**Conclusion:**\nJanet makes $18 every day at the farmers' market.\n\n\\boxed{18}",
+   "correct": true,
+   "server": {
+    "tps": 54.5,
+    "rounds": 74.0,
+    "accepted": 190.0,
+    "drafted": 298.0
+   }
+  },
+  {
+   "i": 1,
+   "prompt_sha256": "4bbd7dae18608633",
+   "tokens": 258,
+   "wall_s": 4.0045,
+   "tok_s": 64.427,
+   "finish": "stop",
+   "text_sha256": "1e95d32c2b269afe09a587c406cfa98553dac843bfbc5d5a6901454e9b037ecf",
+   "chars": 844,
+   "pred": "3",
+   "gold": "3",
+   "text": "To find the total number of bolts of fiber needed for the robe, we can follow these steps:\n\n1.  **Determine the amount of blue fiber:**\n    The problem states that the robe takes 2 bolts of blue fiber.\n    $$ \\text{Blue fiber} = 2 \\text{ bolts} $$\n\n2.  **Determine the amount of white fiber:**\n    The problem states that the robe takes \"half that much\" white fiber. This refers to half the amount of the blue fiber.\n    $$ \\text{White fiber} = \\frac{1}{2} \\times \\text{Blue fiber} $$\n    $$ \\text{White fiber} = \\frac{1}{2} \\times 2 = 1 \\text{ bolt} $$\n\n3.  **Calculate the total amount of fiber:**\n    Add the amount of blue fiber and white fiber together.\n    $$ \\text{Total fiber} = \\text{Blue fiber} + \\text{White fiber} $$\n    $$ \\text{Total fiber} = 2 + 1 = 3 \\text{ bolts} $$\n\nTherefore, it takes a total of 3 bolts of fiber.\n\n\\boxed{3}",
+   "correct": true,
+   "server": {
+    "tps": 67.0,
+    "rounds": 52.0,
+    "accepted": 208.0,
+    "drafted": 312.0
+   }
+  },
+  {
+   "i": 2,
+   "prompt_sha256": "eb23ff8afdb1f33c",
+   "tokens": 845,
+   "wall_s": 15.0399,
+   "tok_s": 56.184,
+   "finish": "stop",
+   "text_sha256": "4af521c66632f7edf3356cb8ac42dbbc7385acefcbb5cfa84303e027f7bd4bbc",
+   "chars": 2615,
+   "pred": "70000",
+   "gold": "70000",
+   "text": "To determine the profit Josh made, we need to calculate his total costs and the final selling value of the house.\n\n**Step 1: Calculate the total cost invested by Josh.**\nJosh's total cost consists of the purchase price of the house and the cost of repairs.\n$$ \\text{Total Cost} = \\text{Purchase Price} + \\text{Repair Cost} $$\n$$ \\text{Total Cost} = \\$80,000 + \\$50,000 $$\n$$ \\text{Total Cost} = \\$130,000 $$\n\n**Step 2: Determine the new value of the house.**\nThe problem states that the repairs increased the value of the house by 150%. In financial and real estate contexts, \"increased the value by [percentage]\" typically refers to the percentage increase applied to the original base value (the purchase price).\n\n*   **Original Value (Purchase Price):** $\\$80,000$\n*   **Percentage Increase:** $150\\%$\n\nFirst, calculate the dollar amount of the increase:\n$$ \\text{Value Increase} = \\$80,000 \\times 150\\% $$\n$$ \\text{Value Increase} = \\$80,000 \\times 1.5 $$\n$$ \\text{Value Increase} = \\$120,000 $$\n\nNext, add the increase to the original value to find the new market value (selling price):\n$$ \\text{New Value} = \\text{Original Value} + \\text{Value Increase} $$\n$$ \\text{New Value} = \\$80,000 + \\$120,000 $$\n$$ \\text{New Value} = \\$200,000 $$\n\n*(Note: If the phrase \"increased the value by 150%\" were interpreted as \"increased the value **to** 150% of the original,\" the new value would be $\\$120,000$. However, standard interpretation of \"increased **by**\" implies addition to the base. Even if we assume the standard flipping scenario where the final sale price is derived from the initial value plus the appreciation, the calculation above holds. Let's double-check if there's an alternative interpretation where \"value\" refers to total investment. Usually, \"value\" refers to market value. The purchase price is the initial market value. So, New Market Value = $1.5 \\times \\$80,000$ is incorrect; that would be \"increased **to** 150%\". \"Increased **by** 150%\" means $80,000 + (1.5 \\times 80,000) = 200,000$.)*\n\nLet's re-read carefully: \"This increased the value of the house by 150%.\"\nBase value = $\\$80,000$.\nIncrease amount = $150\\%$ of $\\$80,000 = \\$120,000$.\nFinal Value = $\\$80,000 + \\$120,000 = \\$200,000$.\n\n**Step 3: Calculate the profit.**\nProfit is the final selling value minus the total costs incurred.\n$$ \\text{Profit} = \\text{New Value} - \\text{Total Cost} $$\n$$ \\text{Profit} = \\$200,000 - \\$130,000 $$\n$$ \\text{Profit} = \\$70,000 $$\n\n**Conclusion:**\nJosh spent a total of $\\$130,000$ and the house's new value is $\\$200,000$. His profit is the difference between these two amounts.\n\n\\boxed{70000}",
+   "correct": true,
+   "server": {
+    "tps": 56.8,
+    "rounds": 224.0,
+    "accepted": 624.0,
+    "drafted": 1050.0
+   }
+  },
+  {
+   "i": 3,
+   "prompt_sha256": "6241e4417bf45933",
+   "tokens": 266,
+   "wall_s": 5.0588,
+   "tok_s": 52.582,
+   "finish": "stop",
+   "text_sha256": "1b3dc903ec02ad1d5789d0cfcb65ed00efbd91257fbac675ff89fa0058d491a3",
+   "chars": 847,
+   "pred": "540",
+   "gold": "540",
+   "text": "To find the total distance James runs in a week, we can break the problem down into simple steps:\n\n1.  **Calculate the distance run in one session:**\n    James runs 3 sprints per session, and each sprint is 60 meters long.\n    $$ \\text{Distance per session} = 3 \\times 60 \\text{ meters} = 180 \\text{ meters} $$\n\n2.  **Calculate the total distance run in a week:**\n    He runs 3 times a week.\n    $$ \\text{Total weekly distance} = \\text{Distance per session} \\times \\text{Number of sessions} $$\n    $$ \\text{Total weekly distance} = 180 \\text{ meters} \\times 3 $$\n    $$ \\text{Total weekly distance} = 540 \\text{ meters} $$\n\nAlternatively, you can multiply all factors at once:\n$$ 3 \\text{ sprints} \\times 60 \\text{ meters/sprint} \\times 3 \\text{ times/week} = 540 \\text{ meters} $$\n\nThe total distance James runs a week is 540 meters.\n\n\\boxed{540}",
+   "correct": true,
+   "server": {
+    "tps": 54.1,
+    "rounds": 68.0,
+    "accepted": 198.0,
+    "drafted": 359.0
+   }
+  },
+  {
+   "i": 4,
+   "prompt_sha256": "625cd057174db780",
+   "tokens": 340,
+   "wall_s": 5.6528,
+   "tok_s": 60.148,
+   "finish": "stop",
+   "text_sha256": "a9653693110be412f9b53852922c728c607dec2010826d61cca53990887bc28b",
+   "chars": 1120,
+   "pred": "20",
+   "gold": "20",
+   "text": "To find out how many cups of feed Wendi needs to give her chickens in the final meal of the day, we can follow these steps:\n\n**Step 1: Calculate the total amount of feed needed for the entire flock for one day.**\nWe know that each chicken needs 3 cups of feed per day. Wendi has a flock of 20 chickens.\n$$ \\text{Total daily feed} = \\text{Number of chickens} \\times \\text{Feed per chicken} $$\n$$ \\text{Total daily feed} = 20 \\times 3 = 60 \\text{ cups} $$\n\n**Step 2: Calculate the total amount of feed already given in the morning and afternoon.**\nWendi gives 15 cups in the morning and 25 cups in the afternoon.\n$$ \\text{Feed given so far} = \\text{Morning feed} + \\text{Afternoon feed} $$\n$$ \\text{Feed given so far} = 15 + 25 = 40 \\text{ cups} $$\n\n**Step 3: Calculate the remaining feed needed for the final meal.**\nSubtract the feed already given from the total daily feed requirement.\n$$ \\text{Final meal feed} = \\text{Total daily feed} - \\text{Feed given so far} $$\n$$ \\text{Final meal feed} = 60 - 40 = 20 \\text{ cups} $$\n\n**Conclusion:**\nWendi needs to give 20 cups of feed in the final meal of the day.\n\n\\boxed{20}",
+   "correct": true,
+   "server": {
+    "tps": 62.7,
+    "rounds": 78.0,
+    "accepted": 263.0,
+    "drafted": 398.0
+   }
+  },
+  {
+   "i": 5,
+   "prompt_sha256": "eac82303949cfbc7",
+   "tokens": 463,
+   "wall_s": 7.8831,
+   "tok_s": 58.733,
+   "finish": "stop",
+   "text_sha256": "61ce22c88cadaa6025ee101e8f0d351aadcae2705b6ff89ba45d7c29027f3e90",
+   "chars": 1338,
+   "pred": "64",
+   "gold": "64",
+   "text": "To determine how much Kylar needs to pay for 16 glasses, we need to analyze the pricing structure and calculate the total cost step by step.\n\n**1. Analyze the Pricing Structure**\n*   The price of the **first** glass is $5.\n*   The price of the **second** glass is 60% of $5.\n*   This pattern repeats: odd-numbered glasses (1st, 3rd, 5th, etc.) cost $5, and even-numbered glasses (2nd, 4th, 6th, etc.) cost the discounted price.\n\n**2. Calculate the Discounted Price**\nThe discounted price for every second glass is:\n$$ 60\\% \\times \\$5 = 0.60 \\times 5 = \\$3 $$\n\nSo, the cost of a pair of glasses (one full price + one discounted) is:\n$$ \\$5 + \\$3 = \\$8 $$\n\n**3. Determine the Number of Pairs**\nKylar wants to buy 16 glasses. Since the discount applies to every second glass, we can group the glasses into pairs of 2.\n$$ \\text{Number of pairs} = \\frac{16 \\text{ glasses}}{2 \\text{ glasses/pair}} = 8 \\text{ pairs} $$\n\n**4. Calculate the Total Cost**\nSince there are 8 pairs, and each pair costs $8:\n$$ \\text{Total Cost} = 8 \\text{ pairs} \\times \\$8/\\text{pair} = \\$64 $$\n\n**Verification:**\n*   Glasses at $5: There are 8 such glasses (1st, 3rd, ..., 15th). Cost: $8 \\times 5 = 40$.\n*   Glasses at $3: There are 8 such glasses (2nd, 4th, ..., 16th). Cost: $8 \\times 3 = 24$.\n*   Total: $40 + 24 = 64$.\n\nKylar needs to pay **$64**.\n\n\\boxed{64}",
+   "correct": true,
+   "server": {
+    "tps": 60.1,
+    "rounds": 115.0,
+    "accepted": 349.0,
+    "drafted": 523.0
+   }
+  },
+  {
+   "i": 6,
+   "prompt_sha256": "8a22a567612d02b3",
+   "tokens": 358,
+   "wall_s": 5.7682,
+   "tok_s": 62.064,
+   "finish": "stop",
+   "text_sha256": "c63a62bab9e20374e9376c79d0e247cb9fc26bee9dda476c7ce76b4e6597d7cb",
+   "chars": 1143,
+   "pred": "260",
+   "gold": "260",
+   "text": "To find the total number of sheep in Toulouse, Charleston, and Seattle, we will determine the number of sheep in each city step by step based on the information provided.\n\n**Step 1: Determine the number of sheep in Seattle.**\nThe problem states directly that Seattle has 20 sheep.\n$$ \\text{Seattle} = 20 $$\n\n**Step 2: Determine the number of sheep in Charleston.**\nThe problem states that Charleston has 4 times as many sheep as Seattle.\n$$ \\text{Charleston} = 4 \\times \\text{Seattle} $$\n$$ \\text{Charleston} = 4 \\times 20 = 80 $$\n\n**Step 3: Determine the number of sheep in Toulouse.**\nThe problem states that Toulouse has twice as many sheep as Charleston.\n$$ \\text{Toulouse} = 2 \\times \\text{Charleston} $$\n$$ \\text{Toulouse} = 2 \\times 80 = 160 $$\n\n**Step 4: Calculate the total number of sheep.**\nTo find the total, we add the number of sheep in all three cities together.\n$$ \\text{Total} = \\text{Toulouse} + \\text{Charleston} + \\text{Seattle} $$\n$$ \\text{Total} = 160 + 80 + 20 $$\n\nCalculation:\n$$ 160 + 80 = 240 $$\n$$ 240 + 20 = 260 $$\n\n**Conclusion:**\nThe total number of sheep in Toulouse, Charleston, and Seattle is 260.\n\n\\boxed{260}",
+   "correct": true,
+   "server": {
+    "tps": 63.8,
+    "rounds": 79.0,
+    "accepted": 279.0,
+    "drafted": 426.0
+   }
+  },
+  {
+   "i": 7,
+   "prompt_sha256": "2c2d240e9afb05f4",
+   "tokens": 520,
+   "wall_s": 8.5079,
+   "tok_s": 61.12,
+   "finish": "stop",
+   "text_sha256": "2ce51d8b4868309d7345dabef6430b0a496338ce97e5094afbd7a39cc014b711",
+   "chars": 1698,
+   "pred": "160",
+   "gold": "160",
+   "text": "To determine the total time it takes for Carla to download the file, we need to break the process down into two parts: the time spent downloading before the interruption, and the time spent downloading after the restart.\n\n**Step 1: Calculate the time for the first part of the download.**\n*   The total file size is $200 \\text{ GB}$.\n*   The interruption happens $40\\%$ of the way through the download.\n*   Amount downloaded before interruption: $0.40 \\times 200 \\text{ GB} = 80 \\text{ GB}$.\n*   The download speed is $2 \\text{ GB/minute}$.\n*   Time taken to download these $80 \\text{ GB}$:\n    $$ \\text{Time}_1 = \\frac{80 \\text{ GB}}{2 \\text{ GB/minute}} = 40 \\text{ minutes} $$\n\n**Step 2: Account for the system restart time.**\n*   The Windows restart takes $20 \\text{ minutes}$.\n*   Note: During this time, no data is being downloaded, so this time is added to the total duration.\n\n**Step 3: Calculate the time for the second part of the download.**\n*   After the restart, the download must begin from the beginning. This means the entire $200 \\text{ GB}$ file needs to be downloaded again.\n*   Total file size to download: $200 \\text{ GB}$.\n*   Download speed remains $2 \\text{ GB/minute}$.\n*   Time taken to download the full $200 \\text{ GB}$:\n    $$ \\text{Time}_2 = \\frac{200 \\text{ GB}}{2 \\text{ GB/minute}} = 100 \\text{ minutes} $$\n\n**Step 4: Calculate the total time.**\n*   Total Time = (Time for first partial download) + (Time for restart) + (Time for full download from scratch)\n*   Total Time = $40 \\text{ minutes} + 20 \\text{ minutes} + 100 \\text{ minutes}$\n*   Total Time = $160 \\text{ minutes}$\n\n**Conclusion:**\nThe total time taken to download the file is 160 minutes.\n\n\\boxed{160}",
+   "correct": true,
+   "server": {
+    "tps": 62.4,
+    "rounds": 117.0,
+    "accepted": 403.0,
+    "drafted": 600.0
+   }
+  },
+  {
+   "i": 8,
+   "prompt_sha256": "00c641a78d6ea65e",
+   "tokens": 651,
+   "wall_s": 10.7532,
+   "tok_s": 60.54,
+   "finish": "stop",
+   "text_sha256": "5fbf873ac8919126805019e3d60c0ac88f21566658f504f696344dbd3e5fc311",
+   "chars": 1860,
+   "pred": "45",
+   "gold": null,
+   "text": "Here is the step-by-step logical deduction to solve the problem:\n\n**Step 1: Calculate the distance John drove away from home.**\nJohn drives for 3 hours at a speed of 60 mph.\n$$ \\text{Distance}_{\\text{out}} = \\text{Speed} \\times \\text{Time} $$\n$$ \\text{Distance}_{\\text{out}} = 60 \\text{ mph} \\times 3 \\text{ hours} = 180 \\text{ miles} $$\n\nAt this point, John is 180 miles away from home.\n\n**Step 2: Analyze the return trip duration and traffic conditions.**\nJohn attempts to get home in 4 hours.\n- **First 2 hours:** Standstill traffic. Speed = 0 mph.\n  $$ \\text{Distance}_{\\text{part1}} = 0 \\text{ mph} \\times 2 \\text{ hours} = 0 \\text{ miles} $$\n- **Next half-hour:** Driving at 30 mph.\n  $$ \\text{Distance}_{\\text{part2}} = 30 \\text{ mph} \\times 0.5 \\text{ hours} = 15 \\text{ miles} $$\n- **Remaining time:** The total return attempt is 4 hours. He has already used $2 + 0.5 = 2.5$ hours.\n  $$ \\text{Remaining time} = 4 \\text{ hours} - 2.5 \\text{ hours} = 1.5 \\text{ hours} $$\n  He drives this remaining time at 80 mph.\n  $$ \\text{Distance}_{\\text{part3}} = 80 \\text{ mph} \\times 1.5 \\text{ hours} $$\n  $$ 80 \\times 1.5 = 120 \\text{ miles} $$\n\n**Step 3: Calculate the total distance covered towards home.**\n$$ \\text{Total Distance}_{\\text{return}} = \\text{Distance}_{\\text{part1}} + \\text{Distance}_{\\text{part2}} + \\text{Distance}_{\\text{part3}} $$\n$$ \\text{Total Distance}_{\\text{return}} = 0 + 15 + 120 = 135 \\text{ miles} $$\n\n**Step 4: Calculate the final distance from home.**\nJohn started the return trip 180 miles away from home. He drove 135 miles closer to home during the 4-hour period.\n$$ \\text{Final Distance} = \\text{Initial Distance Away} - \\text{Distance Traveled Home} $$\n$$ \\text{Final Distance} = 180 \\text{ miles} - 135 \\text{ miles} = 45 \\text{ miles} $$\n\n**Conclusion:**\nAt the end of the 4 hours, John is 45 miles from home.\n\n\\boxed{45}",
+   "correct": null,
+   "server": {
+    "tps": 61.8,
+    "rounds": 151.0,
+    "accepted": 501.0,
+    "drafted": 777.0
+   }
+  },
+  {
+   "i": 9,
+   "prompt_sha256": "e55862e446690091",
+   "tokens": 354,
+   "wall_s": 6.6858,
+   "tok_s": 52.948,
+   "finish": "stop",
+   "text_sha256": "7ae4ac0e0e69825b6094dc088139194251a34a312536f4c79fe1721dfcb97659",
+   "chars": 1160,
+   "pred": "460",
+   "gold": null,
+   "text": "To calculate Eliza's total earnings for the week, we need to break down her work hours into regular hours and overtime hours, calculate the pay for each, and then sum them up.\n\n**Step 1: Determine regular and overtime hours**\nEliza works a total of 45 hours.\nThe threshold for regular pay is 40 hours.\n*   Regular hours = 40 hours\n*   Overtime hours = Total hours - Regular hours = $45 - 40 = 5$ hours\n\n**Step 2: Calculate regular pay**\nEliza's regular hourly rate is $\\$10$.\n*   Regular pay = Regular hours $\\times$ Regular rate\n*   Regular pay = $40 \\times 10 = \\$400$\n\n**Step 3: Calculate the overtime hourly rate**\nThe overtime rate is 1.2 times the regular hourly rate.\n*   Overtime rate = $1.2 \\times \\$10 = \\$12$ per hour\n\n**Step 4: Calculate overtime pay**\nEliza worked 5 hours of overtime.\n*   Overtime pay = Overtime hours $\\times$ Overtime rate\n*   Overtime pay = $5 \\times 12 = \\$60$\n\n**Step 5: Calculate total earnings**\nTotal earnings are the sum of regular pay and overtime pay.\n*   Total earnings = Regular pay + Overtime pay\n*   Total earnings = $400 + 60 = \\$460$\n\n**Conclusion**\nEliza's total earnings for this week are $\\$460$.\n\n\\boxed{460}",
+   "correct": null,
+   "server": {
+    "tps": 54.3,
+    "rounds": 92.0,
+    "accepted": 262.0,
+    "drafted": 451.0
+   }
+  },
+  {
+   "i": 10,
+   "prompt_sha256": "ce38692144adfe16",
+   "tokens": 502,
+   "wall_s": 7.463,
+   "tok_s": 67.265,
+   "finish": "stop",
+   "text_sha256": "34be72ec5c54674ce677ec84f1ab92960cebbc05b34ba22c7e26d14af05d34d7",
+   "chars": 1534,
+   "pred": "366",
+   "gold": null,
+   "text": "Here is the step-by-step calculation to determine the total number of downloads over the three months.\n\n**Step 1: Calculate the downloads in the first month.**\nAccording to the problem, the number of downloads in the first month is given directly.\n$$ \\text{Month 1 Downloads} = 60 $$\n\n**Step 2: Calculate the downloads in the second month.**\nThe problem states that the downloads in the second month were three times as many as in the first month.\n$$ \\text{Month 2 Downloads} = 3 \\times \\text{Month 1 Downloads} $$\n$$ \\text{Month 2 Downloads} = 3 \\times 60 = 180 $$\n\n**Step 3: Calculate the downloads in the third month.**\nThe problem states that the downloads in the third month were reduced by 30% compared to the second month. This means the third month had 70% of the downloads of the second month ($100\\% - 30\\% = 70\\%$).\n\nFirst, calculate the reduction amount:\n$$ \\text{Reduction} = 30\\% \\times 180 = 0.30 \\times 180 = 54 $$\n\nThen, subtract the reduction from the second month's total:\n$$ \\text{Month 3 Downloads} = 180 - 54 = 126 $$\n\nAlternatively, calculate directly:\n$$ \\text{Month 3 Downloads} = 180 \\times (1 - 0.30) = 180 \\times 0.70 = 126 $$\n\n**Step 4: Calculate the total downloads over the three months.**\nAdd the downloads from all three months together.\n$$ \\text{Total Downloads} = \\text{Month 1} + \\text{Month 2} + \\text{Month 3} $$\n$$ \\text{Total Downloads} = 60 + 180 + 126 $$\n\n$$ 60 + 180 = 240 $$\n$$ 240 + 126 = 366 $$\n\n**Conclusion:**\nThe program had a total of 366 downloads over the three months.\n\n\\boxed{366}",
+   "correct": null,
+   "server": {
+    "tps": 68.8,
+    "rounds": 100.0,
+    "accepted": 402.0,
+    "drafted": 565.0
+   }
+  },
+  {
+   "i": 11,
+   "prompt_sha256": "f1d522faf75ebc27",
+   "tokens": 507,
+   "wall_s": 7.7728,
+   "tok_s": 65.228,
+   "finish": "stop",
+   "text_sha256": "72f73980fc48fb07a0583152dcfb532776e1951f4fc98ff3e1482e7d4eb95eda",
+   "chars": 1289,
+   "pred": "694",
+   "gold": null,
+   "text": "To find the total cost of the pastries Toula bought, we need to calculate the cost for each type of pastry and then sum them up.\n\n**Step 1: Calculate the cost of the donuts.**\nToula bought 3 dozen donuts at a price of $68 per dozen.\n$$ \\text{Cost of donuts} = 3 \\times 68 $$\n$$ 3 \\times 60 = 180 $$\n$$ 3 \\times 8 = 24 $$\n$$ 180 + 24 = 204 $$\nThe cost of the donuts is **$204**.\n\n**Step 2: Calculate the cost of the mini cupcakes.**\nToula bought 2 dozen mini cupcakes at a price of $80 per dozen.\n$$ \\text{Cost of mini cupcakes} = 2 \\times 80 $$\n$$ 2 \\times 80 = 160 $$\nThe cost of the mini cupcakes is **$160**.\n\n**Step 3: Calculate the cost of the mini cheesecakes.**\nToula bought 6 dozen mini cheesecakes at a price of $55 per dozen.\n$$ \\text{Cost of mini cheesecakes} = 6 \\times 55 $$\n$$ 6 \\times 50 = 300 $$\n$$ 6 \\times 5 = 30 $$\n$$ 300 + 30 = 330 $$\nThe cost of the mini cheesecakes is **$330**.\n\n**Step 4: Calculate the total cost.**\nAdd the costs from the previous steps together.\n$$ \\text{Total Cost} = \\text{Cost of donuts} + \\text{Cost of mini cupcakes} + \\text{Cost of mini cheesecakes} $$\n$$ \\text{Total Cost} = 204 + 160 + 330 $$\n\nFirst, add $204$ and $160$:\n$$ 204 + 160 = 364 $$\n\nNext, add $330$ to the result:\n$$ 364 + 330 = 694 $$\n\nThe total cost is **$694**.\n\n\\boxed{694}",
+   "correct": null,
+   "server": {
+    "tps": 66.8,
+    "rounds": 104.0,
+    "accepted": 403.0,
+    "drafted": 562.0
+   }
+  },
+  {
+   "i": 12,
+   "prompt_sha256": "66c13461547258ae",
+   "tokens": 1024,
+   "wall_s": 20.7548,
+   "tok_s": 49.338,
+   "finish": "length",
+   "text_sha256": "3224661d67521109e442cf9a07e40774867a19603f63cee5786abd30df4a770c",
+   "chars": 3589,
+   "pred": null,
+   "gold": null,
+   "text": "To determine how many years it will take for Carlos to start earning money (i.e., to reach the break-even point where total revenue exceeds total costs), we need to calculate the net profit per year and compare the cumulative profit to the initial investment.\n\n**Step 1: Calculate the annual revenue from selling lemons.**\nThe tree grows 7 lemons per year, and each lemon sells for $\\$1.5$.\n$$ \\text{Annual Revenue} = 7 \\text{ lemons} \\times \\$1.5/\\text{lemon} = \\$10.5 $$\n\n**Step 2: Calculate the net annual profit.**\nThe annual profit is the revenue minus the annual maintenance cost (watering and feeding).\n$$ \\text{Annual Maintenance Cost} = \\$3 $$\n$$ \\text{Net Annual Profit} = \\text{Annual Revenue} - \\text{Annual Maintenance Cost} $$\n$$ \\text{Net Annual Profit} = \\$10.5 - \\$3 = \\$7.5 $$\n\nSo, Carlos nets $\\$7.5$ per year from the tree.\n\n**Step 3: Determine the number of years to recover the initial investment.**\nThe initial cost to plant the tree is $\\$90$. We need to find the number of years ($n$) such that the cumulative net profit equals or exceeds the initial cost.\n\n$$ n \\times \\text{Net Annual Profit} \\ge \\text{Initial Cost} $$\n$$ n \\times 7.5 \\ge 90 $$\n\nSolving for $n$:\n$$ n \\ge \\frac{90}{7.5} $$\n\nTo simplify the division:\n$$ \\frac{90}{7.5} = \\frac{900}{75} $$\n\nDivide both numerator and denominator by 25:\n$$ \\frac{900 \\div 25}{75 \\div 25} = \\frac{36}{3} = 12 $$\n\nSo, $n = 12$.\n\n**Verification:**\n- After 11 years: Total Profit = $11 \\times 7.5 = 82.5$. The initial cost was $\\$90$, so he is still short by $\\$7.5$.\n- After 12 years: Total Profit = $12 \\times 7.5 = 90$. This exactly covers the initial cost. At the end of the 12th year, he has broken even. Any profit after this point (starting from year 13) is \"earning money.\" However, typically in these problems, \"starts earning money\" implies reaching the point where he is no longer in debt regarding the investment, or strictly generating positive net gain over the total lifecycle. Since at $n=12$ he has recovered his costs, he begins to generate true profit immediately after this point. Often, \"break-even\" is considered the tipping point. Let's re-read carefully: \"How many years will it take before he starts earning money\".\n    - If \"earning money\" means having a net positive balance relative to the start, it happens *during* or *at the end* of the 12th year when the 90 dollars are recouped. Strictly speaking, at the very moment he sells the last lemons of year 12, he has $\\$0$ net profit relative to the start. Any time after that is profit.\n    - In standard business math contexts, the break-even point is the answer. It takes 12 years to pay back the investment. After 12 years, the tree is generating pure profit.\n\nLet's check if the question implies strictly *positive* profit.\nIf $n=12$, Net Profit = 0.\nIf $n=13$, Net Profit = $7.5 > 0$.\n\nHowever, usually, these questions ask for the break-even period. \"Start earning money on the lemon tree\" usually refers to the break-even point. Let's look at similar problems. If a machine costs \\$100 and makes \\$10/day, it takes 10 days to start earning money (i.e., be profitable). On day 11, you are fully in the black. But on day 10, you have covered your costs. The phrasing \"starts earning money\" is slightly ambiguous. Does it mean \"when is profit > 0\" or \"when is Cost recovered\"?\n\nLet's assume the standard interpretation: When does the investment pay for itself?\n$90 / 7.5 = 12$.\n\nIf we interpret \"earning money\" as \"having a positive net profit cumulatively\", then at the end of year 12, the net is 0. He isn't *earning* (making a profit",
+   "correct": null,
+   "server": {
+    "tps": 49.7,
+    "rounds": 339.0,
+    "accepted": 684.0,
+    "drafted": 1134.0
+   }
+  },
+  {
+   "i": 13,
+   "prompt_sha256": "33162b4820e72900",
+   "tokens": 562,
+   "wall_s": 9.3638,
+   "tok_s": 60.018,
+   "finish": "stop",
+   "text_sha256": "1b98865804c6fa4f9984756cf109406fe879a97332f86b84ea3391259b6ddc8e",
+   "chars": 1523,
+   "pred": "18",
+   "gold": null,
+   "text": "Let $x$ be the initial number of vacuum cleaners Melanie had.\n\n**Step 1: Sales at the green house**\nMelanie sold a third of her vacuum cleaners at the green house.\nNumber sold at green house = $\\frac{1}{3}x$\nRemaining after green house = $x - \\frac{1}{3}x = \\frac{2}{3}x$\n\n**Step 2: Sales at the red house**\nShe sold 2 more to the red house.\nNumber sold at red house = $2$\nRemaining after red house = $\\frac{2}{3}x - 2$\n\n**Step 3: Sales at the orange house**\nShe sold half of what was left at the orange house.\nThe amount \"left\" before this sale was $\\frac{2}{3}x - 2$.\nNumber sold at orange house = $\\frac{1}{2} \\left( \\frac{2}{3}x - 2 \\right)$\nRemaining after orange house = The other half of what was left = $\\frac{1}{2} \\left( \\frac{2}{3}x - 2 \\right)$\n\n**Step 4: Solve for x**\nWe are given that Melanie has 5 vacuum cleaners left. So, we set the remaining amount equal to 5:\n$$ \\frac{1}{2} \\left( \\frac{2}{3}x - 2 \\right) = 5 $$\n\nMultiply both sides by 2:\n$$ \\frac{2}{3}x - 2 = 10 $$\n\nAdd 2 to both sides:\n$$ \\frac{2}{3}x = 12 $$\n\nMultiply both sides by $\\frac{3}{2}$ to isolate $x$:\n$$ x = 12 \\times \\frac{3}{2} $$\n$$ x = 6 \\times 3 $$\n$$ x = 18 $$\n\n**Verification:**\n1. Start with 18.\n2. Sell $1/3$ at green house: $18 / 3 = 6$ sold. Remaining: $18 - 6 = 12$.\n3. Sell 2 at red house: $12 - 2 = 10$ remaining.\n4. Sell half of what was left at orange house: Half of 10 is 5 sold. Remaining: $10 - 5 = 5$.\n5. She has 5 left. This matches the problem statement.\n\nThe initial number of vacuum cleaners was 18.\n\n\\boxed{18}",
+   "correct": null,
+   "server": {
+    "tps": 61.1,
+    "rounds": 134.0,
+    "accepted": 429.0,
+    "drafted": 642.0
+   }
+  },
+  {
+   "i": 14,
+   "prompt_sha256": "66db695ee2ff2b0e",
+   "tokens": 574,
+   "wall_s": 9.3788,
+   "tok_s": 61.202,
+   "finish": "stop",
+   "text_sha256": "c3aaabe305aa946c79f295ff0d5ed6ea0f481df70e91df02c0020c59ef2083e3",
+   "chars": 1760,
+   "pred": "60",
+   "gold": null,
+   "text": "Here is the step-by-step logical deduction to solve the problem:\n\n**1. Determine the number of students enrolled in Contemporary Dance:**\nThe total number of students is 20.\n20% of the students enrolled in contemporary dance.\n$$ \\text{Contemporary Dance Students} = 20 \\times 0.20 = 4 \\text{ students} $$\n\n**2. Determine the number of remaining students:**\nSubtract the contemporary dance students from the total.\n$$ \\text{Remaining Students} = 20 - 4 = 16 \\text{ students} $$\n\n**3. Determine the number of students enrolled in Jazz Dance:**\n25% of the *remaining* students enrolled in jazz dance.\n$$ \\text{Jazz Dance Students} = 16 \\times 0.25 $$\n$$ \\text{Jazz Dance Students} = 4 \\text{ students} $$\n\n**4. Determine the number of students enrolled in Hip-Hop Dance:**\nThe rest of the students enrolled in hip-hop dance.\n$$ \\text{Hip-Hop Dance Students} = \\text{Remaining Students} - \\text{Jazz Dance Students} $$\n$$ \\text{Hip-Hop Dance Students} = 16 - 4 = 12 \\text{ students} $$\n\n**5. Calculate the percentage of the entire class enrolled in Hip-Hop Dance:**\nDivide the number of hip-hop students by the total number of students and multiply by 100.\n$$ \\text{Percentage} = \\left( \\frac{12}{20} \\right) \\times 100 $$\n$$ \\text{Percentage} = 0.60 \\times 100 $$\n$$ \\text{Percentage} = 60\\% $$\n\n**Alternative Method (using percentages directly):**\n1. Contemporary dance: $20\\%$ of total.\n2. Remaining percentage: $100\\% - 20\\% = 80\\%$ of total.\n3. Jazz dance: $25\\%$ of the remaining $80\\%$.\n   $$ 0.25 \\times 80\\% = 20\\% \\text{ of total} $$\n4. Hip-hop dance: The rest of the remaining percentage.\n   $$ \\text{Hip-hop \\%} = \\text{Remaining \\%} - \\text{Jazz \\%} $$\n   $$ \\text{Hip-hop \\%} = 80\\% - 20\\% = 60\\% $$\n\nBoth methods yield the same result.\n\n\\boxed{60\\%}",
+   "correct": null,
+   "server": {
+    "tps": 62.3,
+    "rounds": 131.0,
+    "accepted": 446.0,
+    "drafted": 696.0
+   }
+  },
+  {
+   "i": 15,
+   "prompt_sha256": "fb5d46d5ac6f9547",
+   "tokens": 418,
+   "wall_s": 6.8675,
+   "tok_s": 60.866,
+   "finish": "stop",
+   "text_sha256": "6ce60e2ed259eca3d37e14d76f5e46045ae81a1b6b52951179cbba8055f4ead9",
+   "chars": 1266,
+   "pred": "125",
+   "gold": null,
+   "text": "To determine the maximum profit, we need to calculate the profit for each purchase plan separately and then compare the results.\n\n**Step 1: Calculate the profit from purchasing jewelry.**\n\n*   **Cost of jewelry:** $\\$5,000$\n*   **Market increase (percentage):** $2.5\\%$\n\nThe profit is calculated as:\n$$ \\text{Profit}_{\\text{jewelry}} = \\text{Cost} \\times \\text{Percentage Increase} $$\n$$ \\text{Profit}_{\\text{jewelry}} = 5,000 \\times 0.025 $$\n\nCalculation:\n$$ 5,000 \\times 0.025 = 125 $$\n\nSo, the profit from jewelry is **$\\$125$**.\n\n**Step 2: Calculate the profit from purchasing electronic gadgets.**\n\n*   **Cost of electronic gadgets:** $\\$8,000$\n*   **Market increase (percentage):** $1.2\\%$\n\nThe profit is calculated as:\n$$ \\text{Profit}_{\\text{gadgets}} = \\text{Cost} \\times \\text{Percentage Increase} $$\n$$ \\text{Profit}_{\\text{gadgets}} = 8,000 \\times 0.012 $$\n\nCalculation:\n$$ 8,000 \\times 0.012 = 96 $$\n\nSo, the profit from electronic gadgets is **$\\$96$**.\n\n**Step 3: Compare the profits and determine the maximum.**\n\n*   Profit from Jewelry: $\\$125$\n*   Profit from Gadgets: $\\$96$\n\nComparing the two values:\n$$ 125 > 96 $$\n\nTherefore, the merchant should choose the jewelry plan to maximize profit. The maximum profit achievable is $\\$125$.\n\n\\boxed{125}",
+   "correct": null,
+   "server": {
+    "tps": 62.6,
+    "rounds": 94.0,
+    "accepted": 324.0,
+    "drafted": 511.0
+   }
+  }
+ ]
+}

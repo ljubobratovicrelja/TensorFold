@@ -17,9 +17,10 @@ pub fn on() bool {
     return @import("sys").environment.read(bool, "TF_FLASHNEXT_HC_FUSE", true) catch true;
 }
 
-/// Whether hc_w's read-out takes its normed rows from the writeback: native, nothing kept, 64 rows or more, our glue.
+/// Whether hc_w's read-out takes its normed rows from the writeback: a table-backed down projection
+/// (the bf16 lane's, or TF_FLASHNEXT_HC_FP8's), nothing kept, 64 rows or more, our glue.
 pub fn fuses(pass: anytype, hc_w: wt.HcW, n: usize, keep: parts.HcKeep) bool {
-    return n >= 64 and hc_w.down.native != null and std.meta.eql(keep, parts.HcKeep{}) and dims == 2560 and
+    return n >= 64 and (hc_w.down.native != null or hc_w.fp8 != null) and std.meta.eql(keep, parts.HcKeep{}) and dims == 2560 and
         streams == 4 and pass.tri.writebackOwned() and pass.k.forms.hc_fuse;
 }
 
@@ -51,12 +52,20 @@ pub fn readoutNative(pass: anytype, hc_w: wt.HcW, r0: usize, n: usize) !void {
     const norm = s.norm + r0 * wide * 2;
     const act = s.act + r0 * low * 2;
     const xs_act = s.xs_act + r0 * (low / 32) * 4;
-    const down = hc_w.down.native orelse return error.UnexpectedTensor;
-    const up = hc_w.up.native orelse return error.UnexpectedTensor;
+    // TF_FLASHNEXT_HC_FP8: the same two projections off the FP8 tables, and no K-slice partials --
+    // each is pinned to one slice (`cuda_hc_fp8.slices`), so the kernel writes its own output
     if (n * hc_w.n_down * 4 > s.hc_part_bytes) return error.UnexpectedTensor; // one slice within hc_part (hcPartRows)
-    try pass.k.nativeMatmul(pass.stream, norm, wide, n, down, s.hc_part, s.native_part, .f32);
+    const pick = if (hc_w.fp8) |p| .{ p.down, p.up, @as(u64, 0) } else .{
+        hc_w.down.native orelse return error.UnexpectedTensor,
+        hc_w.up.native orelse return error.UnexpectedTensor,
+        s.native_part,
+    };
+    const down = pick[0];
+    const up = pick[1];
+    const part = pick[2];
+    try pass.k.nativeMatmul(pass.stream, norm, wide, n, down, s.hc_part, part, .f32);
     const inj_ptr = if (hc_w.has_inj == 1) inj else act;
     try pass.tri.hcReduceAct(s.hc_part, act, xs_act, inj_ptr, 1, n, streams, low, hc_w.n_down, hc_w.has_inj);
-    try pass.k.nativeMatmul(pass.stream, act, low, n, up, s.hc_up, s.native_part, .bf16);
+    try pass.k.nativeMatmul(pass.stream, act, low, n, up, s.hc_up, part, .bf16);
     try pass.tri.hcDenseMix(s.hc_up, norm, s.mixed + r0 * dims * 2, s.xsm + r0 * (dims / 32) * 4, n, dims, streams);
 }

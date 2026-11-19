@@ -290,7 +290,7 @@ pub fn Pass(comptime Tri: type) type {
             const norm = s.norm + r0 * wide * 2;
             const act = s.act + r0 * low * 2;
             const xs_act = s.xs_act + r0 * (low / 32) * 4;
-            if (hc_w.down.native != null) {
+            if (hc_w.down.native != null or hc_w.fp8 != null) {
                 try self.tri.hcNormalize(h, pss, hc_w.scale.ptr, norm, eps, n, dims, streams);
                 return hc.readoutNative(self, hc_w, r0, n);
             }
