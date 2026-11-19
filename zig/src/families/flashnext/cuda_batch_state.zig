@@ -578,6 +578,9 @@ pub const Model = struct {
     layers: []const Layer,
     mixer: HcW,
     head: Q4,
+    /// The target head's quantised arm (`TF_FLASHNEXT_LMHEAD_FP8=<dir>`), or null: the shipped path,
+    /// where `projectHead` never branches on this field beyond one null check.
+    head_fp8: ?*@import("cuda_head_fp8.zig").Head = null,
     ngram: *const ple.Ngram,
     /// The engine's own adds to the MoE outputs: a taught folder's pockets (null: none).
     pocket: ?MoeAdd = null,

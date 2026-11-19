@@ -96,12 +96,14 @@ def main():
     ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--log", default="")
-    ap.add_argument("--out", required=True)
+    ap.add_argument("--out")
     ap.add_argument("--compare", nargs=2)
     a = ap.parse_args()
 
     if a.compare:
         return compare(*a.compare)
+    if not a.out:
+        sys.exit("--out is required unless --compare is given")
 
     prompts = json.load(open(a.prompts))
     golds = []

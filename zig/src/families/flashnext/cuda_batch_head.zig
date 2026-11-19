@@ -81,6 +81,9 @@ pub fn head(self: anytype, logits_host: ?[]u8) !void {
 /// Column tiles keep their own reduction order; each gathered row restores global vocabulary order.
 pub fn projectHead(self: anytype, out: u64, n: usize) !void {
     const s = self.s;
+    // TF_FLASHNEXT_LMHEAD_FP8: the FP8 table ranks, exact bf16 rows rescore (`cuda_head_fp8.zig`).
+    // One null check when the flag is unset, and nothing else below changes.
+    if (self.m.head_fp8) |h| return h.project(self, out, n);
     if (self.m.head.n == vocab) {
         _ = try self.lane(s.mixed, s.xsm, self.m.head, out, s.dummy, n, 1);
         return;

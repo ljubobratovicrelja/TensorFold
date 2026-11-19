@@ -48,3 +48,7 @@ tools/dflash2/runs/
 # activation-probe dumps are evidence, not source: regenerate with collect_task.py
 docs/design/activation-probing/data/
 docs/design/activation-probing/logs/
+
+# The target's FP8 lm_head (TF_FLASHNEXT_LMHEAD_FP8): 636 MB of codes + 1 MB of row scales, written
+# by tools/dflash2/quantize/quantize_lm_head.py. The manifest pins it; the blob stays out of history.
+artifacts/lm_head_fp8/

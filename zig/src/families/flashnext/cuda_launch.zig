@@ -33,6 +33,9 @@ pub const draft_affine = @import("cuda_draft_affine.zig");
 pub const qmm = @import("cuda_qmm.zig");
 /// The batched pass's and its prompt tiles' symbols and launch sizes, which the contract's tests launch.
 pub const batch_state = @import("cuda_batch_state.zig");
+/// TF_FLASHNEXT_LMHEAD_FP8: the target head's FP8 rank and bf16 rescore, declared here so the
+/// family's test build compiles its row-scale, gather-offset and flag checks.
+pub const head_fp8 = @import("cuda_head_fp8.zig");
 pub const batch_gdn_lanes = @import("cuda_batch_gdn_lanes.zig");
 pub const tile_kernels = @import("cuda_tile_kernels.zig");
 pub const gdn = @import("cuda_gdn.zig");
@@ -571,6 +574,12 @@ test "a captured entry takes the whole layer's heads only" {
 
 test {
     _ = @import("cuda_score.zig").CapabilityCases(native.Cuda);
+}
+
+// TF_FLASHNEXT_LMHEAD_FP8's row-scale tile, its tiled gather offset and its flag: a module that only
+// appears under an unreferenced `pub const` never has its test blocks collected.
+test {
+    _ = @import("cuda_head_fp8.zig");
 }
 
 // A module reached only through an unreferenced `pub const` never has its test blocks collected, so
