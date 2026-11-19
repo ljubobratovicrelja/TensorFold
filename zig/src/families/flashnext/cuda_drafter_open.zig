@@ -13,6 +13,9 @@
 //!   drafter's `tf_fxd2_head_topk` reads row-major rows, so the whole table is detiled once, on the
 //!   host, by `cuda_draft2_check.zig`'s `detile` — one implementation, not a second one here. It is
 //!   1.27 GiB at this checkpoint, held for the server's life and shared by every stream.
+//!   `TF_FLASHNEXT_HEAD_FP8=1` with `TF_FLASHNEXT_HEAD_FP8_DIR` adds a 636 MB block-FP8 copy of the
+//!   same table, which the drafter ranks through before rescoring 64 survivors against these exact
+//!   rows; it does not replace this one, because the rescore is what makes the arm lossless.
 //!
 //! The refusals are `cuda_drafter2.refusal`'s list, evaluated against the loaded engine before a byte
 //! of the head is detiled: `--tp 2`, TF_FLASHNEXT_KV_PAGES, a stream already open, no MTP head, a
@@ -87,6 +90,10 @@ pub fn Opener(comptime F: type) type {
             const dr = try d2.Draft2.init(gpa, io, e.driver, e.stream.*, dir, cfg, .{
                 .embed = e.table.w.ptr,
                 .head = head.ptr,
+                // TF_FLASHNEXT_HEAD_FP8=1 (and only "1") ranks through the quantised table named here;
+                // unset is the shipped bf16 head, byte for byte, and the drafter refuses a directory
+                // that arrives without the flag rather than choosing for the caller
+                .head_fp8 = d2.headFp8DirFromEnv(),
             }, head, want);
             errdefer dr.deinit();
             try self.setTaps(dr.taps());

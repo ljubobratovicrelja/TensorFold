@@ -31,6 +31,12 @@ const usage =
     \\                  or affine4 (4-bit MLX codes, the arm `affine4/manifest.json` names).
     \\                  Omitted, the checkpoint's own contents decide, and a checkpoint whose declared
     \\                  precision and contents disagree is refused.
+    \\  --head-fp8 DIR  a block-FP8 copy of the target's lm_head (`head.fp8.safetensors` +
+    \\                  `manifest.json`, as tools/dflash2/quantize/fit_head.py writes it) to rank
+    \\                  through instead of the bf16 head. Off unless `TF_FLASHNEXT_HEAD_FP8=1` is
+    \\                  ALSO set: either one alone is refused, so a run never swaps its head
+    \\                  silently. The 64 surviving ids are rescored against the bf16 head, so the
+    \\                  proposals stay exact (measured: bit-identical acceptance on 880 positions).
     \\  --target DIR    the target checkpoint; only its embed table and head are read
     \\  --fixture DIR   a pre-collected ring (manifest.json, ids.bin, ring.bin)
     \\  --out DIR       where rep{i}/ is written
@@ -52,6 +58,9 @@ const Args = struct {
     out: []const u8 = "",
     repeat: usize = 0,
     precision: ?draftcheck.Precision = null,
+    /// The quantised head's artifact (`--head-fp8`), or null: read only under
+    /// `TF_FLASHNEXT_HEAD_FP8=1`, and a path without the flag is refused at `open`.
+    head_fp8: ?[]const u8 = null,
 };
 
 fn parse(args: []const []const u8) !Args {
@@ -74,6 +83,8 @@ fn parse(args: []const []const u8) !Args {
             a.repeat = std.fmt.parseInt(usize, v, 10) catch return error.BadRepeat;
         } else if (std.mem.eql(u8, flag, "--drafter-precision")) {
             a.precision = draftcheck.Precision.parse(v) orelse return error.BadDrafterPrecision;
+        } else if (std.mem.eql(u8, flag, "--head-fp8")) {
+            a.head_fp8 = v;
         } else return error.UnknownFlag;
     }
     if (a.drafter.len == 0 or a.target.len == 0 or a.fixture.len == 0 or a.out.len == 0)
@@ -148,6 +159,18 @@ pub fn main(init: std.process.Init, argv: []const [:0]const u8) !u8 {
         .head_bf16 = true,
     };
 
-    try draftcheck.runFixtureAt(gpa, io, &driver, stream, o.drafter, m, o.fixture, o.out, o.repeat, o.precision);
+    try draftcheck.runFixtureAt(
+        gpa,
+        io,
+        &driver,
+        stream,
+        o.drafter,
+        m,
+        o.fixture,
+        o.out,
+        o.repeat,
+        o.precision,
+        o.head_fp8,
+    );
     return 0;
 }

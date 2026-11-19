@@ -143,6 +143,9 @@ These settings retain their existing boolean policies rather than gaining new al
 - Flash Next keeps its lenient readers where they are: `TF_FLASHNEXT_TP` and `TF_FLASHNEXT_LOGITS` take a path,
   `TF_FLASHNEXT_OWNED` a list, `TF_FLASHNEXT_DEPTH_LOG` and `TF_TP_TRACE`/`TF_TP_LOCAL`/`TF_TP_STATS` select by presence,
   and the tool-only sampling settings of the MTP check and the `FZ_` developer switches keep their semantics.
+- The Flash Next drafter's quantised head is one switch and one path: `TF_FLASHNEXT_HEAD_FP8` is on only for exact `1`,
+  `TF_FLASHNEXT_HEAD_FP8_DIR` names its artifact, and either one without the other is refused when the drafter opens
+  rather than resolved into a silent substitution of the bf16 head.
 
 The profile registry reports selected arithmetic/experimental overrides; it does not change their parsing or defaults.
 See [profiles](profiles.md) for classes, scopes and grouped slide-learning names.

@@ -75,6 +75,37 @@
 //! this is not. `tf_fxd2_attn_tile` and `tf_fxd2_attn` remain bit-identical to each other and to
 //! themselves, and `TF_FLASHNEXT_ATTN_LEGACY` still selects between them.
 //!
+//! ## `TF_FLASHNEXT_HEAD_FP8`: the head ranked through a block-FP8 `lm_head`, rescored in bf16
+//!
+//! Set to `1`, and *only* `1` — unset, empty or any other text is today's code path, byte for byte —
+//! and with the artifact's directory named by the caller (`TF_FLASHNEXT_HEAD_FP8_DIR`, or
+//! `draft-check --head-fp8 DIR`), a round ranks its seven rows through a weight-only FP8 copy of the
+//! target's head instead of the bf16 one: `Lane.matmulF32` over `zig/src/cuda/fp8.zig`'s 128x128
+//! block layout, then `tf_fxd2_rank_tile` + `tf_fxd2_rank_merge` (`kernels/cuda/draft2_head_fp8.cu`)
+//! reduce the row to its `head_kcov` = 64 best ids, `tf_fxd2_rescore` scores those 64 against the
+//! exact bf16 rows `Target.head` holds, and `tf_fxd2_rescore_top` takes the top 16 of the 448 exact
+//! logits. Unsetting the variable is the whole revert: the fp8 table is never loaded, the bf16
+//! `headw` is tiled at open as it always was, and no branch, buffer or launch of the new path
+//! survives it.
+//!
+//! Why: the head is 45% of a 15.3 ms round — 6.84 ms for 7 rows x [248,320, 2,560] — and the GEMM
+//! inside it (`glm_mm16_16`, 3,880 CTAs) is already at the DRAM wall (~186 GB/s of this box's ~234);
+//! the waste is the top-k behind it, 1.39 ms at 5 GB/s, because `tf_fxd2_topf32` + `tf_fxd2_headmerge`
+//! hand one lane a CTA a serial merge of 512 candidates. Halving the bytes read (1.27 GB -> 636 MB +
+//! 39.7 MB of scales) and doing the select a thread an element is expected to take the stage to
+//! ~3.4 ms + ~0.1 ms; the parent's A/B is the measurement, and `TF_DRAFT2_TIME`'s medians are what to
+//! read it through (`draft-check --repeat 15`, not one round).
+//!
+//! **The rescore is exact, the rank is not.** Measured on 6,160 real head-input rows from the fp8-body
+//! drafter, held-out chunks 6-7 (`tools/dflash2/quantize/fit_head.py`): the fp8 rank alone keeps the
+//! bf16 top-16 inside its top-64 for 1.0000 of rows, but its own top-16 is only recall 0.9683 — so it
+//! may only *nominate*. `tf_fxd2_rescore` then recomputes each id's logit from the bf16 rows in fp32
+//! over the same 2,560 products, ascending K, one accumulator, and the top-16 is taken from those.
+//! That score is not bit-identical to the bf16 GEMM's logit for the same id (the tensor core's 16-wide
+//! k step has its own reduction tree; the difference is <= 1 ulp, ~1e-7 relative), and it never needs
+//! to be: it only reorders 64 candidates, and teacher-forced acceptance over 880 positions with this
+//! exact form was bit-identical to the bf16 head's (ledger §11).
+//!
 //! What this module deliberately is not: it keeps one stream and one weight precision at a time —
 //! the checkpoint as published, its weight-only fp8 build, or its 4-bit (`affine4`) build, chosen
 //! at load and fixed for the life of the drafter — and no snapshots, lanes or trees; its geometry
@@ -142,6 +173,59 @@ pub const head_tile = 8192;
 /// entries.
 pub fn headTiles(c: Config) usize {
     return (c.vocab + head_tile - 1) / head_tile;
+}
+
+/// The candidates the quantised head ranks a row down to before it rescores them in bf16
+/// (`TF_FLASHNEXT_HEAD_FP8=1`). 64 is the width the fidelity measurement was taken at: on 6,160 real
+/// head-input rows the fp8 head's top-64 contained the bf16 head's top-16 for 1.0000 of them (its own
+/// top-16 only for 0.9683), so it is the smallest width with no measured loss, and `rescore` re-scores
+/// exactly `kcov` ids a row against the exact bf16 rows.
+pub const head_kcov: usize = 64;
+
+/// `tf_fxd2_rank_merge`'s slot count: the smallest power of two at least `tiles * kcov`, because the
+/// merge is a bitonic sort and the kernel takes the padded width as an argument. 1,984 at the served
+/// shape (31 tiles x 64), so 2,048 — 16 KiB of shared, the padding sorting last.
+pub fn headSlots(c: Config) usize {
+    var n: usize = 1;
+    while (n < headTiles(c) * head_kcov) n <<= 1;
+    return n;
+}
+
+/// The quantised head's per-round staging, byte for byte: the rank's spill, the surviving ids and
+/// their exact scores. All three are 256-byte aligned by `placeHead`; `headStageBytes` is the total.
+pub const HeadStage = struct {
+    /// `[tiles, rows, kcov]` packed `{fp8 logit, id}` rank keys — `tf_fxd2_rank_tile`'s output and
+    /// `tf_fxd2_rank_merge`'s input: a tile-major list of `kcov` a (tile, row).
+    part: u64,
+    /// `[rows, kcov]` u32: the row's surviving ids, descending by fp8 logit.
+    ids: u64,
+    /// `[rows, kcov]` f32: the same ids' exact bf16 logits, `tf_fxd2_rescore`'s output.
+    resc: u64,
+};
+
+/// The staging's offsets; with `out`, the three tables' addresses from `base`. Sized for the widest
+/// block a round can offer — `c.block - 1` rows, as `cand`/`unary` are — so a stage loaded once fits
+/// a round of any size.
+pub fn placeHead(c: Config, base: u64, out: ?*HeadStage) !usize {
+    const R = c.block - 1;
+    const sizes = .{
+        .{ "part", try bytes(.{ headTiles(c), R, head_kcov, 8 }) },
+        .{ "ids", try bytes(.{ R, head_kcov, 4 }) },
+        .{ "resc", try bytes(.{ R, head_kcov, 4 }) },
+    };
+    var total: usize = 0;
+    inline for (sizes) |s| {
+        const at = (total + 255) & ~@as(usize, 255);
+        total = try std.math.add(usize, at, s[1]);
+        if (out) |b| @field(b, s[0]) = base + at;
+    }
+    return total;
+}
+
+/// The quantised head's staging, `placeHead(c, 0, null)`: 112 KiB at the served shape (111 KiB of rank
+/// spill, 1.75 KiB each of ids and scores), against the 1.27 GB bf16 table the flag stops tiling.
+pub fn headStageBytes(c: Config) !usize {
+    return placeHead(c, 0, null);
 }
 
 /// The chunks the split attention cuts a row's context into at most — the stride of its `PM`, `PL` and
@@ -478,25 +562,19 @@ pub const Weights = struct {
     /// other tensor. The checkpoint's names are the contract's; a build that spells them under
     /// `model.` is read too, because that is how an export writes them.
     fn takeFp8(w: *Weights, gpa: std.mem.Allocator, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize) !Q {
-        const codes = try expectNamed(ck, name, .f8_e4m3, &.{ n, k });
-        var name_buf: [96]u8 = undefined;
-        const scale_name = try std.fmt.bufPrint(&name_buf, "{s}_scale_inv", .{name});
-        const scales = try expectNamed(ck, scale_name, null, &.{ (n + 127) / 128, (k + 127) / 128 });
-        const npad = cuda.fp8.padded(n);
-        const host = try gpa.alloc(u8, npad * k);
-        defer gpa.free(host);
-        cuda.fp8.packCodes(host, codes.bytes, n, k);
-        const inv = try gpa.alloc(f32, scales.numel());
-        defer gpa.free(inv);
-        try core.quant.fp8.widen(scales, inv, false);
-        const tiles = try gpa.alloc(f32, npad * (k / cuda.qmmf.group));
-        defer gpa.free(tiles);
-        cuda.fp8.packScales(tiles, inv, n, k);
-        const cat = try w.book(host.len);
-        try w.arena.upload(cat, host);
-        const sat = try w.book(std.mem.sliceAsBytes(tiles).len);
-        try w.arena.upload(sat, std.mem.sliceAsBytes(tiles));
-        return .{ .codes = w.arena.ptr + cat, .scales = w.arena.ptr + sat, .n = @intCast(n), .k = @intCast(k), .npad = @intCast(npad) };
+        var p = try packFp8(gpa, ck, name, n, k);
+        defer p.deinit(gpa);
+        const cat = try w.book(p.codes.len);
+        try w.arena.upload(cat, p.codes);
+        const sat = try w.book(std.mem.sliceAsBytes(p.scales).len);
+        try w.arena.upload(sat, std.mem.sliceAsBytes(p.scales));
+        return .{
+            .codes = w.arena.ptr + cat,
+            .scales = w.arena.ptr + sat,
+            .n = @intCast(n),
+            .k = @intCast(k),
+            .npad = @intCast(p.npad),
+        };
     }
 };
 
@@ -519,6 +597,60 @@ fn expectNamed(ck: *core.Checkpoint, name: []const u8, dtype: ?core.checkpoint.D
         return error.UnexpectedTensor;
     }
     return t;
+}
+
+/// One tensor's block-FP8 form, host-side, as `cuda/qmmf.zig`'s `fp8g` kernel reads it: the codes
+/// repacked by `cuda/fp8.zig` into `npad * k` bytes, and the scales widened to fp32 and rearranged
+/// into `npad * k / group` tiles. The one packer both the body's projections (`takeFp8`) and the
+/// head's table (`HeadFp8.load`) go through, so their byte layouts cannot drift apart.
+const Packed = struct {
+    codes: []u8,
+    scales: []f32,
+    npad: usize,
+
+    fn deinit(p: *Packed, gpa: std.mem.Allocator) void {
+        gpa.free(p.codes);
+        gpa.free(p.scales);
+    }
+};
+
+fn packFp8(gpa: std.mem.Allocator, ck: *core.Checkpoint, name: []const u8, n: usize, k: usize) !Packed {
+    const codes = try expectNamed(ck, name, .f8_e4m3, &.{ n, k });
+    var name_buf: [96]u8 = undefined;
+    const scale_name = try std.fmt.bufPrint(&name_buf, "{s}_scale_inv", .{name});
+    const scales = try expectNamed(ck, scale_name, null, &.{ (n + 127) / 128, (k + 127) / 128 });
+    const npad = cuda.fp8.padded(n);
+    const host = try gpa.alloc(u8, npad * k);
+    errdefer gpa.free(host);
+    cuda.fp8.packCodes(host, codes.bytes, n, k);
+    const inv = try gpa.alloc(f32, scales.numel());
+    defer gpa.free(inv);
+    try core.quant.fp8.widen(scales, inv, false);
+    const tiles = try gpa.alloc(f32, npad * (k / cuda.qmmf.group));
+    errdefer gpa.free(tiles);
+    cuda.fp8.packScales(tiles, inv, n, k);
+    return .{ .codes = host, .scales = tiles, .npad = npad };
+}
+
+/// `packFp8` out of an artifact directory of its own. The exporter (`tools/dflash2/quantize/fit_head.py`)
+/// writes one file, `head.fp8.safetensors`, beside its `manifest.json` — not the `model*.safetensors`
+/// shards `openModel` looks for — so that name is opened when it exists, and a directory that *is* a
+/// checkpoint (an artifact re-saved as one) falls back to `openModel`. A directory with neither is
+/// `error.FileNotFound` from the checkpoint layer, not a silent bf16 fallback.
+fn packFp8Artifact(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, name: []const u8, n: usize, k: usize) !Packed {
+    const file = "head.fp8.safetensors";
+    const path = try std.fs.path.join(gpa, &.{ dir, file });
+    defer gpa.free(path);
+    var ck: core.Checkpoint = if (std.Io.Dir.cwd().access(io, path, .{})) |_| blk: {
+        var c: core.Checkpoint = .{ .gpa = gpa, .io = io };
+        c.add(dir, file) catch |e| {
+            c.close();
+            return e;
+        };
+        break :blk c;
+    } else |_| try core.Checkpoint.openModel(gpa, io, dir);
+    defer core.checkpoint.cache.close(&ck);
+    return packFp8(gpa, &ck, name, n, k);
 }
 
 /// One layer's tensors, in `cuda_draft2_weights.layerTensor`'s order.
@@ -550,8 +682,50 @@ pub const Target = struct {
     /// `tf_fxd2_headtile` reads it a row at a time. Note that the engine's resident head is the same
     /// tensor repacked into matrix-core tiles (`cuda/qmmf.zig`), which none of this module's kernels
     /// can address: a serving caller has to hand over rows, not tiles (see `cuda_draft2_check.zig`).
+    ///
+    /// It stays required under `TF_FLASHNEXT_HEAD_FP8=1`: the flag only moves the *rank* onto the
+    /// quantised table, and the rescore reads these exact rows for the ids that rank nominated.
     head: u64,
+    /// The quantised head's directory — the artifact `tools/dflash2/quantize/fit_head.py` writes, a
+    /// `head.fp8.safetensors` holding `lm_head.weight` (F8_E4M3) and its 128x128 `_scale_inv` — or
+    /// null for the bf16 head. This names the path only; the arm is taken when
+    /// `TF_FLASHNEXT_HEAD_FP8=1` is *also* set, and either one without the other is refused at `open`
+    /// (`headFp8Choice`). `draft-check --head-fp8 DIR` passes the flag's value here.
+    head_fp8: ?[]const u8 = null,
 };
+
+/// `TF_FLASHNEXT_HEAD_FP8=1`, and *only* `1`: any other text is off, so a typo or a stale `true`
+/// takes the shipped path rather than an experiment's. An empty variable reads as unset too, so a
+/// stray `export VAR=` in a shell cannot turn the arm on. Both this and the directory below are
+/// lenient switches like `TF_FLASHNEXT_ATTN_SPLIT`, whose reader sits where the round is.
+pub fn headFp8Flag() ?[]const u8 {
+    const p = std.c.getenv("TF_FLASHNEXT_HEAD_FP8") orelse return null;
+    const t = std.mem.span(p);
+    return if (t.len == 0) null else t;
+}
+
+/// `TF_FLASHNEXT_HEAD_FP8_DIR`'s text, or null: where the serving engine's quantised head lives. Only
+/// the path — whether the arm is taken is `headFp8Choice`'s, so a directory in the environment with
+/// the flag unset is refused rather than ignored.
+pub fn headFp8DirFromEnv() ?[]const u8 {
+    const p = std.c.getenv("TF_FLASHNEXT_HEAD_FP8_DIR") orelse return null;
+    const t = std.mem.span(p);
+    return if (t.len == 0) null else t;
+}
+
+/// The quantised head a caller asked for, from the two things that can name one: `flag` is
+/// `TF_FLASHNEXT_HEAD_FP8`'s text and `dir` the artifact's directory. Null is today's bf16 head.
+///
+/// A flag without a path, and a path without the flag, are both refused rather than resolved either
+/// way: ranking through fp8 while the caller believed it was bf16 (or the reverse) is the one failure
+/// mode a flag exists to prevent, and a silent substitution would hide it until the proposals moved.
+pub fn headFp8Choice(flag: ?[]const u8, dir: ?[]const u8) !?[]const u8 {
+    const on = if (flag) |p| std.mem.eql(u8, p, "1") else false;
+    const path: ?[]const u8 = if (dir) |p| (if (p.len != 0) p else null) else null;
+    if (on and path == null) return error.HeadFp8PathMissing;
+    if (!on and path != null) return error.HeadFp8FlagUnset;
+    return path;
+}
 
 /// A monotonic reading in nanoseconds: zig 0.17 dropped `std.time.Timer`, and a stage bill measured
 /// in anything but wall-clock deltas around the launches is a guess.
@@ -605,6 +779,89 @@ const AttnSplit = struct {
     }
 };
 
+/// The quantised head, loaded: a weight-only FP8 copy of the target's `lm_head` (636 MB of codes and
+/// 39.7 MB of 128x128 scale tiles at the served shape), the four entries that rank and rescore a row
+/// (`kernels/cuda/draft2_head_fp8.cu`), and the per-round staging they leave behind.
+///
+/// Loaded only when `TF_FLASHNEXT_HEAD_FP8=1` and a directory names the artifact — a drafter that
+/// does not set the flag never opens it, never loads its image and never allocates its staging. The
+/// bf16 `Target.head` stays the exact table the rescore reads: this struct is a *candidate* source,
+/// so the 1.27 GB the flag saves in reads is not saved in residency (`headStageBytes` is ~112 KiB).
+const HeadFp8 = struct {
+    /// `draft2_head_fp8`'s image and the four entries in it, in launch order.
+    mod: cuda.Module,
+    /// `tf_fxd2_rank_tile`: a CTA's `kcov` best of its `head_tile`-wide slice, dynamic shared
+    /// `head_tile * 8` (64 KiB at the served shape, so the attribute is required).
+    rank_tile: cuda.Function,
+    /// `tf_fxd2_rank_merge`: a row's `tiles * kcov` candidates down to its `kcov` ids, dynamic
+    /// shared `headSlots(c) * 8` (16 KiB).
+    rank_merge: cuda.Function,
+    /// `tf_fxd2_rescore`: the exact bf16 dot for each surviving id.
+    rescore: cuda.Function,
+    /// `tf_fxd2_rescore_top`: the top `topk` of a row's `kcov` exact scores, dynamic shared
+    /// `kcov * 8` (512 bytes, inside the default limit).
+    rescore_top: cuda.Function,
+    /// `cuda/fp8.zig`'s packed table: `npad * k` codes, then `npad * k / group` fp32 scale tiles.
+    arena: cuda.DeviceBuffer,
+    /// The view `Lane.matmulF32` reads: `fp8g`, `n = vocab`, `k = hidden`.
+    w: cuda.qmmf.Weight,
+    /// `part`, `ids`, `resc` (`HeadStage`), `headStageBytes(c)`.
+    stage: cuda.DeviceBuffer,
+    est: HeadStage,
+
+    /// `dir`'s artifact, packed and uploaded, then the rank/rescore image. Every refusal here is one a
+    /// load should not survive: the artifact's two tensors are checked by name, dtype and shape
+    /// (`lm_head.weight` F8_E4M3 `[vocab, hidden]`, its `_scale_inv` `[ceil(vocab/128), ceil(hidden/128)]`)
+    /// against the served geometry, so a table fitted for another vocabulary is refused rather than
+    /// read at the wrong stride.
+    fn load(gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, dir: []const u8, c: Config) !HeadFp8 {
+        if (!cuda.kernels.available) return error.BuiltWithoutKernels;
+        var p = try packFp8Artifact(gpa, io, dir, "lm_head.weight", c.vocab, c.hidden);
+        defer p.deinit(gpa);
+        const codes_bytes = p.codes.len;
+        const scale_bytes = std.mem.sliceAsBytes(p.scales).len;
+        // one allocation for both: the codes are a multiple of 256 bytes at every vocabulary this
+        // module admits (npad * k, and k is a multiple of 256), so the scale tiles keep the
+        // alignment the lane kernel's vector loads want
+        var h: HeadFp8 = .{
+            .mod = undefined,   .rank_tile = undefined, .rank_merge = undefined,
+            .rescore = undefined, .rescore_top = undefined, .arena = undefined,
+            .w = undefined,     .stage = undefined,     .est = undefined,
+        };
+        h.arena = try cuda.DeviceBuffer.alloc(d, codes_bytes + scale_bytes);
+        errdefer h.arena.free();
+        try h.arena.upload(0, p.codes);
+        try h.arena.upload(codes_bytes, std.mem.sliceAsBytes(p.scales));
+        h.w = cuda.fp8.weight(h.arena.ptr, h.arena.ptr + codes_bytes, c.vocab, c.hidden);
+        h.stage = try cuda.DeviceBuffer.alloc(d, try headStageBytes(c));
+        errdefer h.stage.free();
+        _ = try placeHead(c, h.stage.ptr, &h.est);
+        h.mod = try cuda.Module.load(d, cuda.kernels.draft2_head_fp8);
+        errdefer h.mod.unload();
+        h.rank_tile = try h.mod.function("tf_fxd2_rank_tile");
+        try h.rank_tile.allowDynamicShared(head_tile * 8);
+        h.rank_merge = try h.mod.function("tf_fxd2_rank_merge");
+        h.rescore = try h.mod.function("tf_fxd2_rescore");
+        h.rescore_top = try h.mod.function("tf_fxd2_rescore_top");
+        return h;
+    }
+
+    /// The bytes this arm asks the device for, the staging included: a load-time bill the caller can
+    /// print before it pays it.
+    fn bytes(c: Config) !usize {
+        const codes = try std.math.mul(usize, cuda.fp8.padded(c.vocab), c.hidden);
+        const groups = c.hidden / cuda.qmmf.group;
+        const scales = try std.math.mul(usize, try std.math.mul(usize, cuda.fp8.padded(c.vocab), groups), 4);
+        return codes + scales + try headStageBytes(c);
+    }
+
+    fn deinit(h: *HeadFp8) void {
+        h.stage.free();
+        h.arena.free();
+        h.mod.unload();
+    }
+};
+
 /// The drafter, loaded: its config, its weights, and its kernels.
 pub const Draft = struct {
     /// Per-stage nanoseconds, kept only when `TF_DRAFT2_TIME` is set: a round that is five times the
@@ -639,6 +896,9 @@ pub const Draft = struct {
     m16: cuda.Function,
     tile16: cuda.Function,
     headw: cuda.DeviceBuffer,
+    /// The quantised head (`TF_FLASHNEXT_HEAD_FP8=1`), or null: the shipped arm, where `headw` holds
+    /// the tiled bf16 table and `headTopk` never branches on this field.
+    hfp: ?HeadFp8 = null,
     /// The weights' precision, resolved at load: `want` when the caller named one, else what the
     /// checkpoint's own tensors say. Every projection's dispatch reads this one enum.
     precision: Precision,
@@ -703,6 +963,18 @@ pub const Draft = struct {
         // selector's shared row is sized for, a ring the window cannot outrun.
         if (c.head_dim != 128 or c.topk > draft2.lp_top or c.rank > 256) return error.UnsupportedDraftConfig;
         if (c.hidden % 256 != 0 or c.hidden % 8 != 0 or c.intermediate % 8 != 0 or c.window > c.ringRows()) return error.UnsupportedDraftConfig;
+        // The head's arm, resolved before anything is allocated: `TF_FLASHNEXT_HEAD_FP8=1` (and only
+        // "1") with the artifact's directory, which is the caller's `Target.head_fp8`
+        // (`draft-check --head-fp8`) or the serving engine's `TF_FLASHNEXT_HEAD_FP8_DIR`. Either one
+        // without the other is refused here, by name, rather than resolved into a silent substitution.
+        const hfp_dir = headFp8Choice(headFp8Flag(), target.head_fp8 orelse headFp8DirFromEnv()) catch |e| {
+            std.log.err(
+                "flashnext drafter: the quantised head needs TF_FLASHNEXT_HEAD_FP8=1 *and* a " ++
+                    "directory (TF_FLASHNEXT_HEAD_FP8_DIR or --head-fp8); refusing {s}",
+                .{@errorName(e)},
+            );
+            return e;
+        };
 
         const s = try gpa.create(Self);
         errdefer gpa.destroy(s);
@@ -737,14 +1009,25 @@ pub const Draft = struct {
         try s.m16.allowDynamicShared(m16Shared());
         s.fuse_dot = try s.mm.function("glm_fuse_dot");
         s.tile16 = try s.mm.function("glm_mm_tile16");
-        s.headw = try cuda.DeviceBuffer.alloc(d, s.c.vocab * s.c.hidden * 2);
+        // With the quantised head the bf16 table is not tiled at all: the rank reads the fp8 table and
+        // the rescore reads the caller's own rows, so nothing in the new arm addresses `headw`. Its
+        // booking is then zero bytes (a `DeviceBuffer` of length 0 holds address 0 and `free` is a
+        // no-op), which is also what keeps the 1.27 GB off the device when the caller chose fp8.
+        s.headw = try cuda.DeviceBuffer.alloc(d, if (hfp_dir == null) s.c.vocab * s.c.hidden * 2 else 0);
         errdefer s.headw.free();
-        var targs: cuda.Args = .{};
-        targs.add(s.target.head);
-        targs.add(s.headw.ptr);
-        targs.add(@as(c_int, @intCast(s.c.vocab)));
-        targs.add(@as(c_int, @intCast(s.c.hidden)));
-        try cuda.launch.launch(s.tile16, .{ .grid = .{ .x = @intCast((s.c.vocab / 8) * (s.c.hidden / 64) * 32 / 256), .y = 1, .z = 1 }, .block = .{ .x = 256 } }, s.stream, &targs);
+        if (hfp_dir == null) {
+            var targs: cuda.Args = .{};
+            targs.add(s.target.head);
+            targs.add(s.headw.ptr);
+            targs.add(@as(c_int, @intCast(s.c.vocab)));
+            targs.add(@as(c_int, @intCast(s.c.hidden)));
+            // one CTA a 32-row by 64-column output tile of the repacked table
+            const tiles = (s.c.vocab / 8) * (s.c.hidden / 64) * 32 / 256;
+            try cuda.launch.launch(s.tile16, .{
+                .grid = .{ .x = @intCast(tiles), .y = 1, .z = 1 },
+                .block = .{ .x = 256 },
+            }, s.stream, &targs);
+        }
         s.w = try loadWeights(gpa, io, s, dir);
         errdefer s.w.deinit(gpa);
         if (std.c.getenv("TF_DRAFT2_TIME")) |p| {
@@ -760,11 +1043,25 @@ pub const Draft = struct {
         if (std.c.getenv("TF_FLASHNEXT_ATTN_SPLIT")) |p| {
             if (std.mem.eql(u8, std.mem.span(p), "1")) s.attn_split = try AttnSplit.load(d);
         }
+        // The quantised head last, because it needs the lane matmul `loadWeights` resolves for the
+        // body (loaded here instead when the body is bf16) and its own booking for that matmul's
+        // K-slice spill — the weights' arena is closed by the first unbooked forward, so the head's
+        // staging cannot live in it.
+        if (hfp_dir) |hdir| {
+            // evaluated at error time, so it covers the lane whether `loadWeights` resolved it or the
+            // next line does: an open that fails here leaves a live module otherwise
+            errdefer if (s.lane) |*l| l.unload();
+            if (s.lane == null) s.lane = try cuda.qmmf.Lane.load(d, (try d.currentCapability()) / 10);
+            try s.bookHeadPart();
+            s.hfp = try HeadFp8.load(gpa, io, d, hdir, s.c);
+            errdefer if (s.hfp) |*hh| hh.deinit();
+        }
         return s;
     }
 
     pub fn deinit(s: *Self) void {
         s.w.deinit(s.gpa);
+        if (s.hfp) |*h| h.deinit();
         if (s.qpart) |*b| b.free();
         if (s.lane) |*l| l.unload();
         // the kernels' own device state (a non-GB10 split's partials) first, then the modules their
@@ -778,6 +1075,20 @@ pub const Draft = struct {
         s.mod.unload();
         s.mm.unload();
         s.gpa.destroy(s);
+    }
+
+    /// The lane matmul's K-slice spill for the *head*'s shape: `qpartBytes` sizes the body's seven
+    /// projections, and the head is an eighth shape (7 rows x [248,320, 2,560]) the body never asks
+    /// for. Grown only when the plan needs it — on this box's `m = 7` the plan is `sk = 1` and the
+    /// answer is 0 bytes — and never shrunk, because the body's own plan already owns `qpart`.
+    fn bookHeadPart(s: *Self) !void {
+        const lane = if (s.lane) |*l| l else return;
+        const head = cuda.fp8.weight(0, 0, s.c.vocab, s.c.hidden);
+        const need = @max(qpartBytes(s.c, lane), lane.partBytes(s.c.block - 1, head));
+        if (need == 0 or (if (s.qpart) |b| b.len >= need else false)) return;
+        const fresh = try cuda.DeviceBuffer.alloc(s.d, need);
+        if (s.qpart) |*b| b.free();
+        s.qpart = fresh;
     }
 
     /// The affine-4 arm's kernels, loaded once at `loadWeights` when the checkpoint's weights are
@@ -1484,6 +1795,10 @@ fn headTopk(s: *Draft, x: u64, rows: usize, part: u64, ids: u64, val: u64, lg: u
     // that writes past the scratch, and a caller that scored eight rows would be as wrong as one
     // that scored none. `part` is booked for `rows` the same way.
     if (rows == 0 or rows > c.block - 1) return error.BadProposalCount;
+    // `TF_FLASHNEXT_HEAD_FP8=1` (and a directory, refused at `open` otherwise): rank through the
+    // quantised table and rescore the survivors in bf16. Null — the shipped arm — falls straight
+    // through to the two passes below, which never see this field.
+    if (s.hfp) |*h| return headRankFp8(s, h, x, rows, ids, val, lg);
     const tiles = headTiles(c);
     const threads: u32 = 256;
     // the dot on glm_mm's tensor cores: [rows, H] x [V, H]^T into fp32 logits — one BM=16 block
@@ -1509,22 +1824,7 @@ fn headTopk(s: *Draft, x: u64, rows: usize, part: u64, ids: u64, val: u64, lg: u
     }
     // one candidate list a thread plus one a warp: `tf_fxd2_topf32` publishes every thread's list
     const slice_shared: usize = (threads + threads / 32) * c.topk * 8;
-    // TF_FLASHNEXT_LG_DUMP=<dir>: the head's input rows and its fp32 logits for row 0, so the GEMM
-    // and the top-k can be checked apart from each other. Off unless set.
-    if (std.c.getenv("TF_FLASHNEXT_LG_DUMP")) |p| {
-        try s.stream.synchronize();
-        const dir = std.mem.span(p);
-        var nb1: [512]u8 = undefined;
-        var nb2: [512]u8 = undefined;
-        const hb = try s.gpa.alloc(u8, rows * c.hidden * 2);
-        defer s.gpa.free(hb);
-        try cuda.memory.download(s.d, x, hb);
-        try std.Io.Dir.cwd().writeFile(s.io, .{ .sub_path = try std.fmt.bufPrint(&nb1, "{s}/head_in.bf16", .{dir}), .data = hb });
-        const lb = try s.gpa.alloc(u8, c.vocab * 4);
-        defer s.gpa.free(lb);
-        try cuda.memory.download(s.d, lg, lb);
-        try std.Io.Dir.cwd().writeFile(s.io, .{ .sub_path = try std.fmt.bufPrint(&nb2, "{s}/logits_r0.f32", .{dir}), .data = lb });
-    }
+    try dumpHead(s, x, lg, rows);
     if (split) {
         try s.stream.synchronize();
         t0 = nowNs(s.io);
@@ -1551,6 +1851,117 @@ fn headTopk(s: *Draft, x: u64, rows: usize, part: u64, ids: u64, val: u64, lg: u
             @as(f64, @floatFromInt(t1 - t0)) / 1e6,
             @as(f64, @floatFromInt(c.vocab * c.hidden * 2)) / 1e6,
         });
+    }
+}
+
+/// The head on `TF_FLASHNEXT_HEAD_FP8=1`, in five launches:
+///
+/// 1. `Lane.matmulF32` (`qmmf`'s `fp8g`): `[rows, H]` bf16 activations x the 128x128-block FP8 table
+///    into `[rows, vocab]` fp32 logits — 636 MB of codes and 39.7 MB of scale tiles read a round,
+///    against the bf16 table's 1.27 GB, over the same 3,880 output tiles. Needs no `part` at m = 7
+///    (`bookHeadPart` grows it if a plan ever does).
+/// 2. `tf_fxd2_rank_tile(X, PART, V, kcov, rows, tile)`, grid (tiles, rows): a CTA's `kcov` best of
+///    its `head_tile`-wide slice.
+/// 3. `tf_fxd2_rank_merge(PART, IDS, tiles, rows, kcov, slots)`, grid (rows): the row's `kcov` ids.
+/// 4. `tf_fxd2_rescore(IDS, X, HEAD, OUT, n, kcov, K)`: the exact bf16 logit of each survivor, from
+///    the caller's own row-major head. This is the launch that makes the arm lossless: the fp8 table
+///    only nominates, these 448 logits rank (see this file's header, and ledger §11).
+/// 5. `tf_fxd2_rescore_top(RESC, IDS, ID, VAL, kcov, topk)`, grid (rows): the top `topk`, descending.
+///
+/// `ids` and `val` are the round's `[rows, topk]` tables — the selector's own, unchanged — and `lg`
+/// is the same `[rows, vocab]` fp32 staging the shipped path writes, so a traced round and
+/// `TF_FLASHNEXT_LG_DUMP` mean the same thing on both arms (the dump then holds the *fp8* logits,
+/// which is what makes the rank's table inspectable apart from the rescore).
+fn headRankFp8(s: *Draft, h: *HeadFp8, x: u64, rows: usize, ids: u64, val: u64, lg: u64) !void {
+    const c = s.c;
+    const tiles = headTiles(c);
+    const lane = if (s.lane) |*l| l else return error.DrafterPrecisionMismatch;
+    const part = if (s.qpart) |b| b.ptr else @as(u64, 0);
+    if (lane.partBytes(rows, h.w) > (if (s.qpart) |b| b.len else 0)) return error.DrafterPartTooSmall;
+    // 1. the rank's GEMM, over the quantised table
+    try lane.matmulF32(s.stream, x, c.hidden, rows, h.w, lg, part);
+    // 2. one candidate list a tile
+    try launch(s, h.rank_tile, .{ @intCast(tiles), @intCast(rows), 1 }, 256, @intCast(head_tile * 8), .{
+        lg, h.est.part, ci(c.vocab), ci(head_kcov), ci(rows), ci(head_tile),
+    });
+    // 3. the row's list, of the tiles' lists
+    try launch(s, h.rank_merge, .{ @intCast(rows), 1, 1 }, 256, @intCast(headSlots(c) * 8), .{
+        h.est.part, h.est.ids, ci(tiles), ci(rows), ci(head_kcov), ci(headSlots(c)),
+    });
+    // 4. the exact scores: one thread an (id, row), ascending K, one fp32 accumulator
+    const n = rows * head_kcov;
+    try launch(s, h.rescore, .{ @intCast((n + 127) / 128), 1, 1 }, 128, 0, .{
+        h.est.ids, x, s.target.head, h.est.resc, ci(n), ci(head_kcov), ci(c.hidden),
+    });
+    // 5. the top `topk` of them, into the selector's tables
+    try launch(s, h.rescore_top, .{ @intCast(rows), 1, 1 }, 32, @intCast(head_kcov * 8), .{
+        h.est.resc, h.est.ids, ids, val, ci(head_kcov), ci(c.topk),
+    });
+    try dumpHead(s, x, lg, rows);
+    try dumpFp8Head(s, h, rows, ids, val);
+}
+
+/// `TF_FLASHNEXT_HEAD_DUMP=<dir>`: what the fp8 head hands the selector (`ids`, `val`) and what it
+/// rescored (`h.est.ids`, `h.est.resc`), so a served round's head output can be checked against an
+/// exact bf16 dot of the same `head_in.bf16` rows. Overwrites every round; pair it with `LG_DUMP`.
+fn dumpFp8Head(s: *Draft, h: *HeadFp8, rows: usize, ids: u64, val: u64) !void {
+    const c = s.c;
+    const p = std.c.getenv("TF_FLASHNEXT_HEAD_DUMP") orelse return;
+    try s.stream.synchronize();
+    const dir = std.mem.span(p);
+    var nb: [512]u8 = undefined;
+    const nk = rows * c.topk;
+    const nb_ids = try s.gpa.alloc(u8, nk * 4);
+    defer s.gpa.free(nb_ids);
+    try cuda.memory.download(s.d, ids, nb_ids);
+    try std.Io.Dir.cwd().writeFile(s.io, .{
+        .sub_path = try std.fmt.bufPrint(&nb, "{s}/ids.u32", .{dir}),
+        .data = nb_ids,
+    });
+    const nb_val = try s.gpa.alloc(u8, nk * 4);
+    defer s.gpa.free(nb_val);
+    try cuda.memory.download(s.d, val, nb_val);
+    try std.Io.Dir.cwd().writeFile(s.io, .{
+        .sub_path = try std.fmt.bufPrint(&nb, "{s}/val.f32", .{dir}),
+        .data = nb_val,
+    });
+    const nc = rows * head_kcov;
+    const rb = try s.gpa.alloc(u8, nc * 4);
+    defer s.gpa.free(rb);
+    try cuda.memory.download(s.d, h.est.ids, rb);
+    try std.Io.Dir.cwd().writeFile(s.io, .{
+        .sub_path = try std.fmt.bufPrint(&nb, "{s}/rank_ids.u32", .{dir}),
+        .data = rb,
+    });
+    const sb = try s.gpa.alloc(u8, nc * 4);
+    defer s.gpa.free(sb);
+    try cuda.memory.download(s.d, h.est.resc, sb);
+    try std.Io.Dir.cwd().writeFile(s.io, .{
+        .sub_path = try std.fmt.bufPrint(&nb, "{s}/resc.f32", .{dir}),
+        .data = sb,
+    });
+}
+
+/// `TF_FLASHNEXT_LG_DUMP=<dir>`: the head's input rows and its fp32 logits for row 0, so the GEMM and
+/// the top-k can be checked apart from each other, on either arm (the fp8 arm's logits are its own
+/// table's, which is what makes the rank inspectable apart from the rescore). Off unless set.
+fn dumpHead(s: *Draft, x: u64, lg: u64, rows: usize) !void {
+    const c = s.c;
+    if (std.c.getenv("TF_FLASHNEXT_LG_DUMP")) |p| {
+        try s.stream.synchronize();
+        const dir = std.mem.span(p);
+        var nb1: [512]u8 = undefined;
+        var nb2: [512]u8 = undefined;
+        const hb = try s.gpa.alloc(u8, rows * c.hidden * 2);
+        defer s.gpa.free(hb);
+        try cuda.memory.download(s.d, x, hb);
+        const in_path = try std.fmt.bufPrint(&nb1, "{s}/head_in.bf16", .{dir});
+        try std.Io.Dir.cwd().writeFile(s.io, .{ .sub_path = in_path, .data = hb });
+        const lb = try s.gpa.alloc(u8, c.vocab * 4);
+        defer s.gpa.free(lb);
+        try cuda.memory.download(s.d, lg, lb);
+        const lg_path = try std.fmt.bufPrint(&nb2, "{s}/logits_r0.f32", .{dir});
+        try std.Io.Dir.cwd().writeFile(s.io, .{ .sub_path = lg_path, .data = lb });
     }
 }
 
@@ -2066,12 +2477,12 @@ test "a round's scratch is one block plus one context chunk, 256-byte aligned, a
     try std.testing.expectEqual(@as(u64, 512), b.unary - b.cand);
     try std.testing.expectEqual(@as(u64, 512), b.prop - b.unary);
     try std.testing.expectEqual(@as(u64, 256), b.err - b.prop);
-    // The head's first pass leaves `[tiles, rows, topk]` candidates behind — 243 tiles of 16 a row
-    // at the served shape, 213 KiB — and the second pass reads exactly that and nothing else. It is
+    // The head's first pass leaves `[tiles, rows, topk]` candidates behind — 31 tiles of 8,192 a row
+    // at the served shape, 27 KiB — and the second pass reads exactly that and nothing else. It is
     // the round's only table sized by the tile count, so its bytes move with `head_tile` alone.
     try std.testing.expectEqual(@as(u64, 256), b.part - b.err);
     try std.testing.expectEqual(headTiles(c) * (c.block - 1) * c.topk * 8 + (c.block - 1) * c.vocab * 4 + attentionPartials(c), total - @as(usize, @intCast(b.part - 4096)));
-    try std.testing.expectEqual(@as(usize, 243), headTiles(c));
+    try std.testing.expectEqual(@as(usize, 31), headTiles(c));
     // The split attention's partials trail the head's: a max and a sum a (line, chunk) — `[NCH, line]`
     // fp32 each — and the chunk's unnormalised output, `[NCH, line, head_dim]` fp32. At the served
     // shape 8 chunks x 256 lines: 8 KiB each of PM and PL, 1 MiB of PO.
@@ -2203,6 +2614,79 @@ test "the split attention's partial stride is the kernel's own NCH" {
     // and the two entries the launcher resolves are the ones the file defines
     try std.testing.expect(std.mem.indexOf(u8, src, "tf_fxd2_attn_split(") != null);
     try std.testing.expect(std.mem.indexOf(u8, src, "tf_fxd2_attn_split_merge(") != null);
+}
+
+test "the quantised head is taken only for TF_FLASHNEXT_HEAD_FP8=1 *and* a directory, never for one of them" {
+    // the shipped path: neither, and the head stays bf16
+    try std.testing.expect((try headFp8Choice(null, null)) == null);
+    // a stale/typo'd flag is off, exactly as TF_FLASHNEXT_ATTN_SPLIT is: "true", "0", "" and "yes"
+    // are all the shipped path
+    for ([_][]const u8{ "true", "0", "yes", "", " 1" }) |text| {
+        try std.testing.expect((try headFp8Choice(text, null)) == null);
+        try std.testing.expectError(error.HeadFp8FlagUnset, headFp8Choice(text, "/tmp/headfit/full1/rtn"));
+    }
+    // the one accepted form, and an empty directory is no directory
+    try std.testing.expectEqualStrings("/tmp/headfit/full1/rtn", (try headFp8Choice("1", "/tmp/headfit/full1/rtn")).?);
+    try std.testing.expectError(error.HeadFp8PathMissing, headFp8Choice("1", null));
+    try std.testing.expectError(error.HeadFp8PathMissing, headFp8Choice("1", ""));
+    // a path with the flag unset is refused, not read: the serving engine exporting the directory
+    // into a shell that forgot the flag must not silently rank through fp8
+    try std.testing.expectError(error.HeadFp8FlagUnset, headFp8Choice(null, "/tmp/headfit/full1/rtn"));
+}
+
+test "the quantised head's staging is 112 KiB at the served shape, and every table is 256-byte aligned" {
+    const c = try draft2.parse(std.testing.allocator, served_json, testTarget());
+    const total = try headStageBytes(c);
+    try std.testing.expectEqual(total, try placeHead(c, 0, null));
+    var b: HeadStage = undefined;
+    _ = try placeHead(c, 4096, &b);
+    inline for (@typeInfo(HeadStage).@"struct".field_names) |name| {
+        const at = @field(b, name) - 4096;
+        try std.testing.expect(at % 256 == 0);
+        try std.testing.expect(at < total);
+    }
+    // 31 tiles (248,320 / 8,192) x 7 rows x 64 candidates x 8 bytes of packed {logit, id}, then the
+    // ids and the exact scores, 7 x 64 x 4 each
+    try std.testing.expectEqual(@as(usize, 31), headTiles(c));
+    try std.testing.expectEqual(@as(u64, 31 * 7 * 64 * 8), b.ids - b.part);
+    try std.testing.expectEqual(@as(u64, 7 * 64 * 4), b.resc - b.ids);
+    try std.testing.expectEqual(@as(u64, 31 * 7 * 64 * 8 + 2 * 7 * 64 * 4), @as(u64, @intCast(total)));
+    try std.testing.expect(total <= 128 << 10);
+    // the merge's padded width: the smallest power of two at least tiles * kcov, and it is what the
+    // kernel's bitonic sort needs — 2,048 at the served shape, 16 KiB of shared
+    try std.testing.expectEqual(@as(usize, 2048), headSlots(c));
+    try std.testing.expectEqual(@as(usize, 0), headSlots(c) & (headSlots(c) - 1));
+    try std.testing.expect(headSlots(c) >= headTiles(c) * head_kcov);
+    try std.testing.expectEqual(@as(usize, 0), head_kcov & (head_kcov - 1));
+    try std.testing.expectEqual(@as(usize, 0), head_tile & (head_tile - 1));
+    // the rank's shared plane is 64 KiB — past the default 48 KiB a dynamic launch may ask for, which
+    // is why `HeadFp8.load` sets the attribute; the other two are inside it
+    try std.testing.expect(head_tile * 8 > 48 * 1024);
+    try std.testing.expect(headSlots(c) * 8 <= 48 * 1024);
+    try std.testing.expect(head_kcov * 8 <= 48 * 1024);
+    // and the whole arm's device bill: 636 MB of codes, 39.7 MB of scale tiles, 112 KiB of staging
+    const arm = try HeadFp8.bytes(c);
+    try std.testing.expectEqual(@as(usize, vocab * hidden), arm - 39_731_200 - total);
+    try std.testing.expect(arm < (700 << 20));
+}
+
+test "the quantised head's four entries are the ones the file defines" {
+    // The names `HeadFp8.load` resolves, and the widths it launches: a rename in the source is a
+    // driver-level "entry not found" at load, which is late — this is the cheap place to catch it.
+    const src = @embedFile("../../../kernels/cuda/draft2_head_fp8.cu");
+    for ([_][]const u8{
+        "tf_fxd2_rank_tile(",
+        "tf_fxd2_rank_merge(",
+        "tf_fxd2_rescore(",
+        "tf_fxd2_rescore_top(",
+    }) |name| try std.testing.expect(std.mem.indexOf(u8, src, name) != null);
+    // the rescore is one thread an id with an ascending-K fma chain — the property the exactness
+    // comment in that file rests on, and the one thing a "simplification" to a strided or tree sum
+    // would quietly break
+    try std.testing.expect(std.mem.indexOf(u8, src, "for (int k = 0; k < K; ++k) s = fmaf(") != null);
+    // and the rank path passes only the fp8 table and the caller's bf16 rows: no second copy of the
+    // head is read, which is what keeps the arm's residency at 675 MB on top of the one it replaced
+    try std.testing.expect(std.mem.indexOf(u8, src, "HEAD + (size_t)id") != null);
 }
 
 test {

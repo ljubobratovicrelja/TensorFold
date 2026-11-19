@@ -54,6 +54,9 @@ const Stream = lanes.Stream;
 
 /// The weights' precision, re-exported from the forward (`bf16` as published, or weight-only fp8).
 pub const Precision = fwd.Precision;
+/// `TF_FLASHNEXT_HEAD_FP8_DIR`, re-exported so a family that opens a drafter does not have to reach
+/// into the forward module to name the head's artifact (`fwd.Target.head_fp8`).
+pub const headFp8DirFromEnv = fwd.headFp8DirFromEnv;
 
 /// The drafter's block: the anchor's row and `block - 1` proposals beside it.
 pub const block = fwd.block;
@@ -151,7 +154,9 @@ pub const Opening = struct {
     /// The MTP head. flashnext's window verify rewinds through `mtp.Draft`, so a drafted window of
     /// more than one row needs it; DFlash2 asks for seven.
     head: bool = true,
-    /// The head's bf16 tiles: the drafter's own `tf_fxd2_head_topk` reads row-major rows.
+    /// The head's bf16 tiles: the drafter reads row-major rows — the shipped path's `tf_fxd2_head_topk`
+    /// directly, and `TF_FLASHNEXT_HEAD_FP8`'s rescore for the ids its rank nominated. A quantized
+    /// engine head is refused on both arms; the flag swaps the table the *rank* reads, not this one.
     head_bf16: bool = true,
     /// The embedding table, dense: a round's block starts from the target's rows.
     embed_dense: bool = true,

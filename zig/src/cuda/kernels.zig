@@ -77,6 +77,7 @@ pub const train: []const u8 = if (available) &Blob("fatbin_train").bytes else &.
 pub const qwen35: []const u8 = if (available) &Blob("fatbin_qwen35").bytes else &.{};
 pub const qwen35_draft: []const u8 = if (available) &Blob("fatbin_qwen35_draft").bytes else &.{};
 pub const draft2_attn_split: []const u8 = if (available) &Blob("fatbin_draft2_attn_split").bytes else &.{};
+pub const draft2_head_fp8: []const u8 = if (available) &Blob("fatbin_draft2_head_fp8").bytes else &.{};
 pub const qwen35_keep: []const u8 = if (available) &Blob("fatbin_qwen35_keep").bytes else &.{};
 pub const joint_schema: []const u8 = if (available) &Blob("fatbin_joint_schema").bytes else &.{};
 pub const qwen_vision: []const u8 = if (available) &Blob("fatbin_qwen_vision").bytes else &.{};

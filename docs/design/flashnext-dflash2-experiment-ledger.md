@@ -383,3 +383,42 @@ Three findings, in order of how much they change the plan:
 Not yet servable: `draft_check.zig` requires `lm_head.weight` bf16 and `cuda_drafter2.zig` raises
 `Draft2HeadNotBf16`; the block-128 fp8 `takeFp8`/`projQ`/`lane.matmulF32` path exists, but the per-round
 gather of 64 bf16 head rows for the rescore is new. That plumbing is the next commit, not this one.
+
+## §12 The fp8 head is exact offline and wrong in service (2026-11-19)
+
+**One session, five arms, `draft-check --repeat 15`, cold rep excluded, medians of 14** (`/tmp/arms/*`, plot `/tmp/prof/arms_all.png`):
+
+| arm | round | attn | head |
+|---|---|---|---|
+| fp8 body (datum) | **16.31 ms** | 3.76 | 6.97 |
+| + affine4 body | 15.45 | 3.78 | 6.97 |
+| + split-KV attention | 12.60 | **1.00** | 6.97 |
+| + block-FP8 head + bf16 rescore | 12.20 | 3.78 | **3.66** |
+| + both | **9.22 ms** | 1.00 | 3.66 |
+
+The two wins are additive: the drafter round drops 43.5% (16.31 → 9.22 ms). The head's own saving is 6.92 → 3.65 ms, matching the roofline (1.27 GB → 636 MB at the wall) rather than the 3.42 ms predicted from the microbenchmark. The attention collateral slowdown seen on the fp8 body does **not** appear on affine4 in this session.
+
+**Offline the fp8 head is exact**: `logits_top16_ids` is identical to the bf16 arm *as an ordered list*, row for row, in every rep compared.
+
+**The first served run was a disaster, and the cause was a sign error.** 16 GSM8K prompts, 1024 tokens, one `:8099` server per arm:
+
+| arm | accept | tok/s | mean round | rate |
+|---|---|---|---|---|
+| fp8 (datum) | 3.341 | 49.7 | 71.0 ms | 0.547 |
+| affine4 + split attn | 3.323 | 49.4 | 71.0 ms | 0.537 |
+| affine4 + split attn + fp8 head | **1.050** | **22.8** | 47.6 ms | **0.120** |
+
+`key_value()` in `draft2_head_fp8.cu` returned `ordered(v)` — the order-preserving u32 — instead of inverting it. For a positive logit `ordered(v)` is the same bits with the sign bit set, which *is* `-v`, so every value `tf_fxd2_rescore_top` handed the selector was negated while the id list stayed correct: the walk picked the worst candidate at every slot. `draft-check` hid it because the offline checks compared `logits_top16_ids` — an ordered id list, which was exact — and never the `val` table; the proposal divergence seen in 15/15 reps was this bug, not the numerical chaos it was filed under.
+
+Fix (`o = 0xFFFFFFFF - key>>32; return __uint_as_float((o & 0x80000000) ? (o & 0x7FFFFFFF) : ~o)`): after it, `draft-check` proposals are **identical to the attention-only arm in 15/15 reps**, and the served arm is:
+
+| arm | accept | tok/s | mean round |
+|---|---|---|---|
+| fp8 (datum) | 3.281 | 48.2 | 72.0 ms |
+| affine4 + split attn + fp8 head (fixed) | 3.305 | **51.7** | **67.4 ms** |
+
+Paired tok/s **+3.53 [+2.14, +4.91] = +7.25% CI [+4.31%, +10.19%]**, accept −0.74% CI [−3.58%, +2.10%] (null, as the lossless claim requires), and **16/16 completions bit-identical to the fp8 arm**.
+
+Lesson for the ledger: an id-level fidelity check is not a head check. Dump the value table the selector consumes (`TF_FLASHNEXT_HEAD_DUMP`) and compare *that*; a rank that orders correctly with negated scores passes every id-set test.
+
+Also worth recording: on affine4 the split-attention gain is **not** reproduced — +0.56% CI [−1.48%, +2.59%] against fp8 here, where the earlier affine4-vs-affine4 A/B gave +2.49% CI [+0.22%, +4.77%]. Treat the attention served effect as 0–2.5%, not 2.5%.

@@ -184,7 +184,12 @@ pub fn run(
     defer head.free();
 
     // 2. the drafter itself: the served checkpoint, its 81 tensors, its five layers' rings
-    const d = try fwd.Draft.open(gpa, io, driver, stream, dir, targetConfig(), .{ .embed = m.embed, .head = head.ptr }, null);
+    const target: fwd.Target = .{
+        .embed = m.embed,
+        .head = head.ptr,
+        .head_fp8 = fwd.headFp8DirFromEnv(),
+    };
+    const d = try fwd.Draft.open(gpa, io, driver, stream, dir, targetConfig(), target, null);
     defer d.deinit();
     var st = try d.create();
     defer st.deinit();
@@ -419,7 +424,19 @@ fn runFixture(
     m: Model,
     fx_dir: []const u8,
 ) !void {
-    return runFixtureAt(gpa, io, driver, stream, dir, m, fx_dir, stageDirFromEnv() orelse return error.DraftCheckNoStageDir, 0, null);
+    return runFixtureAt(
+        gpa,
+        io,
+        driver,
+        stream,
+        dir,
+        m,
+        fx_dir,
+        stageDirFromEnv() orelse return error.DraftCheckNoStageDir,
+        0,
+        null,
+        fwd.headFp8DirFromEnv(),
+    );
 }
 
 /// `runFixture` with the destination named by the caller rather than `TF_FLASHNEXT_DRAFT_STAGES`,
@@ -437,6 +454,9 @@ pub fn runFixtureAt(
     reps: usize,
     /// The weights' precision, or null for the checkpoint's own (see `fwd.Precision`).
     want: ?fwd.Precision,
+    /// The quantised head's directory (`--head-fp8`), or null: only read under
+    /// `TF_FLASHNEXT_HEAD_FP8=1`, and a directory without the flag is refused at `open`.
+    head_fp8: ?[]const u8,
 ) !void {
     if (!draft2.declared(gpa, io, dir)) return error.DraftCheckNotADrafter;
     try checkModel(m);
@@ -457,7 +477,8 @@ pub fn runFixtureAt(
     defer head.free();
 
     // 2. the drafter itself, exactly as a serving engine opens it
-    const d = try fwd.Draft.open(gpa, io, driver, stream, dir, targetConfig(), .{ .embed = m.embed, .head = head.ptr }, want);
+    const target: fwd.Target = .{ .embed = m.embed, .head = head.ptr, .head_fp8 = head_fp8 };
+    const d = try fwd.Draft.open(gpa, io, driver, stream, dir, targetConfig(), target, want);
     defer d.deinit();
     if (d.c.mask != mask_token) return error.FixtureMaskMismatch;
 
