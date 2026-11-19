@@ -478,3 +478,16 @@ Two things nobody had measured before this run:
 - **The target's own head is 5.29 ms of a 47.6 ms pass (11.3%)** — the same stage we spent the day quantising in the *drafter* is the fourth-largest item in the target and is still bf16 here.
 
 Caveats, stated rather than buried: rows vary per pass (2–8), so the mix is a sample of the served distribution rather than one fixed shape; the profiler adds 387 event records and one synchronise per pass, so absolute values are ≤1–2% high; the plot is `plot_stages.py /tmp/lt` and its title still says "DFlash2 drafter" — the artifact is the target, only the plotter's default title is stale.
+
+## 15. MTP against the optimized drafter, same session (2026-11-19 07:1x)
+
+The first same-corpus pairing of the built-in MTP arm against the combined drafter. 16 harness prompts, `max_tokens 1024`, `--parallel 1 --context 16384 --kv-cache fp8`, one `:8099` server per arm, MTP with no `--drafter` (`/tmp/abmtp`).
+
+| arm | tok/s | accept | accepted/draft | drafts/round | round | outputs |
+|---|---:|---:|---:|---:|---:|---|
+| MTP (built-in) | 54.5 | 3.505 | **0.648** | 3.81 | 65.0 ms | 16/16 identical |
+| optimized drafter | 53.9 | 3.307 | **0.543** | 4.29 | 64.8 ms | |
+
+Paired: tok/s **−0.61 [−2.43, +1.20] = −1.1% CI [−4.5%, +2.3%]** (parity); acceptance length **−0.198 CI [−0.340, −0.056]** (a real deficit, and the only one).
+
+Read it as: the round is now the same length as MTP's (64.8 vs 65.0 ms) and MTP converts its drafts better — 0.648 against our 0.543 — while ours offers more of them (4.29 vs 3.81). Those two effects cancel into throughput parity. Everything the drafter work bought has been spent getting the round to MTP length; the remaining gap is per-draft quality, i.e. the 603M checkpoint and its training corpus, not the engine. Note also that the two arms tie on `accept_len`'s *product*, so any further acceptance work shows up directly in tok/s.
