@@ -21,6 +21,7 @@ const ops = @import("cuda_batch_ops.zig");
 const split_lane = @import("cuda_split_lane.zig");
 const tapring = @import("cuda_tap_ring.zig");
 const layer_time = @import("cuda_layer_time.zig");
+const probe = @import("cuda_probe.zig");
 
 const layers_n = wt.layers_n;
 const linear_n = wt.linear_n;
@@ -114,6 +115,9 @@ pub fn Pass(comptime Tri: type) type {
         /// TF_FLASHNEXT_LAYER_TIME: this pass's event pool, the engine's (cuda_layer_time.zig). Null, every
         /// boundary in the loop below is a null check and nothing is recorded, allocated or synchronised.
         clock: ?*layer_time.Clock = null,
+        /// TF_FLASHNEXT_EXPERT_DUMP / _HIDDEN_DUMP: this engine's captures (cuda_probe.zig). Null, every
+        /// site below is a null check: no copy, no allocation, no read-back.
+        probe: ?*probe.Probes = null,
         rows: usize = 0,
         pos0: usize = 0,
         /// The MoE write-back the next layer (or the head) applies first, and the layer it came from.
@@ -588,6 +592,12 @@ pub fn Pass(comptime Tri: type) type {
                 std.debug.print("batch: {d} rows at {d} in {d:.1} ms\n", .{ n, pos0, @as(f64, @floatFromInt(std.Io.Clock.awake.now(self.io).toNanoseconds() - t0)) / 1e6 });
             };
             if (n == 0 or n > s.cap) return error.UnexpectedTensor;
+            // A probe read-back synchronises the stream at the pass's end, which a capture cannot hold:
+            // refused here, before the first copy, as cuda_layer_time.zig refuses its events.
+            if (self.probe != null and (cuda.graph.captureStatus(self.stream) catch .active) != .none) {
+                std.debug.print("probe: refused: the pass's stream is inside a CUDA graph capture; set TF_FLASHNEXT_WINDOW_GRAPH=0\n", .{});
+                return error.ProbeInCapture;
+            }
             if (self.lanes.len > 0) {
                 // shared rounds read every row's scores; a lane keeps its own rollback and hidden rows, nothing else
                 if (self.hooks.logits != .all or self.hooks.keep != null or self.hooks.streams != 0 or self.hooks.moe_add != null) return error.UnexpectedTensor;
@@ -671,6 +681,10 @@ pub fn Pass(comptime Tri: type) type {
                     try self.readoutKeep(lw.mlp_hc, 0, n, keep.mlp_hc);
                 }
                 try self.moeBlockKeep(lw, keep);
+                // TF_FLASHNEXT_EXPERT_DUMP / _HIDDEN_DUMP: this layer's picks and weights are in the
+                // scratch now and its MoE input (`mixed`) is still the row the MoE read; both are
+                // copied here, device to device, before the next layer overwrites them.
+                if (self.probe) |pr| pr.moeLayer(self.stream, s.mixed, s.picks, s.wts, s.router_l, layer, n);
                 if (self.clock) |c| try c.stage(.moe_out);
                 try self.moeAdds(layer, keep);
                 // A tapped layer's output is copied out here, while `s.h` still holds it: the next
@@ -683,6 +697,8 @@ pub fn Pass(comptime Tri: type) type {
             try self.head(logits_host);
             // a report that fails (a driver error on the events, an allocation) never fails the pass
             if (self.clock) |c| c.finish() catch |err| std.debug.print("layer_time: the report failed ({s})\n", .{@errorName(err)});
+            // One read-back a pass, after the head: the captures' device buffers hold this pass's rows.
+            if (self.probe) |pr| pr.afterPass(self.stream, n, pos0);
         }
 
         pub fn complete(self: *Self) !void {

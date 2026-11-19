@@ -44,3 +44,7 @@ tools/dflash2/runs/
 
 # the plotting tool's own venv (matplotlib is not a repo dependency)
 .venv-plot/
+
+# activation-probe dumps are evidence, not source: regenerate with collect_task.py
+docs/design/activation-probing/data/
+docs/design/activation-probing/logs/

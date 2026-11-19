@@ -12,6 +12,7 @@ const chunks = @import("cuda_chunk.zig");
 const tapdump = @import("cuda_tap_dump.zig");
 const draftcheck = @import("cuda_draft2_check.zig");
 const layer_time = @import("cuda_layer_time.zig");
+const Probe = @import("cuda_probe.zig");
 const layers_n = weights.layers_n;
 const linear_n = weights.linear_n;
 const attn_n = weights.attn_n;
@@ -138,6 +139,9 @@ pub const Engine = struct {
     /// engine's life (cuda_layer_time.zig). Null unless a flag asks for it, so the unset path has no
     /// events, no allocation and no synchronise; a pass only branches on a null `Pass.clock`.
     layer_clock: ?layer_time.Clock = null,
+    /// TF_FLASHNEXT_EXPERT_DUMP / TF_FLASHNEXT_HIDDEN_DUMP: this engine's captures (cuda_probe.zig),
+    /// made once at init for the whole serving life. Null unless a flag names a directory.
+    probe: ?@import("cuda_probe.zig").Probes = null,
     graphs: @import("cuda_window_graph.zig").Graphs = .{}, // drafted windows, draft-head pieces, rollbacks on one GPU
     image_factory: ?*@import("cuda_images.zig").Vision = null,
     collective: ?*@import("cuda_collective.zig").Collective = null,
@@ -163,6 +167,7 @@ pub const Engine = struct {
         e.n_layers = 0;
         e.collective = null;
         e.layer_clock = null;
+        e.probe = null;
         e.image_factory = null;
         e.round_graph = .{};
         e.graphs = .{};
@@ -231,10 +236,14 @@ pub const Engine = struct {
         e.busy_chunk = busy;
         // TF_FLASHNEXT_LAYER_TIME/_DUMP: the pass's event pool, made once here rather than on the pass's path
         if (layer_time.wanted()) e.layer_clock = try layer_time.Clock.init(gpa, io, driver, layers_n);
+        // TF_FLASHNEXT_EXPERT_DUMP / _HIDDEN_DUMP: the routing and hidden captures, made once here so a
+        // pass only branches on a null `Pass.probe`; a full disk fails boot, not a reply.
+        if (Probe.wanted()) e.probe = try Probe.Probes.init(gpa, io, driver, stream.*, chunk, layers_n, dims, slots, experts_n);
         return e;
     }
 
     pub fn deinit(e: *Engine) void {
+        if (e.probe) |*p| p.deinit();
         if (e.layer_clock) |*c| c.deinit();
         e.round_graph.clear();
         e.graphs.clear(e.gpa);
@@ -425,6 +434,7 @@ pub const Engine = struct {
             .seq = seq.view(scores),
             .hooks = hk,
             .clock = if (e.layer_clock) |*c| c else null,
+            .probe = if (e.probe) |*p| p else null,
         };
         if (capture == null) {
             // TF_FLASHNEXT_LAYER_TIME records events on the pass's own stream, which a capture cannot hold
@@ -523,6 +533,7 @@ pub const Engine = struct {
                 .tap_source = tap.tap_source,
             },
             .clock = if (e.layer_clock) |*c| c else null,
+            .probe = if (e.probe) |*p| p else null,
         };
         const has_media = for (seqs) |q| {
             if (q.media != null) break true;
