@@ -1,6 +1,6 @@
 # docs/design — index
 
-This worktree is a private TensorFold fork (branch `dflash2`) implementing DFlash2 speculative decoding
+This worktree is a private TensorFold fork (branch `running`) implementing DFlash2 speculative decoding
 for `Qwen3.8-Flash-Next-FP4-Local` on a DGX Spark (GB10). DFlash2 is a 5-layer drafter that cross-attends
 to five target-layer hidden-state taps and drafts a block of 8 rows (7 proposals), which the target
 verifies; verification makes output lossless, so only acceptance length and round cost matter.
@@ -55,6 +55,7 @@ the negative results cost real time; but only one of them describes the current 
 | `flashnext-dflash2-drafter.md` | The original feasibility and integration plan: 9 steps from tap measurement to two-path E2E, the step table and what each produced, the dead ends (torch reference route, OOM sizes), and the checkpoint facts read off the file rather than the card. | **HISTORY** (the step table describes a state before the port ran) |
 | `flashnext-dflash2-kernels.md` | Kernel spec for the flashnext drafter: which `qwen35_draft.cu` kernels are reusable unchanged and with what arguments, and the geometry/arithmetic for the new ones (`tf_fxd2_fuse`, layer QKV step, bidirectional block attention, selector). | **REFERENCE** |
 | `flashnext-dflash2-tap-ring.md` | The tap ring contract: five layer outputs, one row a layer, slot `p % rows`, 50.4 MiB a stream; where in the batched pass the write belongs; and the silent-failure table (a ring not carried by a state drafts from stale rows and only shows as an unexplainable speed number). | **REFERENCE** (the `TapSource` question it defers is settled: `mean4`) |
+| `flashnext-build-and-test-traps.md` | Toolchain notes: the two build graphs and why `-Dgpu` erases the `test` step, judging a run by `TEST_RC`, tests that never get collected, stale fatbins and the `.zig-cache` recovery, Zig 0.17 std changes, module boundaries, timers around async launches, and the `libtfgrammar` build step. | **REFERENCE** |
 | `fluid-subgraph-residency.md` | Repo-level design for Fluid Subgraph Residency (Tier-E exact path, MoE larger than memory, Metal on Flash Next). Not part of the DFlash2 work. | **REFERENCE** |
 
 ## Read in this order
