@@ -68,3 +68,61 @@ throughput null with identical outputs is a failed experiment, not a win.
    commit.
 3. `hc_fp8` on top of a passing `head_fp8`: same pipeline.
 4. Consolidated plot: per-prompt throughput overlay and a stage table, from the committed JSONs.
+
+## Results
+
+All autoregressive numbers below are the same 16 public GSM8K prompts, 1024 new tokens, thinking off,
+one `:8099` server per arm, paired per prompt against a control run on the same box.
+
+### Arm 1 — FP8 e4m3 `lm_head`, kept
+
+| | baseline | head_fp8 |
+|---|---:|---:|
+| tok/s mean | 24.74 | 26.37 |
+| head stage | 5.28 ms | 3.12 ms |
+| outputs | — | 16/16 byte-identical |
+| graded | 8/8 | 8/8 |
+
+Paired difference **+1.63 tok/s [+1.47, +1.79] = +6.59% [+5.96, +7.22]**. The stage halved as the bytes
+halved; the residual 0.48 ms over the ideal 2.64 ms is the rank, gather, top-64 rescore and cast.
+Quantisation: per-row relative L2 2.64% (p99 2.76%), 0.057% saturated codes, no NaN. Artifact pinned in
+`runs/ar/head_fp8.artifact.json`, blob gitignored.
+
+### Arm 2 — FP8 e4m3 hyper-connections, rejected
+
+Same-session pair: 24.57 → 24.42 tok/s, −0.60% [−0.78, −0.43]. A drift control — the *unmodified*
+source measured twice in different sessions — reads −0.68% with 16/16 identical outputs, so the arm's
+real effect is **0.0 ± 0.2%**. Matched stage capture at rows=1: `conv_attn_in` 4.66 → 4.86,
+`conv_mlp_in` 4.95 → 4.78, net +0.03 ms. Those stages are not bandwidth-bound at this row count, so
+removing 42% of their bytes removed nothing. It also changes 12 of 16 outputs: fidelity spent for
+nothing. Kept behind `TF_FLASHNEXT_HC_FP8`, off by default.
+
+**The rule this pair establishes: quantisation pays only where a stage is already at the wall.** The
+head was (240 GB/s of ~234 achievable); the hyper-connection stages were not (73–131 GB/s, which is a
+latency number, not a traffic number).
+
+### The head arm with the DFlash2 drafter
+
+The point of the exercise: the drafter scores its candidates through the *target's* head, so the head is
+the one stage both models pay for. With `TF_FLASHNEXT_LMHEAD_FP8` plus the affine4 body, split-KV
+attention and block-FP8 drafter head:
+
+| | t1_ar | t1_drafter |
+|---|---:|---:|
+| tok/s mean | 25.49 | **62.82** |
+| accept / draft | — | 0.642 (5,936/9,245) |
+| outputs | — | 16/16 byte-identical to AR |
+| graded | 8/8 | 8/8 |
+
+Paired **+37.33 tok/s [+33.74, +40.92] = +146% [+132, +161]**. This is with thinking off, so the answers
+are short and the round count low; it is not the production number, but it is the clean statement that
+the head change composes with the drafter instead of competing with it.
+
+Two harness facts discovered on the way, both now encoded in `ar_run.sh`:
+
+- `--no-drafts` disables an external `--drafter` as well (`cuda_drafter_open.zig`'s predicate), so a
+  drafter arm must leave drafting on (`AR_DRAFTS=1`).
+- The engine proposes **no drafts at all for greedy non-thinking requests** (`accepted=0/0`, one token
+  per round); speculation engages only at temperature > 0. Drafter arms are therefore sampled
+  (`--temperature 1.0 --top-p 0.95 --top-k 20`, seeded per prompt), and the AR control is run at the
+  same sampling so the pair stays comparable.
