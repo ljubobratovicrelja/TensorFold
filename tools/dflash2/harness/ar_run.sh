@@ -31,7 +31,8 @@ for i in $(seq 1 120); do
 done
 curl -s -m 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1 || { echo "never became ready" >&2; tail -20 "$LOG/serve.log" >&2; exit 1; }
 
-python3 "$(dirname "$0")/ar_bench.py" --arm "$arm" --log "$LOG/serve.log" --out "$out"
+python3 "$(dirname "$0")/ar_bench.py" --arm "$arm" --log "$LOG/serve.log" --out "$out" \
+  --max-tokens "${MAX_TOKENS:-1024}"
 rc=$?
 
 kill "$(cat "$PIDFILE")" 2>/dev/null

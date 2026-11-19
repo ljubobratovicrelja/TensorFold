@@ -93,7 +93,7 @@ def main():
                                                       "prompts/gsm8k_16.json"))
     ap.add_argument("--gold", default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                    "prompts/gsm8k_gold.json"))
-    ap.add_argument("--max-tokens", type=int, default=512)
+    ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--log", default="")
     ap.add_argument("--out", required=True)
