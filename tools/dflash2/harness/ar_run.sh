@@ -20,8 +20,13 @@ if curl -s -m 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then
 fi
 [ -x "$BIN" ] || { echo "no binary at $BIN — build first" >&2; exit 2; }
 
+# AR_DRAFTS=1 leaves drafting on, which is the only way an external --drafter engages:
+# cuda_drafter_open.zig's openDrafter is reached "only when the server was given --drafter and
+# drafts are on". With it off the DFlash2 path never loads and MTP stays as it was.
+draft_flags=()
+[ "${AR_DRAFTS:-0}" = "1" ] || draft_flags+=(--no-drafts)
 "$BIN" serve "$CKPT" --host 127.0.0.1 --port "$PORT" --name qwen3.8-flash-next \
-  --context 16384 --parallel 1 --kv-cache fp8 --no-drafts "$@" > "$LOG/serve.log" 2>&1 &
+  --context 16384 --parallel 1 --kv-cache fp8 "${draft_flags[@]}" "$@" > "$LOG/serve.log" 2>&1 &
 echo $! > "$PIDFILE"
 
 for i in $(seq 1 120); do
@@ -32,7 +37,7 @@ done
 curl -s -m 2 "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1 || { echo "never became ready" >&2; tail -20 "$LOG/serve.log" >&2; exit 1; }
 
 python3 "$(dirname "$0")/ar_bench.py" --arm "$arm" --log "$LOG/serve.log" --out "$out" \
-  --max-tokens "${MAX_TOKENS:-1024}"
+  --max-tokens "${MAX_TOKENS:-1024}" ${BENCH_ARGS:-}
 rc=$?
 
 kill "$(cat "$PIDFILE")" 2>/dev/null

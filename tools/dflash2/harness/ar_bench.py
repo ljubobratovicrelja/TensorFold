@@ -37,14 +37,16 @@ BOXED = re.compile(r"\\boxed\{([^}]*)\}")
 NUM = re.compile(r"-?\d+(?:[\.,]\d+)?")
 
 
-def post(base, prompt, max_tokens, seed):
+def post(base, prompt, max_tokens, seed, temperature, top_p, top_k, draft):
     body = {
         "model": MODEL,
         "messages": [{"role": "user", "content": prompt}],
         "max_tokens": max_tokens,
-        "temperature": 0.0,
+        "temperature": temperature,
+        "top_p": top_p,
+        "top_k": top_k,
         "seed": seed,
-        "draft": False,
+        "draft": draft,
         "chat_template_kwargs": {"enable_thinking": False},
     }
     req = urllib.request.Request(
@@ -95,6 +97,10 @@ def main():
                                                    "prompts/gsm8k_gold.json"))
     ap.add_argument("--max-tokens", type=int, default=1024)
     ap.add_argument("--limit", type=int, default=0)
+    ap.add_argument("--temperature", type=float, default=0.0)
+    ap.add_argument("--top-p", dest="top_p", type=float, default=1.0)
+    ap.add_argument("--top-k", dest="top_k", type=int, default=0)
+    ap.add_argument("--draft", action="store_true", help="let the server draft (needs a drafter or MTP)")
     ap.add_argument("--log", default="")
     ap.add_argument("--out")
     ap.add_argument("--compare", nargs=2)
@@ -116,7 +122,7 @@ def main():
 
     rows, t_start = [], time.time()
     for i, pr in enumerate(prompts):
-        body, wall = post(a.base, pr, a.max_tokens, seed=1234 + i)
+        body, wall = post(a.base, pr, a.max_tokens, seed=1234 + i, temperature=a.temperature, top_p=a.top_p, top_k=a.top_k, draft=a.draft)
         text = (body.get("choices") or [{}])[0].get("message", {}).get("content") or ""
         usage = body.get("usage") or {}
         toks = usage.get("completion_tokens")
@@ -147,8 +153,9 @@ def main():
         "arm": a.arm,
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "source_rev": rev,
-        "config": {"model": MODEL, "max_tokens": a.max_tokens, "temperature": 0.0,
-                   "draft": False, "drafter": None, "prompts": os.path.basename(a.prompts),
+        "config": {"model": MODEL, "max_tokens": a.max_tokens,
+                   "draft": a.draft, "temperature": a.temperature,
+                   "top_p": a.top_p, "top_k": a.top_k, "prompts": os.path.basename(a.prompts),
                    "thinking": False},
         "aggregate": {
             "prompts": len(rows),
