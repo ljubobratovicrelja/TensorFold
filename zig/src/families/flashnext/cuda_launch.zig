@@ -582,6 +582,12 @@ test {
     _ = @import("cuda_head_fp8.zig");
 }
 
+// TF_FLASHNEXT_HC_FP8's flag, its per-layer prefix match and its file names: same reason, and the
+// prefix match is the one that decides whether the MTP's branches are read as layer 0.
+test {
+    _ = @import("cuda_hc_fp8.zig");
+}
+
 // A module reached only through an unreferenced `pub const` never has its test blocks collected, so
 // the DFlash2 drafter's selector-walk equivalence is anchored here rather than being silently skipped.
 test {

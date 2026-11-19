@@ -51,6 +51,7 @@ def main():
     ax1.legend(fontsize=9, loc="lower right")
 
     if len(arms) > 1:
+        span = []
         for k in range(1, len(arms)):
             name, _, rows = arms[k]
             delta = [rows[i]["tok_s"] - base_rows[i]["tok_s"] for i in idx]
@@ -59,13 +60,17 @@ def main():
             se = sd / len(delta) ** 0.5
             h = t975(len(delta)) * se
             ax2.bar([k - 1], [m], width=0.5, color=colours[k % 4], yerr=[h], capsize=6)
+            span += [m - h, m + h]
             ax2.text(k - 1, m / 2, f"{m:+.2f} tok/s\n{100*m/statistics.mean([base_rows[i]['tok_s'] for i in idx]):+.2f}%",
                      ha="center", va="center", fontsize=11, color="white", fontweight="bold")
+        ax2.set_xlim(-0.7, max(0.7, len(arms) - 1.4))
         ax2.set_xticks(range(len(arms) - 1))
         ax2.set_xticklabels([f"{n}\nvs {base_name}" for n, _, _ in arms[1:]])
         ax2.axhline(0, color="k", lw=0.8)
         ax2.set_ylabel("paired difference, tok/s")
-        ax2.set_ylim(0, max(1e-6, max(m + h for m, h in [(m, h)]) ) * 1.0)
+        lo, hi = min(span + [0.0]), max(span + [0.0])
+        pad = max(0.15 * (hi - lo), 0.02)
+        ax2.set_ylim(lo - pad, hi + pad)
         ax2.set_title("Paired difference (95% t-interval)")
 
     if a.note:

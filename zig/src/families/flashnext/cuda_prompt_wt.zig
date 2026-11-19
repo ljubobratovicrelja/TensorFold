@@ -342,6 +342,7 @@ pub const Face = struct {
 };
 
 pub const Q4 = @import("cuda_projection.zig").Projection;
+const HcFp8 = @import("cuda_hc_fp8.zig").Pair;
 
 pub const HcW = struct {
     scale: cuda.DeviceBuffer,
@@ -349,11 +350,17 @@ pub const HcW = struct {
     up: Q4,
     n_down: usize,
     has_inj: usize,
+    /// TF_FLASHNEXT_HC_FP8: this branch's two input-mix tables as FP8 e4m3 (`cuda_hc_fp8.zig`). Null
+    /// unless the flag names an artifact, and then `down`/`up` are empty: the bf16 matrices are not
+    /// loaded at all, and the read-out takes its FP8 branch on this field
+    /// (`cuda_batch_hc.readoutNative`, `cuda_batch.readoutKeep`, `cuda_batch_hc.fuses`).
+    fp8: ?HcFp8 = null,
 
     pub fn free(self: *HcW) void {
         self.scale.free();
         self.down.free();
         self.up.free();
+        if (self.fp8) |*p| p.free();
     }
 };
 
@@ -473,6 +480,11 @@ pub fn join3(gpa: std.mem.Allocator, store: *Store, buf: []u8, prefix: []const u
 }
 
 pub fn loadHc(gpa: std.mem.Allocator, driver: *cuda.Driver, store: *Store, prefix: []const u8, inject: bool) !HcW {
+    // TF_FLASHNEXT_HC_FP8: a per-layer branch's two input mixes from the artifact, not from the
+    // checkpoint. Decided before the dtype probe so the bf16 matrices are never read, let alone
+    // uploaded -- the read-out mixers and the MTP's branches do not match `spec` and load as shipped.
+    if (@import("cuda_hc_fp8.zig").dirFromEnv()) |dir| if (@import("cuda_hc_fp8.zig").spec(prefix)) |arm|
+        return loadFp8Hc(gpa, driver, store, dir, arm, prefix, inject);
     var buf: [180]u8 = undefined;
     const down_name = try std.fmt.bufPrint(&buf, "{s}.input_mix_weight_down.weight", .{prefix});
     const down_tensor = try store.tensor(down_name);
@@ -551,6 +563,45 @@ fn loadDenseHc(gpa: std.mem.Allocator, driver: *cuda.Driver, store: *Store, pref
     if (gamma.len != wide) return error.UnexpectedTensor;
     const scale = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(gamma));
     return .{ .scale = scale, .down = dq, .up = uq, .n_down = n, .has_inj = @intFromBool(inject) };
+}
+
+/// One line for the whole FP8 arm rather than 96: the load loop is single-threaded, so a plain flag
+/// is enough, and a per-branch line would bury the rest of the load log.
+var fp8_announced = false;
+
+/// A per-layer branch out of `dir`'s FP8 artifact: the two input-mix tables and the norm's gamma.
+///
+/// The bf16 pair is not loaded: the arm exists to halve a stream, and holding 1.26 GB of bf16 beside
+/// the codes would spend the memory it saves. `inject` is required because the artifact's down table
+/// is the engine's `n_down = low + streams` rows -- the checkpoint's 320 mix rows with the branch's
+/// 4 `block_inject_weight` rows appended.
+fn loadFp8Hc(gpa: std.mem.Allocator, driver: *cuda.Driver, store: *Store, dir: []const u8, arm: @import("cuda_hc_fp8.zig").Spec, prefix: []const u8, inject: bool) !HcW {
+    var buf: [200]u8 = undefined;
+    if (!inject) {
+        std.log.err("flashnext: TF_FLASHNEXT_HC_FP8's down table is the layer's mix and inject rows together; {s} loads without inject", .{prefix});
+        return error.HcFp8InjectRequired;
+    }
+    const gamma = try store.normScale(gpa, try store.tensor(try std.fmt.bufPrint(&buf, "{s}.hc_norm.weight", .{prefix})));
+    defer gpa.free(gamma);
+    if (gamma.len != wide) return error.UnexpectedTensor;
+    const n = low + streams;
+    var pair = try @import("cuda_hc_fp8.zig").load(gpa, store.io, driver, dir, arm, n, wide, low);
+    errdefer pair.free();
+    if (!fp8_announced) {
+        fp8_announced = true;
+        std.log.info("flashnext: hyper-connection input mixes armed from {s}: {d} x {d} and {d} x {d} per branch in FP8 e4m3, {d:.1} MB a branch of codes and row scales, read in one K slice; the bf16 matrices are not loaded", .{
+            dir, n, wide, wide, low, @as(f64, @floatFromInt(pair.bytes)) / 1e6,
+        });
+    }
+    const scale = try cuda.DeviceBuffer.fromHost(driver, std.mem.sliceAsBytes(gamma));
+    return .{
+        .scale = scale,
+        .down = Q4.empty(driver),
+        .up = Q4.empty(driver),
+        .n_down = n,
+        .has_inj = 1,
+        .fp8 = pair,
+    };
 }
 
 pub fn stitch(gpa: std.mem.Allocator, store: *Store, prefix: []const u8, names: []const []const u8) !struct { w: []u8, s: []u8, b: []u8, n: usize } {
