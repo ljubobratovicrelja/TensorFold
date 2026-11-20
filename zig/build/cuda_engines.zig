@@ -58,6 +58,12 @@ pub fn flashnextModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize
     m.addImport("qwen_vision", qwen_vision);
     m.addImport("living", core.import_table.get("living").?);
     m.addImport("engine_api", api); // its disk image (cuda_disk.zig) names the rows store's types: family()'s, the server's
+    // The drafter's two kernels live in zig/kernels/, which is outside this module's package path
+    // (zig/src/, rooted at cuda_launch.zig), so the tests that pin their constants cannot @embedFile
+    // them by path. Exposed as anonymous imports instead, the convention cuda_runtime.zig uses for
+    // its fatbins: the bytes land in the module, and the test reads them by name.
+    m.addAnonymousImport("kernel_draft2_attn_split", .{ .root_source_file = b.path("zig/kernels/cuda/draft2_attn_split.cu") });
+    m.addAnonymousImport("kernel_draft2_head_fp8", .{ .root_source_file = b.path("zig/kernels/cuda/draft2_head_fp8.cu") });
     return m;
 }
 

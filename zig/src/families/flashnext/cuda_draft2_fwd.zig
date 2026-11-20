@@ -2607,7 +2607,7 @@ test "the split attention's partial stride is the kernel's own NCH" {
     // `PM`/`PL`/`PO` are indexed `line * NCH + chunk` on both sides of the launch, and NCH is written
     // into the kernel source: this is the one place the two can disagree, and a disagreement reads
     // one line's partials as another's. Cheap to check here rather than in a proposal diff.
-    const src = @embedFile("../../../kernels/cuda/draft2_attn_split.cu");
+    const src = @embedFile("kernel_draft2_attn_split");
     var buf: [48]u8 = undefined;
     const want = try std.fmt.bufPrint(&buf, "constexpr int NCH = {d};", .{attn_split_max});
     try std.testing.expect(std.mem.indexOf(u8, src, want) != null);
@@ -2673,7 +2673,7 @@ test "the quantised head's staging is 112 KiB at the served shape, and every tab
 test "the quantised head's four entries are the ones the file defines" {
     // The names `HeadFp8.load` resolves, and the widths it launches: a rename in the source is a
     // driver-level "entry not found" at load, which is late — this is the cheap place to catch it.
-    const src = @embedFile("../../../kernels/cuda/draft2_head_fp8.cu");
+    const src = @embedFile("kernel_draft2_head_fp8");
     for ([_][]const u8{
         "tf_fxd2_rank_tile(",
         "tf_fxd2_rank_merge(",
