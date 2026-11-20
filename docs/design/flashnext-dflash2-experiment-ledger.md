@@ -541,3 +541,11 @@ the box reproduces the 2026-11-18 pairing within its usual drift.
 Not measured here: capability. The AZ card's 51.7 vs 49.4 is their own harness, and one column ran on
 vLLM, so it is their claim, not ours; the artifact for this run is `~/runs/dflash2/2026-11-20-top5-agentic/`
 (rows, four server logs, `agentic_16.json`).
+
+Suite state at this commit: `zig build test` is 9483/9562 (78 skipped), with two failures — a
+test-only `@embedFile` of `kernels/cuda/draft2_{attn_split,head_fp8}.cu` outside the package path in
+`cuda_draft2_fwd.zig`, and a deterministic crash in `draft_sources_cuda_test` ("Flash Next follows the
+loaded checkpoint head", uninitialised `n_costs` panicking at `cuda_lanes.zig:351`). Both reproduce
+byte-for-byte on `ada4045db` built in a scratch worktree: 9483/9562, same two compile errors, same
+panic and same poisoned index. They predate the top-5 change and are not mine to fix silently.
+
