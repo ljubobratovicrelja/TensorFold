@@ -127,10 +127,21 @@ pub const Pool = struct {
     limit: ?u64,
     unified: bool,
     parked: u64 = 0, // the part of `free` parked on the per-CPU page lists
+    /// Set by a sample taken after a load: the device bytes this process already holds. Admission of
+    /// what comes NEXT (the streams) is then `total - reserve`, not `MemAvailable - reserve`.
+    held: u64 = 0,
 
     /// Bytes the engine may still allocate on top of `held`.
+    ///
+    /// A post-load sample must not measure `MemAvailable`: the kernel has just handed out tens of GiB
+    /// of device allocations and reclassifies their backing pages as reclaimable only after a delay, so
+    /// the reading is a function of when memory accounting last ran, not of what is free. Same unit, same
+    /// flags, four loads on this box read 34.5, 31.0, 25.9 and 23.4 GiB available and two of them refused
+    /// `--parallel 4` on a 1.8 GiB shortfall. `total - reserve - held` is the same quantity from a number
+    /// that does not move. A pre-load sample (`held` 0) keeps using `free`, which is MemAvailable: there is
+    /// nothing of this process's to count and other processes' demand is exactly what MemAvailable reports.
     pub fn room(p: Pool, held: u64) u64 {
-        const left = p.free -| p.reserve;
+        const left = if (p.held > 0) (p.total -| p.reserve) -| p.held else p.free -| p.reserve;
         return if (p.limit) |cap| @min(left, cap -| held) else left;
     }
 };
@@ -219,6 +230,15 @@ test "the memory plan: reserve, cap, and admission that fails closed" {
     try std.testing.expectEqual(60 * g, p.room(20 * g));
     const capped: Pool = .{ .free = 70 * g, .total = 96 * g, .reserve = 10 * g, .limit = 30 * g, .unified = false };
     try std.testing.expectEqual(10 * g, capped.room(20 * g)); // the cap less what the engine holds
+    // A post-load sample counts the load itself: `free` (MemAvailable) has not seen it yet, `total` has.
+    const post: Pool = .{ .free = 25 * g, .total = 120 * g, .reserve = 9 * g, .limit = null, .unified = true, .held = 75 * g };
+    try std.testing.expectEqual(36 * g, post.room(75 * g)); // 120 - 9 - 75, not the 16 the stale free reads
+    try std.testing.expectEqual(@as(u32, 4), try admit(post.room(75 * g), 5 * g, 0, 4, true)); // four lanes fit
+    // Pre-load (held 0) is unchanged: MemAvailable less the reserve.
+    const pre: Pool = .{ .free = 25 * g, .total = 120 * g, .reserve = 9 * g, .limit = null, .unified = true };
+    try std.testing.expectEqual(16 * g, pre.room(0));
+    const capped_post: Pool = .{ .free = 25 * g, .total = 120 * g, .reserve = 9 * g, .limit = 30 * g, .unified = true, .held = 75 * g };
+    try std.testing.expectEqual(0, capped_post.room(75 * g)); // the cap's 30 GiB is already spent by the 75 held
     try std.testing.expectEqual(@as(u32, 8), try admit(60 * g, g, 0, 8, false));
     try std.testing.expectEqual(@as(u32, 5), try admit(5 * g + 1, g, 0, 8, false)); // auto serves what fits
     try std.testing.expectError(error.TooMany, admit(5 * g, g, 0, 8, true)); // a fixed --parallel refuses

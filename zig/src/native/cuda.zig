@@ -342,7 +342,10 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     var served = try drafted.wrap(F, a, gpa, io, loaded, o, problem) orelse return null;
     defer if (!opened) served.close(gpa);
     const model = cuda.usage(false).device - held0;
-    const after = try pool(a, io, &g.ctx, problem) orelse return null;
+    var after = try pool(a, io, &g.ctx, problem) orelse return null;
+    // Marked post-load: what the streams may take is total - reserve - model, not MemAvailable - reserve,
+    // which the just-issued allocations have not yet been counted against (see Pool.room).
+    after.held = model;
     family_memory.noteParked(after, "the CUDA memory budget");
     const L = @TypeOf(loaded); // a family's Loaded may leave out a learner and a lone driver
     const learn_bytes: usize = if (@hasField(L, "learn_bytes")) loaded.learn_bytes else 0;
