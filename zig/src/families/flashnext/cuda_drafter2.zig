@@ -446,6 +446,11 @@ pub const Draft2 = struct {
     pub fn note(self: *Self, s: *Stream, from: u64, to: u64) void {
         const st = self.states.get(s) orelse return;
         if (to <= from) return;
+        // The drafter has now been handed every token through `to`: a prefill hands a stream's prompt over this
+        // way, with no round yet, and `covered` is what a saved state's `ringWhole` checks before it can reach
+        // disk (cuda_snap.zig). `absorbOne` advances it for rows a round absorbs; this is the same claim for the
+        // rows a pass tapped.
+        st.covered = @max(st.covered, to);
         if (st.written == 0) {
             st.begin = from;
             st.written = to;
