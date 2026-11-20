@@ -491,3 +491,53 @@ The first same-corpus pairing of the built-in MTP arm against the combined draft
 Paired: tok/s **−0.61 [−2.43, +1.20] = −1.1% CI [−4.5%, +2.3%]** (parity); acceptance length **−0.198 CI [−0.340, −0.056]** (a real deficit, and the only one).
 
 Read it as: the round is now the same length as MTP's (64.8 vs 65.0 ms) and MTP converts its drafts better — 0.648 against our 0.543 — while ours offers more of them (4.29 vs 3.81). Those two effects cancel into throughput parity. Everything the drafter work bought has been spent getting the round to MTP length; the remaining gap is per-draft quality, i.e. the 603M checkpoint and its training corpus, not the engine. Note also that the two arms tie on `accept_len`'s *product*, so any further acceptance work shows up directly in tok/s.
+
+## 16. Adopting top-5 routing with the healed shared expert (2026-11-20)
+
+azampatti published the same cut I had only read about on the INT4 card, in NVIDIA's FP4-Local format:
+`azampatti/Qwen3.8-Flash-Next-FP4-Local-AZ` is NVIDIA's checkpoint with `num_experts_per_tok` 5, the
+shared expert widened 640 → 1280 (the heal trained on an INT4 student, requantized to MXFP8), and the
+MTP shared expert zero-padded to 1280 so one config describes both layers. Only `config.json` and
+shard 15 of 21 differ; the other twenty are byte-identical to the NVIDIA shards already in the cache,
+so adoption is a 5.1 GB download assembled with hardlinks (`~/models/az-fp4-local-top5`).
+
+Engine side, on branch `dflash2`: `slots` 11 → 6, a new `shared_w` constant (640 → 1280) threaded
+through the shared-expert GEMMs, the batch scratch and the ModelOpt loader, and the three
+`hcWriteback` launches that passed `topk = 10, slots = 11` as literals. The loader's shape check is
+the tripwire: every one of those layers fails with `UnexpectedTensor` if the width is wrong, so a boot
+that reaches `] serving` proves the weights loaded at their real widths. No kernel changed — the
+MoE sum, the router and the shared SwiGLU take their widths as arguments.
+
+Protocol: 16 of Relja's real-traffic prompts (the same `/tmp/agentic_16.json` as §2.1), `max_tokens
+384`, `--context 262144 --parallel 3 --kv-cache fp8 --vision --thinking`, one `:8099` server at a
+time, all four arms in one session. Baseline arms run the `running` build (slots 11, shared 640) on
+NVIDIA's checkpoint; treated arms run the `dflash2` build on the AZ checkpoint, so the build delta is
+inside the comparison and small; the drafter arms use `dflash2-affine4` with no `TF_FLASHNEXT_*`
+head/split flags.
+
+| arm | tok/s | accept_len | accepted/draft | offered/round | outputs |
+|---|---:|---:|---:|---:|---|
+| base-mtp (top-10) | 41.0 | 2.224 | 0.630 | 1.88 | |
+| top5-mtp | **45.1** | 2.228 | 0.618 | 1.90 | |
+| base-df2 (top-10) | 31.8 | 2.051 | 0.339 | 2.93 | |
+| top5-df2 | **36.4** | 2.159 | 0.320 | 3.46 | |
+
+Paired, n = 16, same prompts and seeds:
+
+- MTP: tok/s **+4.13 CI [+2.41, +5.86]** (+10.1%); accept length **+0.004 CI [−0.084, +0.093]** (flat).
+- DFlash2: tok/s **+4.59 CI [+2.83, +6.36]** (+14.5%); accept length +0.107 CI [−0.025, +0.239] (indistinguishable from zero, point estimate positive).
+
+So the cut pays about a tenth of the served rate on the drafter arm and a seventh on the DFlash2 arm,
+and costs no measurable acceptance. Two structural notes: MTP routes 5 too here (its head was trained
+at 10) and still holds 0.618 against 0.630 — the drop is not resolved at n = 16 either way; and
+`drafts/round` rises on DFlash2 (2.93 → 3.46) because the round is cheaper, not because the depth rule
+changed. Within each target, MTP and DFlash2 produced identical text on 16/16 prompts, so verification
+is still lossless under the new routing; across targets 15/16 prompts differ, which is what a changed
+target weight set does at the same seed, not a defect.
+
+Baseline reproduction: base-mtp reads 41.0 / 2.224 / 0.630 here against 39.4 / 2.186 / 0.630 in §2.1 —
+the box reproduces the 2026-11-18 pairing within its usual drift.
+
+Not measured here: capability. The AZ card's 51.7 vs 49.4 is their own harness, and one column ran on
+vLLM, so it is their claim, not ours; the artifact for this run is `~/runs/dflash2/2026-11-20-top5-agentic/`
+(rows, four server logs, `agentic_16.json`).

@@ -9,7 +9,7 @@ const train = flash.train;
 const Trainer = train.Trainer(flash.Tri);
 const dims = 2560;
 const layers_n = 48;
-const slots = 11;
+const slots = 6;
 
 fn fetch(d: *const cuda.Driver, gpa: std.mem.Allocator, ptr: u64, n: usize) ![]u8 {
     const out = try gpa.alloc(u8, n);

@@ -19,7 +19,7 @@ const shapes = [_]Want{
     .{ .name = "num_experts", .value = wt.experts_n },
     .{ .name = "num_experts_per_tok", .value = wt.slots - 1 },
     .{ .name = "moe_intermediate_size", .value = wt.moe_w },
-    .{ .name = "shared_expert_intermediate_size", .value = wt.moe_w },
+    .{ .name = "shared_expert_intermediate_size", .value = wt.shared_w },
     .{ .name = "hc_count", .value = wt.streams },
     .{ .name = "hc_lowrank", .value = wt.low },
     .{ .name = "linear_num_key_heads", .value = gdn.nk },
@@ -281,7 +281,7 @@ test "a taught folder's wider shared expert passes with its pocket's count, and 
     var quant: std.json.ObjectMap = .empty;
     try quant.put(gpa, "bits", .{ .integer = 4 });
     try quant.put(gpa, "group_size", .{ .integer = 32 });
-    try text.put(gpa, "shared_expert_intermediate_size", .{ .integer = wt.moe_w + 64 });
+    try text.put(gpa, "shared_expert_intermediate_size", .{ .integer = wt.shared_w + 64 });
     try std.testing.expectEqualStrings("shared_expert_intermediate_size", mismatch(text, quant).?);
     try text.put(gpa, learned_key, .{ .integer = 64 });
     try std.testing.expectEqual(@as(?[]const u8, null), mismatch(text, quant));

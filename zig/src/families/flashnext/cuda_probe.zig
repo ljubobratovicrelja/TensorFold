@@ -380,9 +380,9 @@ pub const Hidden = struct {
 test "a pass's record is its header, its ids and its weights, layers-major" {
     const layers = 48;
     const cap = 131;
-    const slots = 11;
+    const slots = 6;
     const per_layer = cap * slots * 4;
-    try std.testing.expectEqual(@as(usize, 20 + 2 * layers * per_layer), 20 + 2 * 48 * 131 * 44);
-    // a full 4096-row prompt: 17 MB on the device and on disk a pass
-    try std.testing.expectEqual(@as(usize, 2 * 48 * 4096 * 44), 34_603_008);
+    try std.testing.expectEqual(@as(usize, 20 + 2 * layers * per_layer), 20 + 2 * 48 * 131 * 24);
+    // a full 4096-row prompt: 9.4 MB on the device and on disk a pass
+    try std.testing.expectEqual(@as(usize, 2 * 48 * 4096 * 24), 9_437_184);
 }

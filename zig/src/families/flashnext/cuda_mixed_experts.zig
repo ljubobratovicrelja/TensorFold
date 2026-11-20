@@ -27,8 +27,8 @@ pub fn load(a: std.mem.Allocator, d: *cuda.Driver, store: *wt.Store, prefix: []c
     if (rank == 0 or split) {
         var buf: [256]u8 = undefined;
         for ([_][]const u8{ "gate_proj", "up_proj", "down_proj" }, 0..) |name, i| {
-            const n = if (i == 2) wt.dims else wt.moe_w;
-            const k = if (i == 2) wt.moe_w else wt.dims;
+            const n = if (i == 2) wt.dims else wt.shared_w;
+            const k = if (i == 2) wt.shared_w else wt.dims;
             const key = try std.fmt.bufPrint(&buf, "{s}.shared_expert.{s}", .{ prefix, name });
             shared[i] = if (split) try projections.loadCut(a, d, store, key, n, k, try routed.Cut.init(n, world, rank), .rows) else try projections.load(a, d, store, key, n, k);
             if (shared[i].native == null) return error.UnsupportedQuantization;

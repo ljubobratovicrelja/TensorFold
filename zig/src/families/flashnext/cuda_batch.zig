@@ -194,7 +194,7 @@ pub fn Pass(comptime Tri: type) type {
             }
             const y = s.y + r0 * slots * dims * 4;
             const wts = s.wts + r0 * slots * 4;
-            try self.tri.hcWriteback(h, h, pss, dummy, "*bf16", inj, y, "*fp32", wts, "*fp32", rs, n, dims, streams, 2, 10, 11, 1);
+            try self.tri.hcWriteback(h, h, pss, dummy, "*bf16", inj, y, "*fp32", wts, "*fp32", rs, n, dims, streams, 2, slots - 1, slots, 1);
         }
 
         /// A read-out over rows [r0, r0 + n) of the streams: mixed and its group sums, and the inject gates.

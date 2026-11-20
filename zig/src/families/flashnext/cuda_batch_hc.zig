@@ -41,7 +41,7 @@ pub fn writebackNorm(pass: anytype, hc_w: wt.HcW, r0: usize, n: usize) !void {
     }
     const y = s.y + r0 * slots * dims * 4;
     const wts = s.wts + r0 * slots * 4;
-    try pass.tri.hcWritebackNorm(h, h, pss, dummy, inj, y, wts, scale, norm, eps, rs, n, dims, streams, 2, 10, 11, 1);
+    try pass.tri.hcWritebackNorm(h, h, pss, dummy, inj, y, wts, scale, norm, eps, rs, n, dims, streams, 2, slots - 1, slots, 1);
 }
 
 /// A native read-out over rows [r0, r0 + n) whose normed rows are in: down, act and gates, up, the mix.

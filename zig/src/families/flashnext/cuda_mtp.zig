@@ -328,7 +328,8 @@ pub fn headBytes(fp8: bool) usize {
     const weights = 3 * wt.moe_w * dims;
     const nvfp4 = weights / 2 * 5 / 4;
     const routed = if (fp8) weights + 3 * (wt.moe_w / 128) * (dims / 128) * 4 else nvfp4;
-    const experts = wt.experts_n * routed + nvfp4;
+    const shared = 3 * wt.shared_w * dims / 2 * 5 / 4;
+    const experts = wt.experts_n * routed + shared;
     const attn = (wt.proj_n + dims) * dims / 2 * 5 / 4;
     const draft = 79_591 * dims / 2 * 5 / 4;
     return experts + attn + draft + 2 * dims * dims / 2 * 5 / 4 + @import("cuda_draw_batch.zig").bytes + @import("cuda_draft_draw.zig").scoreBytes(79_591);
@@ -341,7 +342,7 @@ pub const Ops = @import("cuda_mtp_ops.zig").Ops;
 pub const check = @import("cuda_mtp_check.zig").check;
 
 test "the head's bytes: NVFP4 experts as before, FP8 routed experts a byte a weight and their f32 block scales" {
-    const before = (wt.experts_n + 1) * 3 * wt.moe_w * dims / 2 * 5 / 4 + (wt.proj_n + dims) * dims / 2 * 5 / 4 + 79_591 * dims / 2 * 5 / 4 + 2 * dims * dims / 2 * 5 / 4;
+    const before = wt.experts_n * 3 * wt.moe_w * dims / 2 * 5 / 4 + 3 * wt.shared_w * dims / 2 * 5 / 4 + (wt.proj_n + dims) * dims / 2 * 5 / 4 + 79_591 * dims / 2 * 5 / 4 + 2 * dims * dims / 2 * 5 / 4;
     try std.testing.expectEqual(before + @import("cuda_draw_batch.zig").bytes + @import("cuda_draft_draw.zig").scoreBytes(79_591), headBytes(false));
     // an expert's three projections: 640 x 2560 bytes and 5 x 20 scales each, against 5/8 of a byte a weight
     try std.testing.expectEqual(wt.experts_n * (3 * (640 * 2560 + 5 * 20 * 4) - 3 * 640 * 2560 * 5 / 8), headBytes(true) - headBytes(false));

@@ -17,8 +17,11 @@ pub const low: usize = 320;
 pub const eps: f32 = 1e-6;
 pub const vocab: usize = 248320;
 pub const experts_n: usize = 512;
-pub const slots: usize = 11;
+pub const slots: usize = 6;
 pub const moe_w: usize = 640;
+/// The shared expert's width. NVIDIA's checkpoint ships 640; the healed top-5 checkpoint ships 1280
+/// (the original 640 rows plus 640 healed ones), so it is its own constant, not `moe_w`.
+pub const shared_w: usize = 1280;
 pub const block_bytes: usize = 160 * 4;
 pub const tile: usize = 16;
 pub const q_heads: usize = 24;
